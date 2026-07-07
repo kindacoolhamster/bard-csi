@@ -237,10 +237,13 @@ configMaps: []
 
 # StorageClasses and snapshot/VAC/group classes. Default OFF — these are policy,
 # often managed separately (GitOps). Enable + edit to have the chart create them.
-# NOTE: parameters here select a backend TYPE + tuning, never a cluster/credentials.
+# NOTE: `backend` (top-level, REQUIRED) names the backend TYPE the volume routes to
+# (ceph-rbd, cephfs, …) and is rendered into the SC's parameters.backend; `parameters`
+# is extra per-backend tuning. Neither names a cluster or credentials (those live in
+# the BackendCluster CRs + plugin config).
 storageClasses: []
   # - name: bard-rbd
-  #   backend: ceph-rbd
+  #   backend: ceph-rbd            # REQUIRED — without it the driver rejects every volume
   #   parameters: { fsType: ext4 }
   #   reclaimPolicy: Delete
   #   allowVolumeExpansion: true

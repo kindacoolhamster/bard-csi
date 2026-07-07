@@ -16,9 +16,14 @@ metadata:
     storageclass.kubernetes.io/is-default-class: "true"
   {{- end }}
 provisioner: csi.bard.io
-{{- with .parameters }}
+{{- if or .backend .parameters }}
 parameters:
+  {{- if .backend }}
+  backend: {{ .backend }}
+  {{- end }}
+  {{- with .parameters }}
   {{- toYaml . | nindent 2 }}
+  {{- end }}
 {{- end }}
 reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
 allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}

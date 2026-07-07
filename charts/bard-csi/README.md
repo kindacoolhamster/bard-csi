@@ -29,18 +29,32 @@ backend instances/zones.
 ## Install
 
 ```sh
-# 1. (prereq) external-snapshotter if you want snapshots / group snapshots:
-#    its CRDs + a snapshot-controller. For VolumeGroupSnapshot use v8.2.0 with
-#    --feature-gates=CSIVolumeGroupSnapshot=true (this chart does NOT install the
-#    cluster-singleton snapshot-controller). For a quick, version-matched install
-#    (also fixes upstream's mispinned controller image) see hack/install-snapshotter.sh.
+# 1. (prereq) external-snapshotter — the snapshotter sidecar is ON by default
+#    (disable with --set sidecars.snapshotter.enabled=false). It is a cluster
+#    singleton this chart deliberately does NOT bundle; install its CRDs + a
+#    snapshot-controller pinned to the SAME version the sidecar uses (v8.2.0):
+#      V=v8.2.0; B=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/$V
+#      for c in snapshot.storage.k8s.io_volumesnapshot{classes,contents,s} \
+#               groupsnapshot.storage.k8s.io_volumegroupsnapshot{classes,contents,s}; do
+#        kubectl apply -f "$B/client/config/crd/$c.yaml"; done
+#      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
+#      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
+#      # upstream's manifest MISPINS the controller image to v8.0.1, which — with the
+#      # group-snapshot gate the sidecar sets — stalls even PLAIN snapshots; force it:
+#      kubectl -n kube-system set image deploy/snapshot-controller \
+#        snapshot-controller=registry.k8s.io/sig-storage/snapshot-controller:$V
+#    (from a source checkout, hack/install-snapshotter.sh does exactly this.)
 
 # 2. create the credentials Secret (one cephx key per instance id)
 kubectl -n kube-system create secret generic bard-ceph-keys \
   --from-literal=galileo="$(ceph auth get-key client.k8s-csi-test)"
 
-# 3. install with your backend described in its own terms (see values below)
-helm install bard-csi charts/bard-csi -n kube-system -f my-values.yaml
+# 3. install — the released chart + images pull straight from the registry:
+helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
+  --version 0.1.0-rc.2 -n kube-system -f my-values.yaml   # see Releases for the current version
+#    (From a source checkout, `helm install bard-csi charts/bard-csi …` uses the
+#     dev-PLACEHOLDER appVersion, whose images are NOT published → ImagePullBackOff;
+#     build/load your own images, or --set image.tag / plugins.<backend>.image.tag.)
 
 # 4. label your nodes per zone: kubectl label node <n> topology.kubernetes.io/zone=<zone>
 ```
@@ -138,6 +152,13 @@ across all enabled node plugins, since they are pod-wide.
 
 ## Notes & caveats
 
+- **The Ceph backends need kernel modules on every node.** The default Ceph RBD
+  mounter (krbd) maps images through the node kernel, so each node must have the
+  **`rbd`** module loaded (`modprobe rbd`; persist in `/etc/modules-load.d/`) —
+  without it NodeStage fails and the PVC never mounts. Feature-conditional, same
+  treatment: **`nbd`** for the `mounter: rbd-nbd` alternative, **`dm_crypt`** for
+  LUKS encryption (`encrypted: "true"`), and **`ceph`** for the CephFS kernel
+  mounter.
 - **CSIDriver and the ClusterRoles are cluster-scoped singletons** keyed by the
   driver name — one bard-csi per cluster.
 - **CRD**: the `BackendCluster` CRD ships in `crds/` (Helm installs it on first
