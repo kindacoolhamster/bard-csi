@@ -1,0 +1,45 @@
+# Multi-cluster dispatch demo: a SECOND ceph-rbd instance ("kepler") alongside
+# galileo, so one StorageClass (bard-rbd) provisions into different backends by
+# the pod's zone. Apply this, add the kepler key to bard-ceph-keys (hack/secret.yaml),
+# label bard-worker2 topology.kubernetes.io/zone=kepler, restart the bard pods,
+# then `kubectl apply -f hack/test-multicluster.yaml`.
+#
+# DEV STAND-IN: with no second physical box, "kepler" is a second *pool* + a
+# second scoped cephx user on the SAME galileo mon. Bard's code can't tell that
+# from a separate cluster -- an instance is just a (monitors, pool, user) tuple;
+# for truly separate clusters only kepler's `monitors` would differ. The dispatch,
+# per-instance plugin config, and per-instance credential paths are identical.
+#
+# The Ceph RBD plugin's config, now with BOTH instances. Replaces the
+# single-instance bard-ceph-config from deploy/20-config.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-ceph-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        monitors: ["192.168.1.225:3300"]
+        pool: k8s-csi-test
+        userID: k8s-csi-test
+        mounter: rbd-nbd
+      kepler:
+        monitors: ["192.168.1.225:3300"]   # same mon (stand-in); a real cluster differs here
+        pool: k8s-csi-kepler
+        userID: k8s-csi-kepler
+        mounter: rbd-nbd
+---
+# The second BackendCluster: same backendType, a new instance + zone. This is the
+# ENTIRE control-plane change to add a cluster -- one CR.
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: kepler-rbd
+spec:
+  backendType: ceph-rbd
+  instance: kepler
+  zone: kepler
+  plugin:
+    endpoint: /var/lib/bard/plugins/ceph-rbd.sock

@@ -1,0 +1,14 @@
+# A one-shot space reclamation for a single PVC. The csi-addons controller-manager
+# resolves the PVC to its PV/volume handle and calls Bard's csi-addons
+# ControllerReclaimSpace, which dispatches to the owning backend (rbd sparsify for
+# Ceph RBD). Set `target.persistentVolumeClaim` to a PVC backed by `bard-rbd`.
+apiVersion: csiaddons.openshift.io/v1alpha1
+kind: ReclaimSpaceJob
+metadata:
+  name: bard-reclaim
+spec:
+  target:
+    persistentVolumeClaim: bard-test
+  # NOTE: csi-addons v0.12.0 removed spec.backoffLimit / spec.retryDeadlineSeconds
+  # from ReclaimSpaceJob (they are now rejected as unknown fields). `target` is the
+  # only field a one-shot reclaim needs.

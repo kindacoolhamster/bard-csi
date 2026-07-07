@@ -1,0 +1,39 @@
+# Raw block volume (volumeMode: Block) on the bard-rbd StorageClass: the rbd
+# image is mapped and the raw device is handed to the pod via volumeDevices (no
+# filesystem). The pod writes a signature to the block device and reads it back.
+#
+# RBD also supports multi-node block (accessModes: ReadWriteMany + volumeMode:
+# Block): multiple nodes map the same image and the application coordinates
+# writes (use imageFeatures without exclusive-lock). The driver rejects
+# ReadWriteMany/ReadOnlyMany for a *filesystem* rbd volume -- one image cannot
+# back a shared cross-node mount safely.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bard-block }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  volumeMode: Block
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: bard-block }
+spec:
+  nodeSelector: { kubernetes.io/hostname: bard-worker } # zone galileo
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo bard-block-works | dd of=/dev/xvda bs=512 count=1 conv=notrunc 2>/dev/null
+          dd if=/dev/xvda bs=512 count=1 2>/dev/null | head -c 16
+          echo
+          sleep 3600
+      volumeDevices:
+        - { name: vol, devicePath: /dev/xvda }
+  volumes:
+    - name: vol
+      persistentVolumeClaim: { claimName: bard-block }

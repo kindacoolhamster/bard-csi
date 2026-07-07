@@ -1,0 +1,248 @@
+# RBAC for the controller sidecars (provisioner, snapshotter, resizer) and the
+# node-driver-registrar. Scoped to what each sidecar actually watches/edits.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bard-csi-controller
+  namespace: kube-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bard-csi-node
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bard-csi-controller
+rules:
+  # external-provisioner
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotclasses", "volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch", "create", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status", "volumesnapshots/status"]
+    verbs: ["update", "patch"]
+  # external-snapshotter v8 VolumeGroupSnapshot: the sidecar reconciles group
+  # snapshot contents and calls the driver's GroupController.
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  # external-resizer
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  # external-resizer modify-volume controller (VolumeAttributesClass):
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  # Bard core: read its backend config from BackendCluster CRs at startup.
+  - apiGroups: ["bard.io"]
+    resources: ["backendclusters"]
+    verbs: ["get", "list", "watch"]
+  # Cross-namespace volume data sources (the CrossNamespaceVolumeDataSource
+  # feature gate + the provisioner's matching --feature-gates): the provisioner
+  # authorizes a PVC's cross-namespace dataSourceRef against Gateway API
+  # ReferenceGrants. Harmless while the CRD/gate are absent.
+  # See deploy/examples/crossnamespace/.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch"]
+  # external-provisioner --enable-capacity: publish CSIStorageCapacity objects.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csidrivers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    # get: provisioner reads its own pod for the capacity ownerref chain.
+    # list/watch: external-health-monitor maps volumes to the pods using them.
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"] # ownerref chain Pod -> ReplicaSet -> Deployment
+  # csi-addons sidecar: registers a CSIAddonsNode for this driver and reads the
+  # ReclaimSpaceJob/CronJob CRs it executes (ControllerReclaimSpace). The
+  # cluster-wide csi-addons controller-manager (installed separately, see
+  # deploy/examples/reclaimspace/) owns the rest of the CRD reconciliation.
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["csiaddonsnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs", "reclaimspacecronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs/status", "reclaimspacecronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  # NetworkFence is a controller-side operation (node fencing for failover/DR): the
+  # controller's csi-addons sidecar reads the NetworkFence CRs and calls Bard's
+  # FenceController (ceph-rbd -> osd blocklist range). Node fencing is cluster-
+  # scoped, so only the controller plane needs these.
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["networkfences"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["networkfences/status"]
+    verbs: ["get", "update", "patch"]
+  # VolumeReplication (RBD mirroring for DR) is also controller-side: the
+  # controller's csi-addons sidecar reads VolumeReplication[Class] CRs and calls
+  # Bard's Replication service (ceph-rbd -> rbd mirror image).
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumereplications", "volumereplicationclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumereplications/status"]
+    verbs: ["get", "update", "patch"]
+  # VolumeGroup (consistency groups, e.g. rbd group) backs group replication for DR:
+  # the controller's csi-addons sidecar reads VolumeGroupReplication CRs and calls
+  # Bard's VolumeGroup service (ceph-rbd -> rbd group). Harmless if the CRD is absent.
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumegroupreplications", "volumegroupreplicationclasses", "volumegroupreplicationcontents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumegroupreplications/status", "volumegroupreplicationcontents/status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bard-csi-controller
+subjects:
+  - kind: ServiceAccount
+    name: bard-csi-controller
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: bard-csi-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bard-csi-node
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  # Bard core: read its backend config from BackendCluster CRs at startup.
+  - apiGroups: ["bard.io"]
+    resources: ["backendclusters"]
+    verbs: ["get", "list", "watch"]
+  # csi-addons node sidecar reads its own pod to resolve the CSIAddonsNode's owner
+  # reference (pod -> DaemonSet) when it registers. Without this it fails with the
+  # generic "failed to get CSIAddonsNode object" and crashloops.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  # csi-addons node sidecar resolves the target PVC -> PV -> volume handle before
+  # calling the driver's NodeReclaimSpace (online fstrim); without PV/PVC read it
+  # fails with "failed to get pv ...".
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  # csi-addons node sidecar: register a CSIAddonsNode + read the node-phase
+  # ReclaimSpaceJobs it runs (NodeReclaimSpace / fstrim).
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["csiaddonsnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs", "reclaimspacecronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs/status", "reclaimspacecronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  # EncryptionKeyRotation is node-side (it needs the staged dm-crypt device): the
+  # node csi-addons sidecar reads the rotation jobs and calls Bard's rotate service.
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["encryptionkeyrotationjobs", "encryptionkeyrotationcronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["encryptionkeyrotationjobs/status", "encryptionkeyrotationcronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bard-csi-node
+subjects:
+  - kind: ServiceAccount
+    name: bard-csi-node
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: bard-csi-node
+  apiGroup: rbac.authorization.k8s.io
+---
+# The csi-addons sidecars (controller + node) serve a gRPC endpoint that the
+# cluster-wide csi-addons controller-manager connects to. The sidecar authenticates
+# that connection with a TokenReview, so each plane's SA needs the built-in
+# system:auth-delegator role (create tokenreviews + subjectaccessreviews). Without
+# this the CSIAddonsNode stays in state Failed ("failed to review token ...
+# tokenreviews ... is forbidden") and ReclaimSpace jobs never reach the driver.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bard-csi-controller-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: bard-csi-controller
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bard-csi-node-auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: bard-csi-node
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io

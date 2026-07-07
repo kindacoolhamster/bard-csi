@@ -1,0 +1,53 @@
+# Tier 2 harder-workload demo: Prometheus with its TSDB on a bard-rbd PVC. The TSDB
+# I/O profile is unlike a SQL DB -- memory-mapped chunks, a write-ahead log, and
+# periodic head/block compaction -- so it exercises the rbd device differently.
+# Used to prove the TSDB survives a pod restart (WAL replay off the rbd volume) with
+# no block/WAL corruption.
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: bard-prom-config }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 1s        # fast ingest so the TSDB fills quickly
+      evaluation_interval: 5s
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: bard-prom-data }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bard-prometheus
+  labels: { app: bard-prometheus }
+spec:
+  securityContext:
+    fsGroup: 65534               # nobody -- so Prometheus can write the rbd volume
+  containers:
+    - name: prometheus
+      image: prom/prometheus:v2.54.1
+      args:
+        - --config.file=/etc/prometheus/prometheus.yml
+        - --storage.tsdb.path=/prometheus
+        - --storage.tsdb.min-block-duration=2m   # compact to blocks quickly (demo)
+        - --storage.tsdb.max-block-duration=2m
+      ports: [{ containerPort: 9090 }]
+      readinessProbe:
+        httpGet: { path: /-/ready, port: 9090 }
+        initialDelaySeconds: 5
+        periodSeconds: 5
+      volumeMounts:
+        - { name: data, mountPath: /prometheus }
+        - { name: config, mountPath: /etc/prometheus }
+  volumes:
+    - { name: data, persistentVolumeClaim: { claimName: bard-prom-data } }
+    - { name: config, configMap: { name: bard-prom-config } }

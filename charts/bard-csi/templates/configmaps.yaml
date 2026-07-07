@@ -1,0 +1,45 @@
+{{- /*
+Optional chart-managed ConfigMaps. A QoL convenience so the NON-SECRET backend
+config a plugin reads (mons/pools/VG/export, KMS config, ...) can travel in your
+values file -- `helm install -f values.yaml` then brings up the runtime AND its
+config in one shot, instead of a separate `kubectl apply`. The name you give here
+is the same name a plugin's volumes[].configMap.name references.
+
+DELIBERATELY ConfigMaps only: never put credentials (cephx keys, Vault tokens,
+encryption masters) in values -- those stay Secrets you create out of band and the
+sidecars mount by name (SealedSecrets / External Secrets Operator / SOPS keep them
+out of plaintext). See the secrets note in values.yaml.
+*/ -}}
+{{- range .Values.configMaps }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .name }}
+  namespace: {{ include "bard-csi.namespace" $ }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+data:
+  {{- toYaml .data | nindent 2 }}
+{{- end }}
+{{- /*
+Profile-driven: each enabled first-party plugin with `instances` gets its config
+ConfigMap rendered from the high-level instances (mons/pool/fsName/user) -- the admin
+never hand-writes Bard's `instances:` schema.
+*/ -}}
+{{- range $name, $plugin := .Values.plugins }}
+{{- if and $plugin.enabled (include "bard-csi.usesProfile" (dict "name" $name "plugin" $plugin)) }}
+{{- $prof := fromYaml (include "bard-csi.profile" $name) }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $prof.configMap }}
+  namespace: {{ include "bard-csi.namespace" $ }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+data:
+  config.yaml: |
+{{ include "bard-csi.instanceConfig" (dict "name" $name "instances" $plugin.instances) | indent 4 }}
+{{- end }}
+{{- end }}

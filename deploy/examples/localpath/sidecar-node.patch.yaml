@@ -1,0 +1,28 @@
+# Strategic-merge patch adding the localpath plugin sidecar to Bard's node DaemonSet.
+#   kubectl -n kube-system patch daemonset bard-csi-node \
+#     --type=strategic --patch-file deploy/examples/localpath/sidecar-node.patch.yaml
+#
+# Node-plane: bind-mounts the volume's directory into the staging/target paths.
+# Needs the basePath, and the kubelet dir with Bidirectional propagation so its
+# bind mounts reach kubelet. Privileged because it issues mount(8).
+spec:
+  template:
+    spec:
+      volumes:
+        - name: localpath-config
+          configMap:
+            name: bard-localpath-config
+        - name: localpath-data
+          hostPath: { path: /srv/bard-localpath, type: DirectoryOrCreate }
+      containers:
+        - name: localpath-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-localpath:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/localpath.sock", "--config=/etc/bard-localpath/config.json"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: localpath-config, mountPath: /etc/bard-localpath, readOnly: true }
+            - { name: localpath-data, mountPath: /srv/bard-localpath, mountPropagation: Bidirectional }
+            - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }

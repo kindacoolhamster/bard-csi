@@ -1,0 +1,243 @@
+# Controller plane: backend-agnostic Bard core (--controller) + the CSI sidecars,
+# plus the Ceph RBD backend as an out-of-tree plugin sidecar. Core itself has no
+# Ceph knowledge; it proxies CreateVolume/etc. to the plugin over a shared unix
+# socket. To add another backend (e.g. NFS), drop in its plugin sidecar the same
+# way -- see deploy/examples/.
+#
+# No external-attacher by default: attachRequired is false for the node-mapped
+# backends. An attach-style backend (iSCSI) adds the attacher sidecar + flips the
+# CSIDriver flag via deploy/examples/attach/. The provisioner's
+# --feature-gates=Topology=true + WaitForFirstConsumer StorageClasses pass the
+# scheduled node's zone into CreateVolume so the dispatcher picks the cluster.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bard-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bard-csi-controller
+  template:
+    metadata:
+      labels:
+        app: bard-csi-controller
+    spec:
+      serviceAccountName: bard-csi-controller
+      # Shared fsGroup so the per-pod `plugins` emptyDir (and the plugin sockets in
+      # it) is group-owned by this gid with setgid. That lets core connect to a
+      # plugin socket even when core runs as a different, non-root UID -- e.g. a
+      # hardened/distroless core (cgr.dev/chainguard/static, 65532) dialing a
+      # root plugin. Sockets are 0660 (group, not world); see docs/hardened-images.md.
+      securityContext:
+        fsGroup: 65532
+      containers:
+        - name: csi-provisioner
+          # v6.x speaks the GA storage.k8s.io/v1 VolumeAttributesClass API (Kubernetes
+          # 1.34): it stamps the PVC's VAC onto the PV (so it binds) and passes the
+          # VAC parameters as MutableParameters to CreateVolume. VAC is GA, so its
+          # feature gate is locked on and must not be passed explicitly.
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--feature-gates=Topology=true"
+            - "--immediate-topology=false"
+            - "--extra-create-metadata"
+            - "--default-fstype=ext4"
+            - "--leader-election"
+            # Publish per-(StorageClass,topology) CSIStorageCapacity from the
+            # driver's GetCapacity, so the scheduler is capacity-aware.
+            - "--enable-capacity"
+            - "--capacity-ownerref-level=2" # Pod -> ReplicaSet -> Deployment
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # v8 adds VolumeGroupSnapshot support (the group-snapshot feature gate);
+        # it drives the driver's GroupController CreateVolumeGroupSnapshot.
+        - name: csi-snapshotter
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            - "--feature-gates=CSIVolumeGroupSnapshot=true"
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # Drives both ControllerExpandVolume (resize) and ControllerModifyVolume
+        # (VolumeAttributesClass). v2.x speaks the GA storage.k8s.io/v1 VAC API
+        # (Kubernetes 1.34); VAC is GA so its feature gate is locked on and must
+        # not be passed explicitly.
+        - name: csi-resizer
+          image: registry.k8s.io/sig-storage/csi-resizer:v2.2.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # Polls the driver's ControllerGetVolume for each PV and raises an event on
+        # the PVC when a volume reports an abnormal VolumeCondition (e.g. the
+        # backing rbd image was deleted out of band). Needs the driver's
+        # GET_VOLUME + VOLUME_CONDITION controller capabilities.
+        - name: csi-external-health-monitor-controller
+          image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.11.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            - "--monitor-interval=60s"
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.12.0
+          args: ["--csi-address=$(ADDRESS)"]
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # Drives the csi-addons API (ReclaimSpaceJob/CronJob -> the driver's
+        # ControllerReclaimSpace). It registers a CSIAddonsNode and watches the
+        # csi-addons CRDs, which the cluster-wide csi-addons controller-manager
+        # installs (see deploy/examples/reclaimspace/). Talks to the driver's
+        # second socket (--csi-addons-endpoint above).
+        - name: csi-addons
+          image: quay.io/csiaddons/k8s-sidecar:v0.12.0
+          args:
+            - "--csi-addons-address=$(CSIADDONS_ENDPOINT)"
+            - "--node-id=$(NODE_ID)"
+            - "--namespace=$(POD_NAMESPACE)"
+            - "--pod=$(POD_NAME)"
+            - "--pod-uid=$(POD_UID)"
+            - "--leader-election-namespace=$(POD_NAMESPACE)"
+            # The sidecar serves its CSIAddonsNode controller endpoint on this port;
+            # it is required (the sidecar exits "invalid controller port" without it).
+            - "--controller-port=9070"
+            - "--v=2"
+          env:
+            - name: CSIADDONS_ENDPOINT
+              value: unix:///csi/csi-addons.sock
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # Bard core: backend-agnostic, no storage tools (distroless image).
+        - name: bard-csi
+          image: ghcr.io/kindacoolhamster/bard-csi:dev
+          args:
+            - "--controller"
+            - "--endpoint=unix:///csi/csi.sock"
+            # csi-addons (ReclaimSpace, ...) served on a second socket for the
+            # csi-addons sidecar below. Controller-only.
+            - "--csi-addons-endpoint=unix:///csi/csi-addons.sock"
+            - "--config-source=crd"   # read BackendCluster CRs at startup
+            - "--v=2"
+          ports:
+            - name: healthz
+              containerPort: 9808
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 60
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+
+        # Ceph RBD backend plugin. Control-plane ops (rbd create/rm/resize/snap)
+        # are pure userspace network calls -- no privilege needed here.
+        - name: ceph-rbd-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-ceph-rbd:dev
+          args:
+            - "--socket=/var/lib/bard/plugins/ceph-rbd.sock"
+            - "--config=/etc/bard-ceph/config.yaml"
+            - "--key-dir=/etc/bard-ceph-keys"
+            # KMS config so DeleteVolume can remove a deleted encrypted volume's
+            # stored passphrase from its KMS (control-plane cleanup).
+            - "--kms-config=/etc/bard-ceph-kms/config.yaml"
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            - name: ceph-config
+              mountPath: /etc/bard-ceph
+              readOnly: true
+            - name: ceph-keys
+              mountPath: /etc/bard-ceph-keys
+              readOnly: true
+            - name: ceph-kms-config
+              mountPath: /etc/bard-ceph-kms
+              readOnly: true
+            - name: ceph-vault-token
+              mountPath: /etc/bard-ceph-vault
+              readOnly: true
+            - name: ceph-kmip-certs
+              mountPath: /etc/bard-ceph-kmip
+              readOnly: true
+            - name: ceph-azure-creds
+              mountPath: /etc/bard-ceph-azure
+              readOnly: true
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        - name: plugins
+          emptyDir: {}
+        - name: ceph-config
+          configMap:
+            name: bard-ceph-config
+        - name: ceph-keys
+          secret:
+            secretName: bard-ceph-keys
+        - name: ceph-kms-config
+          configMap:
+            name: bard-ceph-kms
+            optional: true
+        - name: ceph-vault-token
+          secret:
+            secretName: bard-ceph-vault-token
+            optional: true
+        - name: ceph-kmip-certs
+          secret:
+            secretName: bard-ceph-kmip-certs
+            optional: true # KMIP mutual-TLS client cert/key + server CA (kmip provider)
+        - name: ceph-azure-creds
+          secret:
+            secretName: bard-ceph-azure
+            optional: true # Azure Key Vault client secret / CA (azure-kv provider)

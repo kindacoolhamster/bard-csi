@@ -1,0 +1,26 @@
+# The CSIDriver object tells Kubernetes how to treat this driver.
+#
+# attachRequired: false  -- Ceph RBD/CephFS/NFS/LVM map on the node, so the
+#                           external-attacher and VolumeAttachment dance are not
+#                           used. An attach-style backend (iSCSI) needs this flag
+#                           flipped cluster-wide -- see deploy/examples/attach/.
+# storageCapacity: true  -- the driver implements GetCapacity; the provisioner
+#                           publishes CSIStorageCapacity for capacity-aware scheduling.
+# seLinuxMount: true     -- the node mounts support the `-o context=` option, so on
+#                           an SELinux cluster kubelet sets the label at mount time
+#                           instead of recursively relabelling every file (a big win
+#                           for large volumes). The kubelet applies this only to
+#                           RWO/RWOP volumes, so shared RWX backends (CephFS/NFS) are
+#                           unaffected by this one global flag.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.bard.io
+spec:
+  attachRequired: false
+  storageCapacity: true
+  podInfoOnMount: true
+  fsGroupPolicy: File
+  seLinuxMount: true
+  volumeLifecycleModes:
+    - Persistent

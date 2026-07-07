@@ -1,0 +1,74 @@
+{{- /*
+Optional StorageClasses / snapshot / VAC / group classes. Off by default — these
+are policy, often GitOps-managed. `parameters` select a backend TYPE + tuning,
+never a cluster or credentials (that lives in BackendCluster CRs + plugin config).
+*/ -}}
+{{- range .Values.storageClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+  {{- if .isDefault }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  {{- end }}
+provisioner: csi.bard.io
+{{- with .parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+reclaimPolicy: {{ .reclaimPolicy | default "Delete" }}
+allowVolumeExpansion: {{ .allowVolumeExpansion | default true }}
+volumeBindingMode: {{ .volumeBindingMode | default "WaitForFirstConsumer" }}
+{{- with .mountOptions }}
+mountOptions:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- range .Values.volumeSnapshotClasses }}
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+driver: csi.bard.io
+deletionPolicy: {{ .deletionPolicy | default "Delete" }}
+{{- with .parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- range .Values.volumeGroupSnapshotClasses }}
+---
+apiVersion: groupsnapshot.storage.k8s.io/v1beta1
+kind: VolumeGroupSnapshotClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+driver: csi.bard.io
+deletionPolicy: {{ .deletionPolicy | default "Delete" }}
+{{- with .parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+{{- range .Values.volumeAttributesClasses }}
+---
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+driverName: csi.bard.io
+{{- with .parameters }}
+parameters:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

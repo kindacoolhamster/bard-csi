@@ -1,0 +1,75 @@
+# CI: build, vet, test, format, and lint the chart on every push/PR.
+# Scaffold -- not wired to anything that gates merges yet; it documents the same
+# commands CLAUDE.md lists for local dev so they also run in the open.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=mod
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build / vet / test
+        run: |
+          go build ./...
+          go vet ./...
+          # The csi-sanity suite (internal/driver) is timing-sensitive on shared
+          # runners -- a create-heavy spec occasionally exceeds its 60s deadline.
+          # Give it ginkgo --flake-attempts so a transient timeout is retried, not
+          # a red build. The flag is only defined for that ginkgo-based test binary,
+          # so run the rest of the packages separately (a global -args would fail
+          # their flag parsing with "flag provided but not defined").
+          go test $(go list ./... | grep -v '/internal/driver$')
+          go test ./internal/driver -args -ginkgo.flake-attempts=2
+      - name: gofmt (must be empty)
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; exit 1; fi
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v5
+      - name: lint + template the chart
+        run: |
+          helm lint charts/bard-csi
+          # render with a couple of plugins enabled to catch template breakage
+          helm template charts/bard-csi \
+            --set plugins.ceph-rbd.enabled=true \
+            --set installCRDs=true >/dev/null
+
+  conformance:
+    # The wire-contract bar: drive the Python localpath plugin (which shares no
+    # code with the tool) over its unix socket with bard-plugin-conformance.
+    # Control plane as the runner user, then again under sudo to add the node
+    # plane (real bind mounts). The tool is prebuilt into the workspace temp
+    # dir so the sudo run reuses it (go isn't on root's PATH) and neither run
+    # writes a root-owned binary through a sticky /tmp path.
+    runs-on: ubuntu-latest
+    env:
+      GOFLAGS: -mod=mod
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: build the conformance tool
+        run: go build -o "$RUNNER_TEMP/bard-plugin-conformance" ./cmd/bard-plugin-conformance
+      - name: conformance -- control plane
+        run: TOOL="$RUNNER_TEMP/bard-plugin-conformance" bash hack/conformance-localpath-test.sh
+      - name: conformance -- node plane (root)
+        run: sudo env TOOL="$RUNNER_TEMP/bard-plugin-conformance" bash hack/conformance-localpath-test.sh
+      - name: plugin log on failure
+        if: failure()
+        run: sudo cat /tmp/lp-conf-plugin.*.log || true

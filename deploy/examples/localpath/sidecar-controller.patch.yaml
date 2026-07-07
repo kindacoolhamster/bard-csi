@@ -1,0 +1,25 @@
+# Strategic-merge patch adding the localpath plugin sidecar to Bard's controller.
+#   kubectl -n kube-system patch deployment bard-csi-controller \
+#     --type=strategic --patch-file deploy/examples/localpath/sidecar-controller.patch.yaml
+#
+# Control plane: create_volume just makes a subdirectory under basePath, so this
+# sidecar only needs that directory (a hostPath here -- a shared mount on a real
+# multi-node cluster). No privilege, no /dev: the directory work is plain mkdir.
+spec:
+  template:
+    spec:
+      volumes:
+        - name: localpath-config
+          configMap:
+            name: bard-localpath-config
+        - name: localpath-data
+          hostPath: { path: /srv/bard-localpath, type: DirectoryOrCreate }
+      containers:
+        - name: localpath-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-localpath:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/localpath.sock", "--config=/etc/bard-localpath/config.json"]
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: localpath-config, mountPath: /etc/bard-localpath, readOnly: true }
+            - { name: localpath-data, mountPath: /srv/bard-localpath }

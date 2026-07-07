@@ -1,0 +1,242 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+    app: {{ include "bard-csi.fullname" . }}-controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  selector:
+    matchLabels:
+      app: {{ include "bard-csi.fullname" . }}-controller
+  template:
+    metadata:
+      labels:
+        app: {{ include "bard-csi.fullname" . }}-controller
+    spec:
+      serviceAccountName: {{ include "bard-csi.fullname" . }}-controller
+      {{- with .Values.podSecurityContext }}
+      # Shared fsGroup so the per-pod `plugins` emptyDir (and the plugin sockets in
+      # it, mode 0660) is group-owned, letting a non-root core (e.g. a hardened
+      # image) connect to a root plugin's socket. See docs/hardened-images.md.
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        {{- if .Values.sidecars.provisioner.enabled }}
+        - name: csi-provisioner
+          image: {{ .Values.sidecars.provisioner.image }}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--feature-gates=Topology=true"
+            - "--immediate-topology=false"
+            - "--extra-create-metadata"
+            - "--default-fstype=ext4"
+            - "--leader-election"
+            {{- if .Values.storageCapacity }}
+            - "--enable-capacity"
+            - "--capacity-ownerref-level=2"
+            {{- end }}
+            {{- range .Values.sidecars.provisioner.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            {{- if .Values.storageCapacity }}
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- if .Values.sidecars.snapshotter.enabled }}
+        - name: csi-snapshotter
+          image: {{ .Values.sidecars.snapshotter.image }}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            {{- if .Values.sidecars.snapshotter.groupSnapshots }}
+            - "--feature-gates=CSIVolumeGroupSnapshot=true"
+            {{- end }}
+            {{- range .Values.sidecars.snapshotter.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- if .Values.sidecars.resizer.enabled }}
+        - name: csi-resizer
+          image: {{ .Values.sidecars.resizer.image }}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            {{- range .Values.sidecars.resizer.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+
+        {{- if .Values.attach.enabled }}
+        # external-attacher: only when attach.enabled flips attachRequired on
+        # (for an attach-style backend like iSCSI). It calls the driver's
+        # ControllerPublishVolume; node-mapped backends no-op it.
+        - name: csi-attacher
+          image: {{ .Values.attach.image }}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            {{- range .Values.attach.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- if .Values.sidecars.healthMonitor.enabled }}
+        - name: csi-external-health-monitor-controller
+          image: {{ .Values.sidecars.healthMonitor.image }}
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--leader-election"
+            - "--monitor-interval={{ .Values.sidecars.healthMonitor.monitorInterval }}"
+            - "--v=2"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- if .Values.sidecars.livenessProbe.enabled }}
+        - name: liveness-probe
+          image: {{ .Values.sidecars.livenessProbe.image }}
+          args: ["--csi-address=$(ADDRESS)"]
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- if .Values.sidecars.csiAddons.enabled }}
+        # Drives the csi-addons API (ReclaimSpaceJob -> ControllerReclaimSpace).
+        # REQUIRES the cluster-wide csi-addons CRDs + controller-manager; see README.
+        - name: csi-addons
+          image: {{ .Values.sidecars.csiAddons.image }}
+          args:
+            - "--csi-addons-address=$(CSIADDONS_ENDPOINT)"
+            - "--node-id=$(NODE_ID)"
+            - "--namespace=$(POD_NAMESPACE)"
+            - "--pod=$(POD_NAME)"
+            - "--pod-uid=$(POD_UID)"
+            - "--leader-election-namespace=$(POD_NAMESPACE)"
+            # Required: the sidecar exits "invalid controller port" without it.
+            - "--controller-port=9070"
+            - "--v=2"
+          env:
+            - name: CSIADDONS_ENDPOINT
+              value: unix:///csi/csi-addons.sock
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        # Bard core: backend-agnostic, no storage tools (distroless image).
+        - name: bard-csi
+          image: {{ include "bard-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--controller"
+            - "--endpoint=unix:///csi/csi.sock"
+            {{- if .Values.sidecars.csiAddons.enabled }}
+            - "--csi-addons-endpoint=unix:///csi/csi-addons.sock"
+            {{- end }}
+            - "--config-source=crd"
+            {{- if .Values.metrics.enabled }}
+            - "--metrics-addr=:{{ .Values.metrics.port }}"
+            {{- end }}
+            - "--v=2"
+          ports:
+            - name: healthz
+              containerPort: 9808
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 60
+          {{- with .Values.controller.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+        {{- range $name, $plugin := .Values.plugins }}
+        {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
+        {{- if and $plugin.enabled $p.controller $p.controller.enabled }}
+        {{- include "bard-csi.pluginContainer" (dict "name" $name "plugin" $p "plane" "controller" "root" $) | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        - name: plugins
+          emptyDir: {}
+        {{- range $name, $plugin := .Values.plugins }}
+        {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
+        {{- if and $plugin.enabled $p.controller $p.controller.enabled }}
+        {{- include "bard-csi.pluginVolumes" (dict "name" $name "plugin" $p "plane" "controller") | nindent 8 }}
+        {{- end }}
+        {{- end }}

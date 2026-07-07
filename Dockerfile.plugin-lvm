@@ -1,0 +1,31 @@
+# Container image for the LVM backend plugin. Ships the LVM2 tools (lvcreate,
+# lvremove, lvextend, lvs) for the control plane, thin-provisioning-tools for thin
+# pools (lvm2 shells out to thin_check etc.), and the standard mkfs/mount tooling
+# for the node. Runs as a sidecar in Bard's controller + node pods; both need host
+# LVM/device access (see deploy/examples/lvm).
+# RUNTIME_BASE is a build-arg (Debian-family default); see Dockerfile.plugin-lvm.hardened
+# for a Chainguard Wolfi build. NOTE: thin-provisioning-tools (thin pools) is NOT
+# in the public Wolfi catalog, so a hardened image supports thick LVM only unless
+# you supply a custom APK -- see docs/hardened-images.md.
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-lvm ./cmd/bard-plugin-lvm
+
+FROM ${RUNTIME_BASE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        lvm2 \
+        thin-provisioning-tools \
+        e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        util-linux \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bard-plugin-lvm /usr/local/bin/bard-plugin-lvm
+ENTRYPOINT ["/usr/local/bin/bard-plugin-lvm"]

@@ -1,0 +1,221 @@
+# Node plane: Bard core (--node) + the node-driver-registrar, plus the Ceph RBD
+# backend plugin as a sidecar. Core's node container is UNPRIVILEGED -- it does
+# no mounts and shells out to nothing; it proxies node ops to the plugin over the
+# shared socket. The plugin sidecar is the privileged one: it runs rbd-nbd/krbd
+# and mounts into the host kubelet dir. NODE_ZONE is what core reports as the
+# node's topology, which the provisioner feeds back into CreateVolume.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: bard-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: bard-csi-node
+  template:
+    metadata:
+      labels:
+        app: bard-csi-node
+    spec:
+      serviceAccountName: bard-csi-node
+      hostNetwork: true # plugin reaches the Ceph mons on the host network
+      hostPID: true     # stable namespace for the rbd-nbd daemons
+      # Shared fsGroup so the per-pod `plugins` emptyDir + its plugin sockets are
+      # group-owned, letting a non-root core (hardened/distroless base) connect to
+      # a root plugin's 0660 socket. See docs/hardened-images.md.
+      securityContext:
+        fsGroup: 65532
+      containers:
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.0
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path=/var/lib/kubelet/plugins/csi.bard.io/csi.sock"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+
+        # Bard core: unprivileged, no host mounts, no storage tools.
+        - name: bard-csi
+          image: ghcr.io/kindacoolhamster/bard-csi:dev
+          # Node core must run as root: it binds the CSI socket in /csi, a kubelet
+          # hostPath (root:root) that fsGroup does NOT manage (fsGroup only owns
+          # emptyDir/PV-type volumes), so a nonroot user gets "bind: permission
+          # denied". The controller core has no such constraint (its sockets are in
+          # an fsGroup-managed emptyDir) and stays nonroot. This matches how upstream
+          # CSI node plugins run -- ceph-csi's csi-rbdplugin and GCP PD's gce-pd-driver
+          # node containers are privileged with no runAsUser, i.e. root, because the
+          # mount path needs CAP_SYS_ADMIN (here the privileged plugin sidecar does
+          # the mounting; core only needs root for this socket bind). With a hardened
+          # image whose default user is nonroot (e.g. chainguard/static), pin it back
+          # to root here; the image stays hardened (no shell/pkg mgr).
+          securityContext:
+            runAsUser: 0
+          args:
+            - "--node"
+            - "--endpoint=unix:///csi/csi.sock"
+            # csi-addons node (online) ReclaimSpace -> the plugin's fstrim, served
+            # on a second socket for the node csi-addons sidecar below.
+            - "--csi-addons-endpoint=unix:///csi/csi-addons.sock"
+            - "--config-source=crd"   # read BackendCluster CRs at startup
+            - "--nodeid=$(NODE_ID)"
+            # Zone comes from this node's topology label, read via the API at
+            # startup -- so one DaemonSet serves many zones. Label your nodes:
+            #   kubectl label node <n> topology.kubernetes.io/zone=<cluster>
+            - "--zone-label=topology.kubernetes.io/zone"
+            # CRUSH-location labels for RBD read-affinity: core reads these node
+            # labels and threads the node's CRUSH location into NodeStage, so a
+            # read-affinity backend (readAffinity: true) maps with
+            # read_from_replica=localize. Each label's last path segment is the
+            # CRUSH bucket type. Off unless set; uncomment to enable:
+            # - "--crush-location-labels=topology.kubernetes.io/region,topology.kubernetes.io/zone"
+            - "--v=2"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Cap volumes per node where the mounter is device-limited. rbd-nbd is
+            # bounded by the node's /dev/nbdN count (nbds_max), so over-committing
+            # wedges staging. Set this to that count (krbd has no such limit -> 0).
+            # - name: MAX_VOLUMES_PER_NODE
+            #   value: "16"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            # Read-only view of kubelet's volume mounts so NodeGetVolumeStats can
+            # statfs a published path. HostToContainer propagation makes the
+            # plugin's (Bidirectional) mounts visible here.
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: HostToContainer
+              readOnly: true
+
+        # csi-addons node sidecar: drives the node (online) phase of a
+        # ReclaimSpaceJob -> the driver's NodeReclaimSpace (fstrim). Registers a
+        # CSIAddonsNode for this node. Needs the cluster-wide csi-addons
+        # controller-manager (see deploy/examples/reclaimspace/).
+        - name: csi-addons
+          image: quay.io/csiaddons/k8s-sidecar:v0.12.0
+          args:
+            - "--csi-addons-address=$(CSIADDONS_ENDPOINT)"
+            - "--node-id=$(NODE_ID)"
+            - "--namespace=$(POD_NAMESPACE)"
+            - "--pod=$(POD_NAME)"
+            - "--pod-uid=$(POD_UID)"
+            # The sidecar serves its CSIAddonsNode controller endpoint on this port;
+            # it is required (the sidecar exits "invalid controller port" without it).
+            - "--controller-port=9070"
+            - "--v=2"
+          env:
+            - name: CSIADDONS_ENDPOINT
+              value: unix:///csi/csi-addons.sock
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+
+        # Ceph RBD backend plugin (node plane): maps the image and mounts it.
+        # Privileged + host /dev + the kubelet dir with Bidirectional propagation
+        # so its mounts reach kubelet.
+        - name: ceph-rbd-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-ceph-rbd:dev
+          securityContext:
+            privileged: true
+          args:
+            - "--socket=/var/lib/bard/plugins/ceph-rbd.sock"
+            - "--config=/etc/bard-ceph/config.yaml"
+            - "--key-dir=/etc/bard-ceph-keys"
+            # Per-instance LUKS master keys. Enables encrypted volumes
+            # (StorageClass param `encrypted: "true"`); a per-volume passphrase is
+            # HKDF-derived from the instance's master key. Node-plane only.
+            - "--encryption-key-dir=/etc/bard-ceph-encryption"
+            # Optional KMS providers (Vault, ...) selected by encryptionKMSID.
+            - "--kms-config=/etc/bard-ceph-kms/config.yaml"
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            - name: ceph-config
+              mountPath: /etc/bard-ceph
+              readOnly: true
+            - name: ceph-keys
+              mountPath: /etc/bard-ceph-keys
+              readOnly: true
+            - name: ceph-encryption-keys
+              mountPath: /etc/bard-ceph-encryption
+              readOnly: true
+            - name: ceph-kms-config
+              mountPath: /etc/bard-ceph-kms
+              readOnly: true
+            - name: ceph-vault-token
+              mountPath: /etc/bard-ceph-vault
+              readOnly: true
+            - name: ceph-kmip-certs
+              mountPath: /etc/bard-ceph-kmip
+              readOnly: true
+            - name: ceph-azure-creds
+              mountPath: /etc/bard-ceph-azure
+              readOnly: true
+            - name: dev-dir
+              mountPath: /dev
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/csi.bard.io/
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        - name: plugins
+          emptyDir: {}
+        - name: ceph-config
+          configMap:
+            name: bard-ceph-config
+        - name: ceph-keys
+          secret:
+            secretName: bard-ceph-keys
+        - name: ceph-encryption-keys
+          secret:
+            secretName: bard-ceph-encryption
+            optional: true # encryption is opt-in; absent secret => encrypted volumes fail clearly
+        - name: ceph-kms-config
+          configMap:
+            name: bard-ceph-kms
+            optional: true # KMS is opt-in (encryptionKMSID); absent => derived-key encryption only
+        - name: ceph-vault-token
+          secret:
+            secretName: bard-ceph-vault-token
+            optional: true
+        - name: ceph-kmip-certs
+          secret:
+            secretName: bard-ceph-kmip-certs
+            optional: true # KMIP mutual-TLS client cert/key + server CA (kmip provider)
+        - name: ceph-azure-creds
+          secret:
+            secretName: bard-ceph-azure
+            optional: true # Azure Key Vault client secret / CA (azure-kv provider)

@@ -1,0 +1,31 @@
+# End-to-end smoke test: a PVC on the bard-rbd StorageClass and a pod that
+# writes to it. With WaitForFirstConsumer the PVC stays Pending until the pod is
+# scheduled, at which point the provisioner creates a real rbd image in Ceph,
+# the node maps+formats+mounts it, and the pod writes a proof file.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bard-test
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bard-test
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo bard-csi-works > /data/proof.txt && sync && cat /data/proof.txt && sleep 3600"]
+      volumeMounts:
+        - name: vol
+          mountPath: /data
+  volumes:
+    - name: vol
+      persistentVolumeClaim:
+        claimName: bard-test

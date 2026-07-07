@@ -1,0 +1,19 @@
+# CSIDriver with control-plane attach ENABLED -- apply this INSTEAD of
+# deploy/00-csidriver.yaml when running an attach-style backend (e.g. iSCSI).
+#
+# attachRequired: true  -- the external-attacher creates a VolumeAttachment per
+#   volume and calls ControllerPublishVolume before NodeStage. Node-mapped
+#   backends (Ceph RBD, LVM) no-op the publish; an attach backend (iSCSI) does the
+#   real per-node LUN masking. This field is IMMUTABLE; changing it on an existing
+#   install requires deleting and recreating this object (see this dir's README).
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.bard.io
+spec:
+  attachRequired: true
+  storageCapacity: true
+  podInfoOnMount: true
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent

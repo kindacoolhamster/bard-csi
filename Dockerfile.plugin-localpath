@@ -1,0 +1,26 @@
+# Container image for the localpath backend plugin -- written in Python to prove
+# Bard's plugin contract is language-agnostic (it's just HTTP+JSON over a unix
+# socket; see pkg/bardplugin). No build step, no compiler: just the stdlib script
+# plus a Python interpreter and the node's mount/umount/findmnt.
+#
+# Doubles as the *hardened-base* example: the default RUNTIME_BASE is a Chainguard
+# Wolfi base (minimal, CVE-tracked, no extra userspace). RUNTIME_BASE is a
+# build-arg, so you can swap your own licensed Chainguard org image or fall back to
+# a stock base with no fork, e.g.:
+#   podman build -f Dockerfile.plugin-localpath \
+#     --build-arg RUNTIME_BASE=python:3-slim --build-arg PKG=apt -t bard-plugin-localpath .
+#
+# NOTE the package-manager split: Debian's util-linux bundles mount/umount/findmnt,
+# but Wolfi ships them as separate packages -- see docs/hardened-images.md.
+ARG RUNTIME_BASE=cgr.dev/chainguard/wolfi-base:latest
+ARG PKG=apk
+FROM ${RUNTIME_BASE}
+ARG PKG=apk
+# apk (Wolfi/Alpine) by default; pass --build-arg PKG=apt for a Debian-family base.
+RUN if [ "${PKG:-apk}" = "apt" ]; then \
+        apt-get update && apt-get install -y --no-install-recommends python3 util-linux && rm -rf /var/lib/apt/lists/*; \
+    else \
+        apk add --no-cache python3 mount umount findmnt; \
+    fi
+COPY plugins/localpath/bard-plugin-localpath /usr/local/bin/bard-plugin-localpath
+ENTRYPOINT ["/usr/local/bin/bard-plugin-localpath"]

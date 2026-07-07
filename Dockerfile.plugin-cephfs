@@ -1,0 +1,39 @@
+# Container image for the CephFS backend plugin. Ships the ceph CLI (subvolume
+# management + mount.ceph for the kernel mounter) and ceph-fuse (userspace
+# mounter). Runs as a sidecar in Bard's controller + node pods.
+#
+# RUNTIME_BASE is a build-arg (Debian-family default); the apt layer is
+# Debian-specific. Like the RBD plugin, the Ceph client packages are not in the
+# public Wolfi catalog -- a hardened CephFS image needs a licensed/custom APK
+# (docs/hardened-images.md).
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-cephfs ./cmd/bard-plugin-cephfs
+
+FROM ${RUNTIME_BASE}
+# Ceph client from the UPSTREAM apt repo (bookworm's is EOL Pacific 16.2); see
+# Dockerfile.plugin-ceph-rbd for the rationale. Match CEPH_RELEASE to your cluster.
+ARG CEPH_RELEASE=tentacle
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -d /etc/apt/keyrings \
+    && curl -fsSL https://download.ceph.com/keys/release.asc -o /etc/apt/keyrings/ceph.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/etc/apt/keyrings/ceph.asc] https://download.ceph.com/debian-${CEPH_RELEASE} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/ceph.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ceph-common \
+        ceph-fuse \
+        fuse \
+        util-linux \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bard-plugin-cephfs /usr/local/bin/bard-plugin-cephfs
+ENTRYPOINT ["/usr/local/bin/bard-plugin-cephfs"]

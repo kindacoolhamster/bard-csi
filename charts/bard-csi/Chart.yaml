@@ -1,0 +1,40 @@
+apiVersion: v2
+name: bard-csi
+description: |
+  Bard CSI — a multi-backend Kubernetes CSI driver whose headline feature is one
+  StorageClass provisioning across multiple backend instances/zones. Backends are
+  out-of-tree plugins (Ceph RBD, CephFS, NFS, LVM, iSCSI, or your own in any
+  language) that run as sidecars alongside the backend-agnostic core.
+
+  This chart deploys the driver runtime: core (controller + node), the CSI
+  sidecars, and whatever backend plugin sidecars you enable. Backend connection
+  config and credentials are NOT owned by this chart — you supply them as
+  ConfigMaps/Secrets the plugin sidecars reference by name.
+type: application
+# version/appVersion here are DEV placeholders: the release workflow packages
+# the chart with the git tag's version (helm package --version/--app-version),
+# so cutting a release never needs a bump commit here.
+version: 0.1.0
+# The bard-csi core image tag a plugin/sidecar image tag defaults to when unset.
+appVersion: "0.1.0"
+keywords:
+  - csi
+  - storage
+  - ceph
+  - rbd
+home: https://github.com/kindacoolhamster/bard-csi
+sources:
+  - https://github.com/kindacoolhamster/bard-csi
+maintainers:
+  - name: kindacoolhamster
+    email: kindacoolhamster@gmail.com
+    url: https://github.com/kindacoolhamster
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/links: |
+    - name: source
+      url: https://github.com/kindacoolhamster/bard-csi
+    - name: quickstart
+      url: https://github.com/kindacoolhamster/bard-csi/blob/main/docs/quickstart.md
+    - name: writing a backend plugin
+      url: https://github.com/kindacoolhamster/bard-csi/blob/main/docs/writing-a-plugin.md

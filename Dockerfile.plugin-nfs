@@ -1,0 +1,24 @@
+# Container image for the NFS backend plugin (an out-of-tree Bard backend).
+# Runs as a sidecar in Bard's controller + node pods.
+#
+# RUNTIME_BASE is a build-arg (Debian-family default); the apt layer is
+# Debian-specific. NFS's tools (nfs-utils/mount.nfs, tar, gzip) do exist in the
+# public Wolfi catalog, so this one can move to a hardened base with an apk swap
+# (docs/hardened-images.md).
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-nfs ./cmd/bard-plugin-nfs
+
+# Runtime: needs the NFS mount helper (mount.nfs), mount/umount, and tar/gzip +
+# coreutils for the tar-based snapshot/restore/clone path.
+FROM ${RUNTIME_BASE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nfs-common util-linux tar gzip coreutils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bard-plugin-nfs /usr/local/bin/bard-plugin-nfs
+ENTRYPOINT ["/usr/local/bin/bard-plugin-nfs"]

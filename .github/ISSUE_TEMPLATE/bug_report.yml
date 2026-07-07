@@ -1,0 +1,65 @@
+name: Bug report
+description: Something isn't working
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: bard-version
+    attributes:
+      label: Bard version
+      description: Release tag or image tag
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: install-method
+    attributes:
+      label: Install method
+      options:
+        - Helm chart
+        - deploy/ manifests
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - ceph-rbd
+        - cephfs
+        - nfs
+        - lvm
+        - iscsi
+        - custom plugin
+        - not backend-specific
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes distribution and version
+      placeholder: e.g. k3s v1.31.4, kubeadm v1.30.2, kind v0.27.0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Controller and node plugin logs
+      description: |
+        kubectl -n kube-system logs -l app=bard-csi-controller --all-containers --tail=200
+        kubectl -n kube-system logs -l app=bard-csi-node --all-containers --tail=200
+        Redact monitor addresses and keys if needed.
+      render: text
+  - type: textarea
+    id: manifests
+    attributes:
+      label: Relevant manifests
+      description: StorageClass, BackendCluster, PVC — with secrets redacted.
+      render: yaml

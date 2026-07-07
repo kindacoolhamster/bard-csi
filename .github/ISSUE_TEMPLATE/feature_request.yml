@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that Bard doesn't support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you'd like it to work — StorageClass parameter, CRD field, CLI, etc.
+  - type: textarea
+    id: prior-art
+    attributes:
+      label: Prior art
+      description: Does another CSI driver (ceph-csi, democratic-csi, cloud drivers) have this? Link it.

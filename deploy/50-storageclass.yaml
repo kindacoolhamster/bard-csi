@@ -1,0 +1,267 @@
+# A SINGLE StorageClass that spans every configured Ceph cluster.
+#
+# volumeBindingMode: WaitForFirstConsumer defers provisioning until a pod is
+# scheduled, so the external-provisioner can pass the chosen node's zone into
+# CreateVolume. The dispatcher maps that zone to a Ceph cluster. Note there is
+# no clusterID / monitor list baked in here -- that is exactly the Ceph CSI
+# limitation this design removes. The class names ONLY the backend type; which
+# cluster -- AND its pool -- is decided per-volume from the resolved instance.
+#
+# Deliberately NO `pool` param: a pool pinned on the class would force every
+# cluster to use the same pool name, which breaks one-class-many-clusters. Each
+# instance carries its own pool in the plugin's config (bard-ceph-config). Set
+# `pool` here only if every cluster genuinely shares one pool name.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4   # also: ext3, ext2, xfs, btrfs
+  # Optional rados namespace for multi-tenancy: isolate this class's images inside
+  # a namespace within the pool (the cephx user can be scoped
+  # `profile rbd pool=<pool> namespace=<ns>`). Overrides the instance's
+  # radosNamespace. Omit for the pool's default namespace.
+  #   radosNamespace: tenant-a
+  # Optional custom prefix for the backend rbd image name (default "csi-vol-"), so
+  # a team's/cluster's images are recognisable in the pool. The image name is
+  # prefix+hash(pvc-name) and the prefix is recorded in the volume handle, so it
+  # threads the whole lifecycle. ceph-csi parity.
+  #   volumeNamePrefix: "team-a-"
+  # Optional RBD image tuning, passed through to `rbd create`:
+  #   imageFeatures: "layering,exclusive-lock,object-map,fast-diff"
+  #   stripeUnit: "65536"   # with stripeCount (both required); needs striping-v2
+  #   stripeCount: "16"
+  #   objectSize: "4194304" # rbd object size in bytes (power of two)
+  # Optional mkfs override. When unset the node formats a fresh volume with defaults
+  # tuned for thin rbd (ext4/3: -m0 -Enodiscard,lazy_itable_init=1,lazy_journal_init=1;
+  # xfs: -K). Set this to pass your own space-separated mkfs args instead. ceph-csi
+  # parity. (Only the filesystem mkfs args; the device is appended automatically.)
+  #   mkfsOptions: "-b 4096 -I 256"
+  # Erasure-coded backing: put image DATA in a separate (EC) pool while metadata
+  # stays in `pool` -- the EC pool needs allow_ec_overwrites. `rbd ... --data-pool`.
+  #   dataPool: "ec-data-pool"
+  # Node map/unmap tuning, passed through to `rbd map`/`rbd unmap` (or rbd-nbd).
+  # Values may be mounter-scoped with `krbd:`/`nbd:` segments separated by ';'
+  # (an unprefixed segment applies to whichever mounter is in use):
+  #   mapOptions: "krbd:notrim;nbd:try-netlink"
+  #   unmapOptions: "force"
+  # Fall back from krbd to rbd-nbd if the krbd `rbd map` fails (e.g. the node's krbd
+  # driver lacks an image feature). The mounter that mapped is recorded so unmap uses
+  # the right tool. ceph-csi parity. (Only meaningful when the instance uses krbd.)
+  #   tryOtherMounters: "true"
+  # rbd-nbd client log control (rbd-nbd maps only; krbd has no client log). cephLogDir
+  # places a per-volume log file there; cephLogStrategy says what NodeUnstage does
+  # with it after a clean unmap: remove (default), compress (gzip), preserve.
+  # ceph-csi parity.
+  #   cephLogDir: "/var/log/bard"
+  #   cephLogStrategy: "compress"
+  # Filesystem mount options come from the StorageClass `mountOptions:` field.
+  # No CSI secret references here: the driver resolves each cluster's cephx key
+  # itself from the per-instance keys Secret it mounts (see deploy/40-node.yaml,
+  # hack/secret.example.yaml). That is what lets ONE StorageClass address many
+  # clusters -- the external-provisioner's secret-name templating has no
+  # node-zone token, so it cannot pick a per-cluster secret on its own.
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted variant: same multi-cluster dispatch, but volumes are LUKS-encrypted
+# at the node, so Ceph only ever stores ciphertext. The per-volume passphrase is
+# HKDF-derived from the instance's master key in the bard-ceph-encryption Secret
+# (see hack/secret-encryption.example.yaml); the StorageClass carries no secret,
+# preserving one-class-many-clusters.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  # Optional: pass filesystem TRIM/discard through the LUKS layer to the rbd image
+  # so Ceph reclaims freed blocks (thin provisioning). Off by default because
+  # dm-crypt discards leak which sectors hold data; opt in only when that is
+  # acceptable. Has no effect on unencrypted volumes (TRIM passes through anyway).
+  encryptedDiscards: "true"
+  # Optional LUKS format tuning, passed to `cryptsetup luksFormat` at first stage
+  # (cryptsetup defaults are used when unset; applies to block/LUKS mode only, not
+  # fscrypt). Validated at provision time. ceph-csi parity.
+  #   encryptionCipher: "aes-xts-plain64"
+  #   encryptionKeySize: "512"            # key size in bits
+  #   encryptionSectorSize: "4096"        # 512 / 1024 / 2048 / 4096
+  # dm-integrity authenticated encryption (detects tampering, not just confidentiality):
+  # hmac-sha256 / hmac-sha512 (with an XTS cipher) or aead (with an AEAD cipher). NOTE
+  # the device is WIPED at format to initialise integrity tags (slower provision,
+  # de-sparsifies the image) and it is incompatible with encryptedDiscards.
+  #   integrityMode: "hmac-sha256"
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted, with the per-volume passphrase managed by a KMS (here the vault-dev
+# provider from the bard-ceph-kms ConfigMap) instead of the derived master key.
+# The passphrase is generated and stored in Vault on first stage; the plaintext
+# key never touches Ceph, the volume context, or the plugin config.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-vault
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: vault-dev
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted with the Kubernetes secrets-metadata KMS: no Vault. A per-volume
+# random key is wrapped with the instance master key (bard-ceph-encryption Secret)
+# and stored in the rbd image metadata. Same as the derived-key default in
+# operational terms, but each volume gets independent random key material.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-k8s
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: k8s-secrets
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted with AWS KMS (the aws-kms provider in bard-ceph-kms): the per-volume
+# data key comes from KMS GenerateDataKey, only its KMS-encrypted form is stored in
+# the rbd image metadata, and the key-encryption key never leaves AWS. Requires the
+# aws-kms provider to be uncommented in the bard-ceph-kms ConfigMap with creds.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-aws
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: aws-kms
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted with AWS KMS via STS web-identity / IRSA (the aws-sts-metadata provider in
+# bard-ceph-kms): identical envelope encryption to aws-kms, but the plugin holds NO
+# static AWS keys -- it assumes an IAM role with its projected ServiceAccount token over
+# STS. The drop-in path for an EKS cluster already using IRSA. Requires the
+# aws-sts-metadata provider (with roleArn) uncommented in the bard-ceph-kms ConfigMap.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-aws-sts
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: aws-sts-metadata
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted with Azure Key Vault (the azure-kv provider in bard-ceph-kms): the
+# per-volume passphrase is stored as a Key Vault secret. Requires the azure-kv
+# provider to be uncommented in the bard-ceph-kms ConfigMap with vault URL + creds.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-azure
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: azure-kv
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Filesystem-level encryption (fscrypt) instead of the default block-level LUKS:
+# the volume is a normal ext4 filesystem with the kernel's native fscrypt, and the
+# pod's data lives in an encrypted directory on it (file contents + names encrypted;
+# filesystem metadata and free space are not -- the LUKS trade-off). Uses the same
+# KMS providers as block mode (here the derived default; add encryptionKMSID to pick
+# another). fsType must be ext4; not available for raw block volumes.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-fscrypt
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionType: file
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Encrypted with a KMIP key manager / HSM (the kmip provider in bard-ceph-kms): the
+# per-volume passphrase is stored as a SecretData object in the HSM. The on-prem /
+# FIPS path. Requires the kmip provider to be uncommented with endpoint + TLS certs.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-rbd-encrypted-kmip
+provisioner: csi.bard.io
+parameters:
+  backend: ceph-rbd
+  fsType: ext4
+  encrypted: "true"
+  encryptionKMSID: kmip
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: bard-rbd-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete
+# Optional: custom prefix for the backend rbd snapshot name (default "csi-snap-"),
+# recorded in the snapshot handle so delete/restore follow it. Also honoured on a
+# VolumeGroupSnapshotClass for group-snapshot members. ceph-csi parity.
+# parameters:
+#   snapshotNamePrefix: "team-snap-"
+---
+# VolumeGroupSnapshot: snapshot a set of volumes (selected by label) as one
+# group. Bard snapshots each member individually and returns them together, so a
+# group can even span multiple Ceph clusters/instances -- but members are taken
+# in sequence, so the group is per-volume crash consistent, not atomic across
+# volumes. Needs external-snapshotter v8+ and the group-snapshot CRDs.
+apiVersion: groupsnapshot.storage.k8s.io/v1beta1
+kind: VolumeGroupSnapshotClass
+metadata:
+  name: bard-rbd-group-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete
+---
+# Runtime-mutable parameters: set `volumeAttributesClassName: bard-rbd-qos` on a
+# PVC (or change it) and the external-resizer calls ControllerModifyVolume, which
+# applies these as rbd QoS throttles on the live image (no remount). Supported
+# keys: qos{,Read,Write}{Iops,Bps}Limit. VolumeAttributesClass is GA in
+# Kubernetes 1.34 (storage.k8s.io/v1); it is beta (v1beta1) on 1.31-1.33.
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttributesClass
+metadata:
+  name: bard-rbd-qos
+driverName: csi.bard.io
+parameters:
+  qosIopsLimit: "2000"
+  qosBpsLimit: "104857600" # 100 MiB/s

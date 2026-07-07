@@ -1,0 +1,48 @@
+# Topology dispatch proof (busybox): two PVCs on the SAME StorageClass (bard-rbd),
+# one pod pinned to each zone. WaitForFirstConsumer defers provisioning until the
+# pod is scheduled, so the chosen node's zone selects the backend:
+#   topo-galileo (k3s-server, zone galileo) -> instance galileo -> pool k8s-csi-test
+#   topo-zoneb   (k3s-agent2, zone zoneb)   -> instance zoneb   -> pool k8s-csi-zoneb
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: topo-galileo }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: topo-galileo }
+spec:
+  nodeSelector: { kubernetes.io/hostname: k3s-server }   # zone galileo
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh","-c","echo on-galileo > /data/where.txt && sync && cat /data/where.txt && sleep 3600"]
+      volumeMounts: [{ name: vol, mountPath: /data }]
+  volumes:
+    - name: vol
+      persistentVolumeClaim: { claimName: topo-galileo }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: topo-zoneb }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata: { name: topo-zoneb }
+spec:
+  nodeSelector: { kubernetes.io/hostname: k3s-agent2 }   # zone zoneb
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh","-c","echo on-zoneb > /data/where.txt && sync && cat /data/where.txt && sleep 3600"]
+      volumeMounts: [{ name: vol, mountPath: /data }]
+  volumes:
+    - name: vol
+      persistentVolumeClaim: { claimName: topo-zoneb }

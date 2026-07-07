@@ -1,0 +1,30 @@
+# Extra RBAC the external-attacher needs, on top of the controller's base role
+# (deploy/10-rbac.yaml, which grants VolumeAttachments get/list/watch for the
+# resizer). The attacher additionally patches VolumeAttachments + their status.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bard-csi-attacher
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bard-csi-attacher
+subjects:
+  - kind: ServiceAccount
+    name: bard-csi-controller
+    namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bard-csi-attacher

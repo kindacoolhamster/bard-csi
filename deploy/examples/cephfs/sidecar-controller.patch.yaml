@@ -1,0 +1,24 @@
+# Strategic-merge patch adding the CephFS plugin sidecar to Bard's controller.
+#   kubectl -n kube-system patch deployment bard-csi-controller \
+#     --type=strategic --patch-file deploy/examples/cephfs/sidecar-controller.patch.yaml
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cephfs-config
+          configMap:
+            name: bard-cephfs-config
+        - name: cephfs-keys
+          secret:
+            secretName: bard-cephfs-keys
+      containers:
+        # Control-plane: `ceph fs subvolume` ops are userspace network calls, so
+        # this sidecar needs no privilege.
+        - name: cephfs-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-cephfs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/cephfs.sock", "--config=/etc/bard-cephfs/config.yaml", "--key-dir=/etc/bard-cephfs-keys"]
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: cephfs-config, mountPath: /etc/bard-cephfs, readOnly: true }
+            - { name: cephfs-keys, mountPath: /etc/bard-cephfs-keys, readOnly: true }

@@ -1,0 +1,19 @@
+# The cross-namespace restore: dataSourceRef (not dataSource) carries the source
+# namespace. Provisions as a normal snapshot restore once the ReferenceGrant in
+# the source namespace allows it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: restored-from-team-src
+  namespace: default
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  dataSourceRef:
+    apiGroup: snapshot.storage.k8s.io
+    kind: VolumeSnapshot
+    name: golden-snap
+    namespace: team-src
+  resources:
+    requests:
+      storage: 1Gi

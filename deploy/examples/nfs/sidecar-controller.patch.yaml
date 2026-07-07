@@ -1,0 +1,32 @@
+# Strategic-merge patch adding the NFS plugin sidecar to Bard's controller.
+# Apply with:
+#   kubectl -n kube-system patch deployment bard-csi-controller \
+#     --type=strategic --patch-file deploy/examples/nfs/sidecar-controller.patch.yaml
+spec:
+  template:
+    spec:
+      volumes:
+        - name: plugins
+          emptyDir: {}
+        - name: nfs-config
+          configMap:
+            name: bard-nfs-config
+      containers:
+        # Give Bard's own container access to the shared plugin socket dir.
+        - name: bard-csi
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+        # The NFS plugin sidecar (control plane: creates/removes subdirectories).
+        - name: nfs-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-nfs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/nfs.sock", "--config=/etc/bard-nfs/config.yaml"]
+          securityContext:
+            privileged: true # on-demand NFS mount to create subdirs
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            - name: nfs-config
+              mountPath: /etc/bard-nfs
+              readOnly: true

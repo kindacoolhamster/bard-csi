@@ -1,0 +1,146 @@
+# Bard core config: which backend instances exist and the zone each serves.
+# Core is backend-agnostic -- a BackendCluster only declares a backend *type*,
+# its plugin socket, and the topology zone; everything backend-specific lives in
+# the plugin's own config (below). A single StorageClass referencing backend
+# "ceph-rbd" lands volumes on whichever cluster the scheduled pod's zone
+# resolves to. Bard lists these at startup (--config-source=crd).
+#
+# Add a second cluster by applying ANOTHER BackendCluster (same backendType, a
+# new instance + zone), plus a matching instance in bard-ceph-config and a key
+# in bard-ceph-keys. No StorageClass change needed -- the multi-cluster capability.
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: galileo-rbd
+spec:
+  backendType: ceph-rbd
+  instance: galileo
+  # Zone == the node's topology.kubernetes.io/zone label. Label the galileo-zone
+  # nodes `topology.kubernetes.io/zone=galileo`; a second cluster gets its own
+  # BackendCluster with a different zone, and nodes labelled to match.
+  zone: galileo
+  default: true
+  plugin:
+    endpoint: /var/lib/bard/plugins/ceph-rbd.sock
+---
+# The Ceph RBD plugin's OWN config: per-instance cluster connection details.
+# Bard core never reads this. cephx keys are NOT here -- they come from the
+# bard-ceph-keys Secret (untracked hack/secret.yaml; template hack/secret.example.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-ceph-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        monitors: ["192.0.2.1:3300"]   # replace with your mon address(es)
+        pool: k8s-csi-test
+        userID: k8s-csi-test
+        # Optional rados namespace: scope this instance's images to a namespace
+        # inside the pool for multi-tenancy (a StorageClass radosNamespace param
+        # overrides it). Omit for the pool's default namespace.
+        # radosNamespace: tenant-a
+        # The plugin defaults to krbd (kernel rbd), which is preferred in
+        # production. This dev example uses rbd-nbd because kind nodes cannot
+        # write the krbd sysfs; on real nodes drop this line.
+        mounter: rbd-nbd
+        # Read-affinity: prefer a CRUSH-local OSD replica for reads. Needs krbd
+        # (drop the rbd-nbd line above) and core's --crush-location-labels so the
+        # node's CRUSH location is known (see deploy/40-node.yaml). Off by default.
+        # readAffinity: true
+        # Optional deployment name stamped on every created image as image-meta
+        # `csi.ceph.com/cluster/name` (ceph-csi's key), to identify which
+        # Kubernetes cluster minted an image when several share a pool.
+        # clusterName: prod-east
+---
+# Optional KMS providers for LUKS encryption. A StorageClass picks one with
+# `encryptionKMSID: <id>`; without it, encrypted volumes use the per-instance
+# derived master key (Secret bard-ceph-encryption). The plugin mounts this at
+# /etc/bard-ceph-kms (--kms-config). The Vault token is NOT here -- it comes from
+# the bard-ceph-vault-token Secret (untracked; template hack/secret-vault-token.example.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-ceph-kms
+  namespace: kube-system
+data:
+  config.yaml: |
+    providers:
+      # Static-token auth: simplest, but the token is long-lived. Good for dev.
+      vault-dev:
+        type: vault
+        address: http://192.0.2.1:8200   # a real cluster points at its Vault
+        kvMount: secret                       # KV v2 mount
+        pathPrefix: bard-luks                 # secret path prefix
+        tokenFile: /etc/bard-ceph-vault/token # from the bard-ceph-vault-token Secret
+      # Kubernetes auth (recommended): the plugin logs in with its ServiceAccount
+      # JWT for a short-lived token -- no static secret to manage or leak. Requires
+      # `vault auth enable kubernetes` + a role bound to the plugin's SAs
+      # (bard-csi-node, bard-csi-controller in kube-system).
+      vault-k8s:
+        type: vault
+        address: http://192.0.2.1:8200
+        kvMount: secret
+        pathPrefix: bard-luks
+        authMethod: kubernetes
+        role: bard-csi                        # the Vault role to assume
+      # Kubernetes secrets-metadata (no external KMS): a per-volume random key is
+      # AES-GCM-wrapped with the instance master key (the bard-ceph-encryption
+      # Secret, --encryption-key-dir) and stored in the rbd image metadata. Needs
+      # no Vault and creates no per-volume Secret; each volume's key is independent
+      # random material (vs the default derived-key provider). The "kubernetes"
+      # type is an accepted alias.
+      k8s-secrets:
+        type: secrets-metadata
+      # AWS KMS (envelope encryption): a per-volume data key from GenerateDataKey is
+      # the LUKS passphrase; only its KMS-encrypted form is stored (in the rbd image
+      # metadata, like secrets-metadata), so the key-encryption key never leaves AWS.
+      # Decrypts on reopen; an encrypted clone inherits the wrapped DEK. Credentials
+      # come from credentialsFile (a mounted Secret in AWS shared-creds format),
+      # inline keys (dev only), or AWS_* env -- in that order. endpoint overrides the
+      # regional URL for a VPC endpoint or a local emulator (LocalStack / local-kms).
+      # aws-kms:
+      #   type: aws-kms
+      #   region: us-east-1
+      #   keyId: alias/bard-csi                  # KMS key id / ARN / alias
+      #   credentialsFile: /etc/bard-ceph-aws/credentials
+      #   # endpoint: http://kms.internal:4599   # optional override
+      # AWS KMS with STS web-identity (IRSA): same envelope encryption as aws-kms, but
+      # NO static AWS keys -- the plugin exchanges its projected ServiceAccount / IRSA
+      # token for an IAM role via STS AssumeRoleWithWebIdentity and uses the resulting
+      # short-lived credentials. The EKS migration path. roleArn is required; the token
+      # defaults to the projected SA token (set webIdentityTokenFile to the IRSA audience
+      # token on EKS). stsEndpoint overrides STS for a VPC endpoint or an emulator.
+      # aws-sts-metadata:
+      #   type: aws-sts-metadata
+      #   region: us-east-1
+      #   keyId: alias/bard-csi                  # KMS key id / ARN / alias
+      #   roleArn: arn:aws:iam::123456789012:role/bard-csi-kms
+      #   # webIdentityTokenFile: /var/run/secrets/eks.amazonaws.com/serviceaccount/token
+      #   # endpoint: http://kms.internal:4599   # optional KMS override
+      #   # stsEndpoint: https://sts.us-east-1.amazonaws.com  # optional STS override
+      # Azure Key Vault: the per-volume passphrase is stored as a Key Vault secret
+      # (the ceph-csi azure-kv model). Auth is AAD client-credentials (a service
+      # principal); use clientSecretFile to mount the secret rather than inline.
+      # authMethod: token (with token/tokenFile) is for emulators / pre-acquired
+      # tokens; caFile / insecureSkipVerify cover an emulator or Azure Stack endpoint.
+      # azure-kv:
+      #   type: azure-kv
+      #   vaultUrl: https://my-vault.vault.azure.net
+      #   tenantId: <aad-tenant-id>
+      #   clientId: <service-principal-app-id>
+      #   clientSecretFile: /etc/bard-ceph-azure/clientSecret
+      # KMIP (on-prem HSM / key manager, the FIPS path): the per-volume passphrase is
+      # Registered as a SecretData object on a KMIP server over mutual TLS. Point
+      # kmipEndpoint at the server; mount the client cert/key + the server CA. Works
+      # with PyKMIP, Thales, Entrust, etc. NOTE the server cert should be ECDSA (or a
+      # modern RSA-GCM cipher) -- PyKMIP's TLS1.2 suite only offers legacy CBC ciphers
+      # for RSA certs, which a modern TLS client will not negotiate.
+      # kmip:
+      #   type: kmip
+      #   kmipEndpoint: kmip.internal:5696
+      #   clientCertFile: /etc/bard-ceph-kmip/client.crt
+      #   clientKeyFile: /etc/bard-ceph-kmip/client.key
+      #   caFile: /etc/bard-ceph-kmip/ca.crt

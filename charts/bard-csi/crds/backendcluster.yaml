@@ -1,0 +1,60 @@
+# BackendCluster: the CRD that declares each storage backend instance Bard can
+# provision into. One CR == one instance (e.g. one Ceph cluster in a zone). It
+# replaces the bard-csi-config ConfigMap as core's source of truth: Bard lists
+# BackendClusters at startup and builds its backend registry + topology dispatch
+# from them.
+#
+# Cluster-scoped, like StorageClass/CSIDriver -- it describes cluster-wide
+# storage infrastructure, not namespaced workloads. No credentials here: cephx
+# keys still live in a Secret the plugin reads, keyed by instance id.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: backendclusters.bard.io
+spec:
+  group: bard.io
+  scope: Cluster
+  names:
+    kind: BackendCluster
+    listKind: BackendClusterList
+    plural: backendclusters
+    singular: backendcluster
+    shortNames: ["bcl"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["backendType", "zone", "plugin"]
+              properties:
+                backendType:
+                  type: string
+                  description: Backend type, matching the plugin's reported type (e.g. "ceph-rbd").
+                instance:
+                  type: string
+                  description: Instance id used in volume handles and to key the per-instance Secret. Defaults to metadata.name.
+                zone:
+                  type: string
+                  description: Topology zone this instance serves. A node in this zone resolves here; a volume created here is pinned to it.
+                default:
+                  type: boolean
+                  description: Use this instance for its backend type when a request carries no usable topology (Immediate binding).
+                plugin:
+                  type: object
+                  required: ["endpoint"]
+                  properties:
+                    endpoint:
+                      type: string
+                      description: Unix socket path of the backend plugin sidecar (shared with Bard's pods).
+      additionalPrinterColumns:
+        - { name: Type, type: string, jsonPath: .spec.backendType }
+        - { name: Instance, type: string, jsonPath: .spec.instance }
+        - { name: Zone, type: string, jsonPath: .spec.zone }
+        - { name: Endpoint, type: string, jsonPath: .spec.plugin.endpoint }
+        - { name: Default, type: boolean, jsonPath: .spec.default }

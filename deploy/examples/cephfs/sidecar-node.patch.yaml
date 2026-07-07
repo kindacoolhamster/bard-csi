@@ -1,0 +1,29 @@
+# Strategic-merge patch adding the CephFS plugin sidecar to Bard's node DaemonSet.
+#   kubectl -n kube-system patch daemonset bard-csi-node \
+#     --type=strategic --patch-file deploy/examples/cephfs/sidecar-node.patch.yaml
+spec:
+  template:
+    spec:
+      volumes:
+        - name: cephfs-config
+          configMap:
+            name: bard-cephfs-config
+        - name: cephfs-keys
+          secret:
+            secretName: bard-cephfs-keys
+      containers:
+        # Node-plane: mounts CephFS (ceph-fuse needs /dev/fuse; kernel mount needs
+        # the ceph module). Privileged + /dev + the kubelet dir with Bidirectional
+        # propagation so its mounts reach kubelet.
+        - name: cephfs-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-cephfs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/cephfs.sock", "--config=/etc/bard-cephfs/config.yaml", "--key-dir=/etc/bard-cephfs-keys"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: cephfs-config, mountPath: /etc/bard-cephfs, readOnly: true }
+            - { name: cephfs-keys, mountPath: /etc/bard-cephfs-keys, readOnly: true }
+            - { name: dev-dir, mountPath: /dev }
+            - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }

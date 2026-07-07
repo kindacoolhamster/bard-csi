@@ -1,0 +1,41 @@
+# A VolumeReplicationClass selects the backend + mirroring settings for a
+# VolumeReplication. schedulingInterval drives how often Bard takes a mirror
+# snapshot (snapshot-based RBD mirroring), i.e. the RPO floor.
+#
+# Prerequisite (cluster admin, one-time): the pool must have mirroring enabled and
+# a peer bootstrapped on BOTH Ceph clusters, with an rbd-mirror daemon running on
+# the secondary. Bard drives the per-image ops (enable/promote/demote/...); it does
+# not set up the pool peering. See README.md.
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: VolumeReplicationClass
+metadata:
+  name: bard-rbd-replication
+spec:
+  provisioner: csi.bard.io
+  parameters:
+    # How often to take a mirror snapshot on the primary (the RPO). Bard adds an
+    # `rbd mirror snapshot schedule` for this interval on EnableVolumeReplication.
+    schedulingInterval: "5m"
+    # Optional: credentials for the mirror ops. The per-instance provisioning user
+    # (mon 'profile rbd') already suffices for every rbd-mirror op, so this is only
+    # needed if you want a distinct user.
+    # replication.storage.openshift.io/replication-secret-name: bard-ceph-keys
+    # replication.storage.openshift.io/replication-secret-namespace: kube-system
+---
+# A VolumeReplication marks a specific PVC for mirroring and sets its role.
+# replicationState: primary  -> this cluster is the writable source (enable+promote)
+#                   secondary -> this cluster is the read-only replica (enable+demote)
+#                   resync    -> re-sync from the peer after a split-brain
+# A DR orchestrator (Ramen) flips replicationState across the two clusters to fail
+# over; you can also drive it by hand for testing.
+apiVersion: replication.storage.openshift.io/v1alpha1
+kind: VolumeReplication
+metadata:
+  name: bard-rbd-replication
+spec:
+  volumeReplicationClass: bard-rbd-replication
+  replicationState: primary
+  dataSource:
+    apiGroup: ""
+    kind: PersistentVolumeClaim
+    name: bard-rbd-pvc          # a PVC backed by the bard-rbd StorageClass

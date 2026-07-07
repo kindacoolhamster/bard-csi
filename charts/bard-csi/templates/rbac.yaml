@@ -1,0 +1,277 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+rules:
+  # external-provisioner (core CreateVolume/DeleteVolume + topology)
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+  # Bard core: read backend config from BackendCluster CRs.
+  - apiGroups: ["bard.io"]
+    resources: ["backendclusters"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csidrivers"]
+    verbs: ["get", "list", "watch"]
+  # bard-csi --inspect (the consistency scanner) reads these regardless of
+  # which sidecars are enabled. Read-only; harmless when the APIs are absent.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotclasses", "volumesnapshotcontents"]
+    verbs: ["get", "list"]
+  {{- if .Values.attach.enabled }}
+  # external-attacher (control-plane attach, e.g. iSCSI): patch VolumeAttachments
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments/status"]
+    verbs: ["patch"]
+  {{- end }}
+  {{- if .Values.sidecars.resizer.enabled }}
+  # external-resizer (expand + ModifyVolume / VolumeAttributesClass)
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattributesclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims/status"]
+    verbs: ["patch"]
+  {{- end }}
+  {{- if .Values.sidecars.snapshotter.enabled }}
+  # external-snapshotter
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotclasses", "volumesnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch", "create", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotcontents/status", "volumesnapshots/status"]
+    verbs: ["update", "patch"]
+  {{- if .Values.sidecars.snapshotter.groupSnapshots }}
+  # VolumeGroupSnapshot (external-snapshotter v8)
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotcontents/status"]
+    verbs: ["update", "patch"]
+  {{- end }}
+  {{- end }}
+  # Cross-namespace volume data sources: the provisioner authorizes a PVC's
+  # cross-namespace dataSourceRef against Gateway API ReferenceGrants (needs the
+  # CrossNamespaceVolumeDataSource cluster + provisioner feature gates). Harmless
+  # while the CRD/gate are absent. See deploy/examples/crossnamespace/.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch"]
+  {{- if .Values.storageCapacity }}
+  # external-provisioner --enable-capacity: publish CSIStorageCapacity, walk the
+  # owner-ref chain Pod -> ReplicaSet -> Deployment.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csistoragecapacities"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get"]
+  {{- end }}
+  {{- if or .Values.storageCapacity .Values.sidecars.healthMonitor.enabled }}
+  # pods: get (capacity owner-ref) + list/watch (health monitor maps volumes to pods)
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"{{ if .Values.sidecars.healthMonitor.enabled }}, "list", "watch"{{ end }}]
+  {{- end }}
+  {{- if .Values.sidecars.csiAddons.enabled }}
+  # csi-addons sidecar: register a CSIAddonsNode + read the ReclaimSpaceJobs it runs.
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["csiaddonsnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs", "reclaimspacecronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs/status", "reclaimspacecronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  # NetworkFence (controller-side node fencing for failover/DR; ceph-rbd only).
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["networkfences"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["networkfences/status"]
+    verbs: ["get", "update", "patch"]
+  # VolumeReplication (controller-side RBD mirroring for DR; ceph-rbd only).
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumereplications", "volumereplicationclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumereplications/status"]
+    verbs: ["get", "update", "patch"]
+  # VolumeGroup (rbd group) backs group replication for DR (harmless if the CRD is absent).
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumegroupreplications", "volumegroupreplicationclasses", "volumegroupreplicationcontents"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["replication.storage.openshift.io"]
+    resources: ["volumegroupreplications/status", "volumegroupreplicationcontents/status"]
+    verbs: ["get", "update", "patch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "bard-csi.fullname" . }}-controller
+    namespace: {{ include "bard-csi.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "bard-csi.fullname" . }}-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["bard.io"]
+    resources: ["backendclusters"]
+    verbs: ["get", "list", "watch"]
+  {{- if .Values.sidecars.csiAddons.enabled }}
+  # csi-addons node sidecar reads its own pod to resolve the CSIAddonsNode owner
+  # ref (pod -> DaemonSet) when registering; without it the sidecar crashloops
+  # with "failed to get CSIAddonsNode object".
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  # csi-addons node sidecar resolves the target PVC -> PV -> volume handle before
+  # calling NodeReclaimSpace (online fstrim); without it: "failed to get pv ...".
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  # csi-addons node sidecar: register a CSIAddonsNode + run node-phase ReclaimSpace.
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["csiaddonsnodes"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs", "reclaimspacecronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["reclaimspacejobs/status", "reclaimspacecronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  # EncryptionKeyRotation (node-side: LUKS key rotation on the staged device).
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["encryptionkeyrotationjobs", "encryptionkeyrotationcronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["csiaddons.openshift.io"]
+    resources: ["encryptionkeyrotationjobs/status", "encryptionkeyrotationcronjobs/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "watch", "list", "create", "update", "patch", "delete"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "bard-csi.fullname" . }}-node
+    namespace: {{ include "bard-csi.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "bard-csi.fullname" . }}-node
+  apiGroup: rbac.authorization.k8s.io
+{{- if .Values.sidecars.csiAddons.enabled }}
+---
+# The csi-addons sidecars serve a gRPC endpoint that the cluster-wide csi-addons
+# controller-manager connects to; the sidecar authenticates that connection with a
+# TokenReview, so each plane's SA needs system:auth-delegator. Without it the
+# CSIAddonsNode stays Failed ("failed to review token ... is forbidden").
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller-auth-delegator
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "bard-csi.fullname" . }}-controller
+    namespace: {{ include "bard-csi.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node-auth-delegator
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "bard-csi.fullname" . }}-node
+    namespace: {{ include "bard-csi.namespace" . }}
+roleRef:
+  kind: ClusterRole
+  name: system:auth-delegator
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

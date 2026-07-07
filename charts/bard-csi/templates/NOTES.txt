@@ -1,0 +1,52 @@
+Bard CSI {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+Controller : deploy/{{ include "bard-csi.fullname" . }}-controller  (namespace {{ include "bard-csi.namespace" . }})
+Node       : daemonset/{{ include "bard-csi.fullname" . }}-node
+
+Enabled plugins:
+{{- $any := false }}
+{{- range $name, $plugin := .Values.plugins }}
+{{-   if $plugin.enabled }}
+{{-     $any = true }}
+{{-     $eff := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
+  - {{ $name }} (socket /var/lib/bard/plugins/{{ $eff.socket }})
+{{-   end }}
+{{- end }}
+{{- if not $any }}
+  (none — set plugins[].enabled=true and supply its config/secrets)
+{{- end }}
+
+NEXT STEPS (owned by you, not this chart):
+
+1. Provide your enabled plugins' config + credentials (referenced by name):
+   - Plugins configured with `instances` (high-level) get their config ConfigMap
+     rendered by this chart. For low-level/custom plugins, non-secret config
+     (mons/pools/VG) can travel in values via `configMaps:` —
+     {{ len .Values.configMaps }} defined in this release. Or apply your own.
+   - Credentials (e.g. Secret "bard-ceph-keys", cephx keys per instance) are
+     never taken as values: create them yourself (SealedSecrets / External
+     Secrets / SOPS). The chart only mounts both by name.
+
+2. Backend wiring: plugins configured with `instances` also get a BackendCluster
+   CR rendered per instance — nothing to apply. For a low-level/custom plugin,
+   apply one per backend instance so the driver knows the zone -> instance
+   mapping and the plugin socket. Example:
+
+     apiVersion: bard.io/v1alpha1
+     kind: BackendCluster
+     metadata: { name: galileo-rbd }
+     spec:
+       backendType: ceph-rbd
+       instance: galileo
+       zone: galileo            # == a node's topology.kubernetes.io/zone label
+       default: true
+       plugin: { endpoint: /var/lib/bard/plugins/ceph-rbd.sock }
+
+3. Label your nodes per zone:  kubectl label node <n> {{ .Values.zoneLabel }}=<zone>
+{{- if .Values.sidecars.snapshotter.groupSnapshots }}
+
+4. VolumeGroupSnapshot is enabled: ensure external-snapshotter is installed with
+   the group CRDs AND a snapshot-controller v8.2.0 run with
+   --feature-gates=CSIVolumeGroupSnapshot=true (this chart does not install the
+   cluster-singleton snapshot-controller).
+{{- end }}

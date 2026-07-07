@@ -1,0 +1,76 @@
+# CephFS plugin config + an RWX StorageClass. See README.md in this dir for the
+# sidecar patches and the bard-csi-config backend entry that tie it together.
+#
+# The CephFS plugin's own config: instance id -> CephFS cluster. cephx keys are
+# NOT here -- they come from the bard-cephfs-keys Secret (untracked
+# hack/secret-cephfs.yaml; template hack/secret-cephfs.example.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-cephfs-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        monitors: ["192.0.2.1:3300"]
+        fsName: bardfs
+        userID: k8s-cephfs
+        # The plugin defaults to the kernel mounter (mount -t ceph), preferred
+        # in production. This dev example uses ceph-fuse because the kind nodes
+        # may lack a usable ceph kernel client; on real nodes drop this line.
+        mounter: fuse
+      # mounter:nfs exports each subvolume through a Ceph-managed NFS-Ganesha
+      # gateway and mounts it over NFS, so nodes need no ceph client at all. The
+      # volume is still a CephFS subvolume, so snapshots, clone, and expand work
+      # exactly as with the native mounters -- this matches ceph-csi's NFS driver
+      # (a CephFS subvolume behind Ganesha) so those users keep every feature.
+      # Requires nfsCluster (the `ceph nfs cluster create` id) and nfsServer (the
+      # gateway endpoint nodes mount). Uncomment to use:
+      # galileo-nfs:
+      #   monitors: ["192.0.2.1:3300"]
+      #   fsName: bardfs
+      #   userID: k8s-cephfs
+      #   mounter: nfs
+      #   nfsCluster: bard-nfs
+      #   nfsServer: 192.0.2.1
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-cephfs
+provisioner: csi.bard.io
+parameters:
+  backend: cephfs
+  # Optional CephFS subvolume group new volumes are created in. Defaults to "csi"
+  # (ceph-csi parity -- which is also where existing ceph-csi subvolumes live, so a
+  # migrated class adopts them). The group is encoded in the volume handle, so the
+  # whole lifecycle addresses the subvolume in its group; set per-instance in the
+  # plugin config to vary it by cluster.
+  #   subvolumeGroup: csi
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Shallow read-only volumes: a ReadOnlyMany PVC restored from a CephFS snapshot
+# mounts the snapshot's .snap directory directly -- no clone, no data copy,
+# instant -- instead of cloning it into a new subvolume. Use for a
+# ReadOnlyMany PVC with a VolumeSnapshot dataSource. Many such PVCs can share one
+# snapshot cheaply (e.g. fan-out read replicas of a dataset).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-cephfs-shallow
+provisioner: csi.bard.io
+parameters:
+  backend: cephfs
+  backingSnapshot: "true"
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: bard-cephfs-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete

@@ -1,0 +1,70 @@
+# Tier 2 harder-workload demo: a real 3-node etcd cluster, each member's data dir
+# on its OWN bard-rbd RWO PVC (volumeClaimTemplates). etcd is fsync-heavy and
+# latency-sensitive -- a different, harsher I/O profile than Postgres -- and being
+# a genuine quorum cluster it proves the StatefulSet volume lifecycle: 3 independent
+# RWO volumes provisioned on demand, and a rolling update that unstages+restages
+# each member's volume in turn while the cluster stays quorate and data survives.
+apiVersion: v1
+kind: Service
+metadata:
+  name: bard-etcd
+  labels: { app: bard-etcd }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true   # peers must resolve before they're "ready"
+  selector: { app: bard-etcd }
+  ports:
+    - { name: client, port: 2379 }
+    - { name: peer, port: 2380 }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bard-etcd
+spec:
+  serviceName: bard-etcd
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels: { app: bard-etcd }
+  template:
+    metadata:
+      labels: { app: bard-etcd }
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.16
+          # The etcd image is distroless (no /bin/sh), so configure via env vars and
+          # the native entrypoint. k8s expands $(VAR) referencing earlier env vars,
+          # so the per-pod name/URLs derive from the pod name with no shell.
+          env:
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - { name: ETCD_NAME, value: "$(POD_NAME)" }
+            - { name: ETCD_DATA_DIR, value: "/data/etcd" }
+            - { name: ETCD_LISTEN_PEER_URLS, value: "http://0.0.0.0:2380" }
+            - { name: ETCD_LISTEN_CLIENT_URLS, value: "http://0.0.0.0:2379" }
+            - { name: ETCD_ADVERTISE_CLIENT_URLS, value: "http://$(POD_NAME).bard-etcd:2379" }
+            - { name: ETCD_INITIAL_ADVERTISE_PEER_URLS, value: "http://$(POD_NAME).bard-etcd:2380" }
+            - { name: ETCD_INITIAL_CLUSTER, value: "bard-etcd-0=http://bard-etcd-0.bard-etcd:2380,bard-etcd-1=http://bard-etcd-1.bard-etcd:2380,bard-etcd-2=http://bard-etcd-2.bard-etcd:2380" }
+            - { name: ETCD_INITIAL_CLUSTER_STATE, value: "new" }
+            - { name: ETCD_INITIAL_CLUSTER_TOKEN, value: "bard-etcd" }
+          ports:
+            - { containerPort: 2379, name: client }
+            - { containerPort: 2380, name: peer }
+          readinessProbe:
+            exec: { command: ["etcdctl", "endpoint", "health"] }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /data }
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 384Mi }
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: bard-rbd
+        resources: { requests: { storage: 1Gi } }

@@ -1,0 +1,40 @@
+# Static (pre-provisioned) RBD volume: a hand-authored PV pointing at an existing
+# image, plus a PVC that binds to it. See README.md. Prerequisites:
+#   rbd -p mypool create preexisting --size 1G          # the image exists
+#   rbd image-meta set mypool/preexisting bard.static true   # Bard never reaps it
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: bard-rbd-static
+spec:
+  capacity:
+    storage: 1Gi                 # must match the real image size
+  accessModes: ["ReadWriteOnce"]
+  # REQUIRED for static volumes: Kubernetes never calls DeleteVolume under Retain,
+  # so the admin's image survives PV deletion. (bard.static is the second guard.)
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""           # not provisioned by a StorageClass
+  csi:
+    driver: csi.bard.io
+    # swsk|1|<backendType>|<instance>|<pool>|<image> -- the instance selects the
+    # cluster + cephx key from bard-ceph-config; pool/image name the rbd image.
+    volumeHandle: "swsk|1|ceph-rbd|galileo|mypool|preexisting"
+    fsType: ext4
+    volumeAttributes:
+      pool: mypool
+      imageName: preexisting
+      # For a Bard-LUKS-encrypted pre-existing image, also set e.g.:
+      # encrypted: "true"
+      # encryptionKMSID: "<kms-id>"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bard-rbd-static
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ""           # bind to the static PV, don't provision
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: bard-rbd-static    # bind explicitly to the PV above

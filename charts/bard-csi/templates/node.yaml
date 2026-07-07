@@ -1,0 +1,178 @@
+{{- /*
+Pod-level host flags are OR-ed across all enabled node plugins (hostNetwork/hostPID
+are pod-wide, not per-container). needsDev decides whether to define the /dev volume.
+*/ -}}
+{{- $hostNetwork := false -}}
+{{- $hostPID := false -}}
+{{- $needsDev := false -}}
+{{- range $name, $plugin := .Values.plugins -}}
+{{-   if $plugin.enabled -}}
+{{-     $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) -}}
+{{-     if and $p.node $p.node.enabled -}}
+{{-       if $p.node.hostNetwork }}{{ $hostNetwork = true }}{{ end -}}
+{{-       if $p.node.hostPID }}{{ $hostPID = true }}{{ end -}}
+{{-       if $p.node.hostDev }}{{ $needsDev = true }}{{ end -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+    app: {{ include "bard-csi.fullname" . }}-node
+spec:
+  selector:
+    matchLabels:
+      app: {{ include "bard-csi.fullname" . }}-node
+  template:
+    metadata:
+      labels:
+        app: {{ include "bard-csi.fullname" . }}-node
+    spec:
+      serviceAccountName: {{ include "bard-csi.fullname" . }}-node
+      {{- if $hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- if $hostPID }}
+      hostPID: true
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      # Shared fsGroup for the per-pod `plugins` emptyDir + its 0660 plugin sockets,
+      # so a non-root core can reach a root plugin. See docs/hardened-images.md.
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.registrar.image }}
+          args:
+            - "--csi-address=/csi/csi.sock"
+            - "--kubelet-registration-path={{ .Values.node.kubeletDir }}/plugins/csi.bard.io/csi.sock"
+            - "--v=2"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        # Bard core: no host mounts, no storage tools. Runs as root because it binds
+        # the CSI socket in /csi (a kubelet hostPath, root-owned, not fsGroup-managed)
+        # -- a nonroot user can't bind there. The controller core has no such need
+        # and stays nonroot. Matches upstream CSI node plugins. docs/hardened-images.md.
+        - name: bard-csi
+          image: {{ include "bard-csi.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            runAsUser: 0
+          args:
+            - "--node"
+            - "--endpoint=unix:///csi/csi.sock"
+            {{- if .Values.sidecars.csiAddons.enabled }}
+            - "--csi-addons-endpoint=unix:///csi/csi-addons.sock"
+            {{- end }}
+            - "--config-source=crd"
+            - "--nodeid=$(NODE_ID)"
+            - "--zone-label={{ .Values.zoneLabel }}"
+            {{- if gt (int .Values.node.maxVolumesPerNode) 0 }}
+            - "--max-volumes-per-node={{ .Values.node.maxVolumesPerNode }}"
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - "--metrics-addr=:{{ .Values.metrics.port }}"
+            {{- end }}
+            - "--v=2"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            # Read-only view of kubelet's mounts so NodeGetVolumeStats can statfs a
+            # published path (a plugin's Bidirectional mounts are visible here).
+            - name: kubelet-dir
+              mountPath: {{ .Values.node.kubeletDir }}
+              mountPropagation: HostToContainer
+              readOnly: true
+        {{- if .Values.sidecars.csiAddons.enabled }}
+        # csi-addons node sidecar: node (online) ReclaimSpace -> NodeReclaimSpace
+        # (fstrim). Needs the cluster-wide csi-addons controller installed (README).
+        - name: csi-addons
+          image: {{ .Values.sidecars.csiAddons.image }}
+          args:
+            - "--csi-addons-address=$(CSIADDONS_ENDPOINT)"
+            - "--node-id=$(NODE_ID)"
+            - "--namespace=$(POD_NAMESPACE)"
+            - "--pod=$(POD_NAME)"
+            - "--pod-uid=$(POD_UID)"
+            # Required: the sidecar exits "invalid controller port" without it.
+            - "--controller-port=9070"
+            - "--v=2"
+          env:
+            - name: CSIADDONS_ENDPOINT
+              value: unix:///csi/csi-addons.sock
+            - name: NODE_ID
+              valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            - name: POD_UID
+              valueFrom: { fieldRef: { fieldPath: metadata.uid } }
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        {{- end }}
+        {{- range $name, $plugin := .Values.plugins }}
+        {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
+        {{- if and $plugin.enabled $p.node $p.node.enabled }}
+        {{- include "bard-csi.pluginContainer" (dict "name" $name "plugin" $p "plane" "node" "root" $) | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins/csi.bard.io/
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}/plugins_registry/
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.node.kubeletDir }}
+            type: Directory
+        - name: plugins
+          emptyDir: {}
+        {{- if $needsDev }}
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- end }}
+        {{- range $name, $plugin := .Values.plugins }}
+        {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
+        {{- if and $plugin.enabled $p.node $p.node.enabled }}
+        {{- include "bard-csi.pluginVolumes" (dict "name" $name "plugin" $p "plane" "node") | nindent 8 }}
+        {{- end }}
+        {{- end }}

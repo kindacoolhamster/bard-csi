@@ -1,0 +1,59 @@
+# Real-workload topology proof: a Postgres (real fsync'd writes through krbd) in
+# EACH zone on the one bard-rbd StorageClass. Each DB's data dir lands in its
+# zone's pool, proven by the volume handle + actual pool contents:
+#   pg-galileo (k3s-server, zone galileo) -> pool k8s-csi-test
+#   pg-zoneb   (k3s-agent2, zone zoneb)   -> pool k8s-csi-zoneb
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: pg-galileo }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-galileo
+  labels: { app: pg-galileo }
+spec:
+  nodeSelector: { kubernetes.io/hostname: k3s-server }
+  containers:
+    - name: pg
+      image: postgres:16-alpine
+      env:
+        - { name: POSTGRES_PASSWORD, value: bard }
+        - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+      resources: { requests: { memory: 192Mi }, limits: { memory: 384Mi } }
+      volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: pg-galileo }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: pg-zoneb }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-rbd
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-zoneb
+  labels: { app: pg-zoneb }
+spec:
+  nodeSelector: { kubernetes.io/hostname: k3s-agent2 }
+  containers:
+    - name: pg
+      image: postgres:16-alpine
+      env:
+        - { name: POSTGRES_PASSWORD, value: bard }
+        - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+      resources: { requests: { memory: 192Mi }, limits: { memory: 384Mi } }
+      volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumes:
+    - name: data
+      persistentVolumeClaim: { claimName: pg-zoneb }

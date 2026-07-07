@@ -1,0 +1,41 @@
+# Strategic-merge patch adding the iSCSI plugin sidecar to Bard's controller.
+#   kubectl -n kube-system patch deployment bard-csi-controller \
+#     --type=strategic --patch-file deploy/examples/iscsi/sidecar-controller.patch.yaml
+#
+# The iSCSI control plane is privileged and host-coupled: it runs lvcreate (carve
+# the LUN block device) and targetcli (the LIO target lives in the host kernel's
+# configfs), so it needs host /dev, /run/lvm, /etc/lvm, /sys/kernel/config and the
+# LIO modules loaded on the host. Like the LVM plugin's shared-VG model, this only
+# works where the controller can reach the target's config; a controller on a
+# different node would need remote LIO management (targetd) -- a documented
+# follow-up. Per-node ACL masking + the node login path are proven via
+# hack/iscsi-plugin-test.sh and the k3s network test (see CLAUDE.md).
+spec:
+  template:
+    spec:
+      volumes:
+        - name: iscsi-config
+          configMap:
+            name: bard-iscsi-config
+        - name: dev-dir
+          hostPath: { path: /dev }
+        - name: lvm-run
+          hostPath: { path: /run/lvm }
+        - name: lvm-etc
+          hostPath: { path: /etc/lvm }
+        - name: configfs
+          hostPath: { path: /sys/kernel/config }
+      containers:
+        - name: iscsi-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-iscsi:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/iscsi.sock", "--config=/etc/bard-iscsi/config.yaml"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: iscsi-config, mountPath: /etc/bard-iscsi, readOnly: true }
+            - { name: dev-dir, mountPath: /dev }
+            - { name: lvm-run, mountPath: /run/lvm }
+            - { name: lvm-etc, mountPath: /etc/lvm }
+            - { name: configfs, mountPath: /sys/kernel/config }

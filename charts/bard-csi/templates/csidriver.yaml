@@ -1,0 +1,25 @@
+# Cluster-scoped, singleton per driver name. Two releases on one cluster collide
+# on this object (and on the ClusterRoles below) — bard-csi is a one-per-cluster
+# driver, like most CSIs.
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: csi.bard.io
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+spec:
+  # Node-mapped backends (Ceph RBD/CephFS/NFS/LVM) map on the node, so the
+  # external-attacher and VolumeAttachment are not used. An attach-style backend
+  # (iSCSI) needs attach.enabled=true, which flips this global flag and adds the
+  # csi-attacher sidecar. The field is immutable: toggling it on an existing
+  # install needs the CSIDriver deleted+recreated.
+  attachRequired: {{ .Values.attach.enabled }}
+  storageCapacity: {{ .Values.storageCapacity }}
+  podInfoOnMount: true
+  fsGroupPolicy: File
+  # SELinux mount-context optimization: kubelet sets the label via `-o context=`
+  # at mount instead of recursively relabelling (big win on large RWO volumes).
+  # Applied only to RWO/RWOP volumes, so shared RWX backends are unaffected.
+  seLinuxMount: {{ .Values.seLinuxMount }}
+  volumeLifecycleModes:
+    - Persistent

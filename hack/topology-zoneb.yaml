@@ -1,0 +1,47 @@
+# Topology-aware dispatch on the k3s tier: a SECOND ceph-rbd backend ("zoneb")
+# alongside galileo, so one StorageClass (bard-rbd) provisions into a different
+# Ceph pool decided by the scheduled pod's zone.
+#
+#   zone galileo  -> nodes k3s-server, k3s-agent   -> instance galileo, pool k8s-csi-test
+#   zone zoneb    -> node  k3s-agent2              -> instance zoneb,   pool k8s-csi-zoneb
+#
+# Each instance has its OWN pool-scoped cephx user (osd 'profile rbd pool=<pool>'),
+# so a misrouted volume cannot be created in the wrong pool -- the caps deny it.
+# This is the real-node analogue of hack/demo-multicluster.yaml (which used kind +
+# rbd-nbd). Here both instances use krbd (the production default).
+#
+# Apply: kubectl apply -f hack/topology-zoneb.yaml
+#        kubectl -n kube-system patch secret bard-ceph-keys --type merge \
+#          -p "{\"stringData\":{\"zoneb\":\"$(ceph auth get-key client.k8s-csi-zoneb)\"}}"
+#        # then restart the bard pods so the plugins reload their per-instance config.
+---
+# The ceph-rbd plugin's per-instance config, now with BOTH instances (krbd).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-ceph-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        monitors: ["192.168.1.225:3300"]
+        pool: k8s-csi-test
+        userID: k8s-csi-test
+      zoneb:
+        monitors: ["192.168.1.225:3300"]   # same mon (single-host dev); a real 2nd cluster differs here
+        pool: k8s-csi-zoneb
+        userID: k8s-csi-zoneb
+---
+# The second BackendCluster: same backendType, a new instance + zone. This single
+# CR is the entire control-plane change to add the zone.
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: zoneb-rbd
+spec:
+  backendType: ceph-rbd
+  instance: zoneb
+  zone: zoneb
+  plugin:
+    endpoint: /var/lib/bard/plugins/ceph-rbd.sock

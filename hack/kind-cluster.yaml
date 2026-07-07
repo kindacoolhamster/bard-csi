@@ -1,0 +1,17 @@
+# Local kind cluster for bard-csi development.
+#
+# Two workers labelled into topology zones so the driver's zone -> backend
+# instance dispatch can be exercised. With a single Ceph cluster today both
+# workers are zone-east; when a second Ceph (west) is added, relabel one worker
+# to zone-west to demonstrate one StorageClass spanning two clusters.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: bard
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.csi.bard.io/zone: zone-east
+  - role: worker
+    labels:
+      topology.csi.bard.io/zone: zone-east

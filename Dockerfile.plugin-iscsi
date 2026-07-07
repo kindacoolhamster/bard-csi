@@ -1,0 +1,33 @@
+# Container image for the iSCSI backend plugin -- the reference attach-style
+# backend. Control plane: LVM2 (carve LUN block devices) + targetcli/rtslib (the
+# LIO target: backstores, targets, per-node ACLs). Node plane: open-iscsi
+# (iscsiadm login/logout) + mkfs/mount tooling. Runs as a sidecar in Bard's
+# controller + node pods (see deploy/examples/iscsi).
+#
+# NOTE: LIO is kernel-backed (configfs), so the controller plugin must run where
+# it can reach the target's config -- in this homelab that is galileo, and the
+# production-correct logic (incl. per-node ACL masking) is proven via the plugin
+# binary over its socket (hack/iscsi-plugin-test.sh), mirroring the LVM plugin.
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-iscsi ./cmd/bard-plugin-iscsi
+
+FROM ${RUNTIME_BASE}
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        lvm2 \
+        targetcli-fb \
+        open-iscsi \
+        e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        util-linux \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bard-plugin-iscsi /usr/local/bin/bard-plugin-iscsi
+ENTRYPOINT ["/usr/local/bin/bard-plugin-iscsi"]

@@ -1,0 +1,85 @@
+# Real-world stateful workload on the Ceph RBD backend: a single-instance
+# PostgreSQL StatefulSet whose data directory lives on a `bard-rbd` PVC. Unlike
+# the busybox smoke tests, this is a real database doing real fsync'd writes
+# through the rbd block device -- the workload used to prove RBD resiliency
+# (pod reschedule, single-writer failover fence, snapshot->restore, online
+# expand). Drive it with hack/demo-postgres-resilience.sh.
+#
+# PGDATA points at a SUBDIRECTORY of the mount (.../pgdata), not the mount root:
+# an ext4 RBD volume has a lost+found at its root, and initdb refuses a
+# non-empty data dir. The subdir sidesteps that (the same reason cloud Postgres
+# charts use a subPath/subdir).
+apiVersion: v1
+kind: Service
+metadata:
+  name: bard-postgres
+  labels: { app: bard-postgres }
+spec:
+  clusterIP: None          # headless -- stable per-pod DNS for the StatefulSet
+  selector: { app: bard-postgres }
+  ports:
+    - port: 5432
+      name: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bard-postgres
+spec:
+  serviceName: bard-postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: bard-postgres }
+  template:
+    metadata:
+      labels: { app: bard-postgres }
+    spec:
+      # Single-writer RWO: only one pod may have this volume staged at a time.
+      # The failover demo relies on the rbd exclusive-lock + fence path, so we
+      # never want two replicas racing for the same image.
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              value: bard
+            - name: POSTGRES_PASSWORD
+              value: bardpw            # demo only; use a Secret in production
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            # Page-level data checksums: Postgres detects any torn/corrupted page
+            # on read (and during WAL recovery), turning silent corruption into a
+            # loud error. Makes the RBD crash-resilience proof meaningful -- after
+            # a hard node loss, a clean amcheck + checksum scan means the block
+            # device + WAL replay preserved integrity, not just row counts.
+            - name: POSTGRES_INITDB_ARGS
+              value: "--data-checksums"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "bard"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres", "-d", "bard"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 512Mi }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: bard-rbd
+        resources:
+          requests:
+            storage: 1Gi

@@ -1,0 +1,52 @@
+# LVM plugin config + a StorageClass. See README.md in this dir for the sidecar
+# patches and the bard-csi-config backend entry that tie it together.
+#
+# The LVM plugin's own config: instance id -> volume group. No secrets -- LVM is
+# local to the host; the plugin just carves logical volumes from an existing VG.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-lvm-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        vg: bard-vg
+        # Optional instance default: provision thin from this pool unless a
+        # StorageClass sets its own thinPool. Leave unset for thick-by-default.
+        # thinPool: bard-thin
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-lvm
+provisioner: csi.bard.io
+parameters:
+  backend: lvm
+  # ext4 by default; set csi.storage.k8s.io/fstype to xfs, btrfs, ext3 or ext2.
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# Thin StorageClass: provisions copy-on-write thin volumes from the named pool,
+# enabling cheap VolumeSnapshot + clone and over-commit. Create the pool once:
+#   lvcreate --type thin-pool -L 20G -n bard-thin bard-vg
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-lvm-thin
+provisioner: csi.bard.io
+parameters:
+  backend: lvm
+  thinPool: bard-thin
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: bard-lvm-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete

@@ -1,0 +1,42 @@
+# iSCSI plugin config + a StorageClass + the BackendCluster that registers it.
+# See README.md in this dir for the sidecar patches and the attach overlay this
+# backend requires (it is the only attach-style backend).
+#
+# The iSCSI plugin's own config: instance id -> { VG to carve LUN block devices
+# from, the portal nodes connect to, the IQN prefix for derived names }. No
+# credentials (CHAP is a follow-up); access is masked per-node via ACLs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-iscsi-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      galileo:
+        vg: bard-vg
+        portal: 192.0.2.1:3260
+        # iqnBase: iqn.2025-01.io.bard   # default; target/initiator names derive from it
+---
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: galileo-iscsi
+spec:
+  backendType: iscsi
+  instance: galileo
+  zone: galileo
+  plugin:
+    endpoint: /var/lib/bard/plugins/iscsi.sock
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-iscsi
+provisioner: csi.bard.io
+parameters:
+  backend: iscsi
+  # ext4 by default; set csi.storage.k8s.io/fstype to xfs, btrfs, ext3 or ext2.
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer

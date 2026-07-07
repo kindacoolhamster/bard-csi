@@ -1,0 +1,30 @@
+# localpath plugin config + a StorageClass. See README.md in this dir for the
+# sidecar patches and the BackendCluster that tie it together.
+#
+# The plugin reads JSON (it's a stdlib Python script -- no YAML parser), so the
+# config blob below is JSON, not YAML. instance id -> base directory. No secrets:
+# a volume is just a subdirectory under basePath, bind-mounted on the node.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-localpath-config
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "instances": {
+        "galileo": { "basePath": "/srv/bard-localpath" }
+      }
+    }
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-localpath
+provisioner: csi.bard.io
+parameters:
+  backend: localpath
+reclaimPolicy: Delete
+# No expansion/snapshots: this backend is a deliberately minimal directory
+# bind-mount -- its job is to prove the wire contract, not to be full-featured.
+volumeBindingMode: WaitForFirstConsumer

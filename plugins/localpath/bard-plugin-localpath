@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""bard-plugin-localpath: a Bard CSI backend plugin written in Python.
+
+It exists to demonstrate that Bard's plugin contract is language-agnostic: a
+plugin is just an HTTP server speaking JSON over a unix socket (see
+pkg/bardplugin), so it can be written in *any* language. This one uses the Python
+standard library only -- no third-party dependencies.
+
+Backend model: a volume is a subdirectory under a configured base path; the node
+bind-mounts it. The base path should be reachable on every node (a shared mount,
+or a single-node hostPath) -- the same "shared storage instance" model the LVM
+plugin uses, which keeps DeleteVolume (run on the controller) able to reach the
+data. No block device, no format step, no snapshots: deliberately minimal so the
+focus is the wire contract, not the storage.
+
+Config (JSON): {"instances": {"<id>": {"basePath": "/srv/bard-localpath"}}}
+"""
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import shutil
+import socketserver
+import subprocess
+
+
+class PluginError(Exception):
+    """Carries a Bard error code so the server can map it to an HTTP status."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# Bard error code -> HTTP status (mirrors pkg/bardplugin's writeErr).
+CODE_STATUS = {"NotFound": 404, "AlreadyExists": 409, "InvalidArgument": 400, "Internal": 500}
+
+
+def run(*args):
+    """Shell out, raising a PluginError on failure (like the Go plugins' Runner)."""
+    p = subprocess.run(list(args), capture_output=True, text=True)
+    if p.returncode != 0:
+        raise PluginError("Internal", "%s: %s" % (" ".join(args), (p.stderr or p.stdout).strip()))
+    return p.stdout
+
+
+def vol_name(csi_name):
+    """A bounded, deterministic directory name (the volume_id has a 128-byte cap)."""
+    return "bard-" + hashlib.sha256(csi_name.encode()).hexdigest()[:16]
+
+
+def is_mountpoint(path):
+    """Is `path` itself a mountpoint? --mountpoint, NOT --target: --target walks up
+    to the containing filesystem and so matches any path that merely sits on a
+    mount -- wrong for an "is this path a mount?" idempotency check."""
+    p = subprocess.run(["findmnt", "-n", "-o", "SOURCE", "--mountpoint", path],
+                       capture_output=True, text=True)
+    return p.returncode == 0 and p.stdout.strip() != ""
+
+
+def umount(path):
+    """Unmount, tolerating an already-unmounted target (NodeUnstage/Unpublish must
+    be idempotent -- CSI may retry after the unmount already happened)."""
+    p = subprocess.run(["umount", path], capture_output=True, text=True)
+    err = (p.stderr or "").lower()
+    if p.returncode != 0 and "not mounted" not in err and "not currently mounted" not in err:
+        raise PluginError("Internal", "localpath: umount %s: %s" % (path, p.stderr.strip()))
+
+
+class LocalPathBackend:
+    def __init__(self, instances):
+        self.instances = instances  # {instance_id: {"basePath": str}}
+
+    def base(self, instance):
+        ic = self.instances.get(instance)
+        if not ic or not ic.get("basePath"):
+            raise PluginError("InvalidArgument", "localpath: no basePath for instance %r" % instance)
+        return ic["basePath"]
+
+    # ---- control plane (runs in Bard's controller pod) ----
+
+    def info(self, _req):
+        # contractVersion: the bardplugin wire-contract version this plugin
+        # implements (absent means 1.0; declare it explicitly).
+        return {"type": "localpath", "contractVersion": "1.0", "capabilities": {
+            "requiresControllerPublish": False,
+            "nodeLocal": False,   # shared base path; see the module docstring
+            "blockDevice": False,  # a directory bind-mount, not a block device
+            "snapshots": False,
+            "expand": False,
+        }}
+
+    def create_volume(self, req):
+        if req.get("sourceSnapshot") or req.get("sourceVolume"):
+            raise PluginError("InvalidArgument", "localpath: clone/restore not supported")
+        base = self.base(req["instance"])
+        name = vol_name(req["name"])
+        path = os.path.join(base, name)
+        os.makedirs(path, 0o777, exist_ok=True)  # idempotent on retry
+        return {
+            "location": base,
+            "name": name,
+            "capacityBytes": req.get("capacityBytes", 0),  # a directory; size is advisory
+            "context": {"path": path},  # handed to the node so it needs no config lookup
+        }
+
+    def delete_volume(self, req):
+        v = req["volume"]
+        shutil.rmtree(os.path.join(v["location"], v["name"]), ignore_errors=True)
+        return {}
+
+    def expand_volume(self, _req):
+        raise PluginError("InvalidArgument", "localpath: expand not supported")
+
+    def create_snapshot(self, _req):
+        raise PluginError("InvalidArgument", "localpath: snapshots not supported")
+
+    def delete_snapshot(self, _req):
+        raise PluginError("InvalidArgument", "localpath: snapshots not supported")
+
+    # ---- node plane (runs in Bard's node DaemonSet) ----
+
+    def node_stage(self, req):
+        path = req.get("context", {}).get("path")
+        if not path:
+            v = req["volume"]
+            path = os.path.join(v["location"], v["name"])
+        staging = req["stagingPath"]
+        os.makedirs(staging, 0o750, exist_ok=True)
+        if is_mountpoint(staging):  # idempotent: already staged on a retry
+            return {}
+        run("mount", "--bind", path, staging)
+        return {}
+
+    def node_unstage(self, req):
+        umount(req["stagingPath"])
+        return {}
+
+    def node_publish(self, req):
+        target = req["targetPath"]
+        os.makedirs(target, 0o750, exist_ok=True)
+        if not is_mountpoint(target):
+            run("mount", "--bind", req["stagingPath"], target)
+            if req.get("readonly"):
+                run("mount", "-o", "remount,ro,bind", req["stagingPath"], target)
+        return {}
+
+    def node_unpublish(self, req):
+        umount(req["targetPath"])
+        return {}
+
+    def node_expand(self, _req):
+        return {}  # a directory; nothing to grow
+
+
+ROUTES = {
+    "/info": "info",
+    "/volume/create": "create_volume",
+    "/volume/delete": "delete_volume",
+    "/volume/expand": "expand_volume",
+    "/snapshot/create": "create_snapshot",
+    "/snapshot/delete": "delete_snapshot",
+    "/node/stage": "node_stage",
+    "/node/unstage": "node_unstage",
+    "/node/publish": "node_publish",
+    "/node/unpublish": "node_unpublish",
+    "/node/expand": "node_expand",
+}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n) or b"{}")
+            method = ROUTES.get(self.path)
+            if method is None:
+                return self._json(404, {"code": "NotFound", "message": "unknown route " + self.path})
+            self._json(200, getattr(self.server.backend, method)(req))
+        except PluginError as e:
+            self._json(CODE_STATUS.get(e.code, 500), {"code": e.code, "message": e.message})
+        except Exception as e:  # any unexpected error -> Internal, mirroring the SDK
+            self._json(500, {"code": "Internal", "message": str(e)})
+
+    def _json(self, status, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_a):  # quiet by default
+        pass
+
+
+class UnixHTTPServer(socketserver.UnixStreamServer):
+    def __init__(self, socket_path, backend):
+        if os.path.exists(socket_path):
+            os.unlink(socket_path)  # clear a stale socket from a prior run
+        super().__init__(socket_path, Handler)
+        # Connectable when core runs under a different UID than this plugin (e.g. a
+        # nonroot hardened/distroless core, UID 65532, dialing a root plugin). 0660,
+        # NOT world-writable: the pod's shared fsGroup owns the per-pod emptyDir
+        # (setgid), so the socket is group-owned by fsGroup and every container in
+        # the pod can connect, while "other" cannot. Same rationale as
+        # pkg/bardplugin.Serve; see docs/hardened-images.md.
+        os.chmod(socket_path, 0o660)
+        self.backend = backend
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--socket", default="/var/lib/bard/plugins/localpath.sock")
+    ap.add_argument("--config", default="/etc/bard-localpath/config.json")
+    args = ap.parse_args()
+
+    with open(args.config) as f:
+        cfg = json.load(f)
+    backend = LocalPathBackend(cfg.get("instances", {}))
+
+    os.makedirs(os.path.dirname(args.socket), exist_ok=True)
+    srv = UnixHTTPServer(args.socket, backend)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+        if os.path.exists(args.socket):
+            os.unlink(args.socket)
+
+
+if __name__ == "__main__":
+    main()

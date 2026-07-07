@@ -1,0 +1,35 @@
+# Strategic-merge patch adding the NFS plugin sidecar to Bard's node DaemonSet.
+# Apply with:
+#   kubectl -n kube-system patch daemonset bard-csi-node \
+#     --type=strategic --patch-file deploy/examples/nfs/sidecar-node.patch.yaml
+spec:
+  template:
+    spec:
+      volumes:
+        - name: plugins
+          emptyDir: {}
+        - name: nfs-config
+          configMap:
+            name: bard-nfs-config
+      containers:
+        - name: bard-csi
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+        # The NFS plugin sidecar (node plane: mounts the volume into the pod).
+        - name: nfs-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-nfs:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/nfs.sock", "--config=/etc/bard-nfs/config.yaml"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: plugins
+              mountPath: /var/lib/bard/plugins
+            - name: nfs-config
+              mountPath: /etc/bard-nfs
+              readOnly: true
+            # Share the kubelet dir so the plugin's mounts propagate to kubelet.
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional

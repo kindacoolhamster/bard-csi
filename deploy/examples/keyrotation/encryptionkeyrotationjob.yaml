@@ -1,0 +1,39 @@
+# Rotate the encryption key of an encrypted PVC -- the csi-addons
+# EncryptionKeyRotation operation. Bard changes the volume's LUKS passphrase to
+# fresh key material (minted by the volume's KMS provider) WITHOUT re-encrypting the
+# data: the LUKS master key is unchanged, only the keyslot that wraps it is replaced,
+# so rotation is fast and the volume stays readable throughout.
+#
+# Requirements:
+#   - The PVC is encrypted (a `bard-rbd-encrypted*` StorageClass) AND staged on a node
+#     (a pod is using it) -- rotation is a node-plane op that needs the dm-crypt device.
+#   - A STORED-key KMS provider: secrets-metadata, Vault, AWS KMS, Azure Key Vault, or
+#     KMIP. The default DERIVED provider has no per-volume stored key to rotate; for
+#     those volumes, rotate the instance master key instead (which rekeys all of them).
+#   - The cluster-wide csi-addons CRDs + controller-manager installed (same as the
+#     ReclaimSpace / NetworkFence examples), and Bard's csi-addons sidecar enabled.
+#   - attach.enabled=true: rotation is a node op and csi-addons locates the node via
+#     the volume's VolumeAttachment; without attach there is none and the job fails
+#     "unable to find nodeID for pv" (see README).
+apiVersion: csiaddons.openshift.io/v1alpha1
+kind: EncryptionKeyRotationJob
+metadata:
+  name: bard-rotate-key
+spec:
+  target:
+    persistentVolumeClaim: bard-encrypted-pvc   # an encrypted, in-use PVC
+---
+# For periodic rotation (e.g. a compliance cadence) use an
+# EncryptionKeyRotationCronJob, or annotate the PVC/namespace with
+# `keyrotation.csiaddons.openshift.io/schedule: "@weekly"` so csi-addons creates the
+# cron job automatically.
+apiVersion: csiaddons.openshift.io/v1alpha1
+kind: EncryptionKeyRotationCronJob
+metadata:
+  name: bard-rotate-key-weekly
+spec:
+  schedule: "@weekly"
+  jobTemplate:
+    spec:
+      target:
+        persistentVolumeClaim: bard-encrypted-pvc

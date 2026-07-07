@@ -1,0 +1,16 @@
+# Published by the namespace that OWNS the snapshots: PVCs in `default` may
+# reference VolumeSnapshots here in `team-src`. Scope `from.namespace` as
+# tightly as you can -- this is the entire authorization surface.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-default-snap-restore
+  namespace: team-src
+spec:
+  from:
+    - group: ""
+      kind: PersistentVolumeClaim
+      namespace: default
+  to:
+    - group: snapshot.storage.k8s.io
+      kind: VolumeSnapshot

@@ -1,0 +1,39 @@
+# Hardened LVM plugin image on a Chainguard Wolfi base -- a worked example of
+# building a tool-carrying Go plugin on a minimal, CVE-tracked base (the Debian
+# default lives in Dockerfile.plugin-lvm). RUNTIME_BASE is a build-arg so a license
+# holder can point at their own org image:
+#   podman build -f Dockerfile.plugin-lvm.hardened \
+#     --build-arg RUNTIME_BASE=cgr.dev/<org>/wolfi-base -t bard-plugin-lvm:hardened .
+#
+# CAVEAT (honest): thin-provisioning-tools is not in the PUBLIC Wolfi catalog, so
+# this image supports THICK LVM only. Thin pools (thin_check/thin_repair, the
+# Vwi-/Vri- snapshot+clone path) need that package -- supply it as a custom APK
+# (melange) or a licensed repo, then add it to the apk line below. The Go binary
+# detects thin from lv_attr at runtime, so it degrades cleanly: thick works, a thin
+# StorageClass simply fails when lvm2 can't find the thin tools. See
+# docs/hardened-images.md.
+#
+# Also note the package split vs Debian: Debian's util-linux bundles
+# mount/umount/findmnt; Wolfi ships them as separate packages.
+ARG RUNTIME_BASE=cgr.dev/chainguard/wolfi-base:latest
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-lvm ./cmd/bard-plugin-lvm
+
+FROM ${RUNTIME_BASE}
+RUN apk add --no-cache \
+        lvm2 \
+        e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        mount \
+        umount \
+        findmnt \
+        blkid \
+        ca-certificates
+COPY --from=build /out/bard-plugin-lvm /usr/local/bin/bard-plugin-lvm
+ENTRYPOINT ["/usr/local/bin/bard-plugin-lvm"]

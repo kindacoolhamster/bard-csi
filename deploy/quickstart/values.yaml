@@ -1,0 +1,51 @@
+# Quickstart values: Bard core + the bundled localpath demo backend.
+# Zero external dependencies -- volumes are directories on the node's disk,
+# bind-mounted into pods. For kicking the tires on a single-node cluster
+# (kind/k3s/minikube), NOT for production. See docs/quickstart.md.
+installCRDs: true
+
+sidecars:
+  # The snapshotter sidecar needs the cluster-wide external-snapshotter CRDs
+  # (installed separately); the quickstart skips both.
+  snapshotter:
+    enabled: false
+
+plugins:
+  localpath:
+    enabled: true
+    image:
+      repository: ghcr.io/kindacoolhamster/bard-plugin-localpath
+      tag: ""   # empty = the chart's appVersion (the release version)
+    socket: localpath.sock
+    backendClusters:
+      - name: quickstart-localpath
+        instance: quickstart
+        zone: quickstart
+        default: true
+    # The plugin reads its instance config (instance id -> basePath) from the
+    # bard-localpath-config ConfigMap created by quickstart.yaml.
+    controller:
+      enabled: true
+      args: ["--config=/etc/bard-localpath/config.json"]
+      volumes:
+        - name: config
+          mountPath: /etc/bard-localpath
+          readOnly: true
+          configMap: { name: bard-localpath-config }
+        - name: data
+          mountPath: /var/lib/bard-localpath
+          hostPath: { path: /var/lib/bard-localpath, type: DirectoryOrCreate }
+    node:
+      enabled: true
+      privileged: true    # issues mount(8) for the bind mounts
+      kubeletDir: true    # staging/target paths live under the kubelet dir
+      args: ["--config=/etc/bard-localpath/config.json"]
+      volumes:
+        - name: config
+          mountPath: /etc/bard-localpath
+          readOnly: true
+          configMap: { name: bard-localpath-config }
+        - name: data
+          mountPath: /var/lib/bard-localpath
+          mountPropagation: Bidirectional
+          hostPath: { path: /var/lib/bard-localpath, type: DirectoryOrCreate }

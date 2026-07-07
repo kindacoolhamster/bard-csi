@@ -1,0 +1,49 @@
+name: New backend plugin
+description: Request — or propose to build — a plugin for a storage system
+labels: ["backend-plugin"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Bard backends are out-of-tree plugins: an HTTP+JSON server on a unix
+        socket, in any language. See
+        [docs/writing-a-plugin.md](../../docs/writing-a-plugin.md) — you don't
+        need to touch Bard core to add a backend.
+  - type: input
+    id: system
+    attributes:
+      label: Storage system
+      description: Name and link
+      placeholder: e.g. ZFS (zfsonlinux), TrueNAS SCALE, SMB/Samba
+    validations:
+      required: true
+  - type: textarea
+    id: management
+    attributes:
+      label: Management surface
+      description: The CLI or API a plugin would drive to create/delete volumes and snapshots.
+      placeholder: e.g. `zfs create` / `zfs snapshot`, TrueNAS REST API, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: access-model
+    attributes:
+      label: How do nodes reach a volume?
+      options:
+        - network filesystem (like NFS/CephFS)
+        - shared block, node maps it (like RBD)
+        - attach-style, controller grants access per node (like iSCSI)
+        - node-local only
+        - not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: implementer
+    attributes:
+      label: Are you interested in building it?
+      options:
+        - "yes, with guidance"
+        - "yes, independently"
+        - "no — requesting it"
+    validations:
+      required: true

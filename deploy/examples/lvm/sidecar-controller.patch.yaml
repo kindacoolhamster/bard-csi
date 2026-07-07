@@ -1,0 +1,35 @@
+# Strategic-merge patch adding the LVM plugin sidecar to Bard's controller.
+#   kubectl -n kube-system patch deployment bard-csi-controller \
+#     --type=strategic --patch-file deploy/examples/lvm/sidecar-controller.patch.yaml
+#
+# UNLIKE the network backends, LVM's control plane is privileged: lvcreate /
+# lvremove / lvextend touch the host's device-mapper, so this sidecar needs the
+# host's /dev, /run/lvm (locks) and /etc/lvm (config). This is intrinsic to the
+# shared-VG model -- the controller manages the VG directly -- and is the reason
+# true per-node LVM wants a privileged node agent instead (see internal/lvmplugin).
+spec:
+  template:
+    spec:
+      volumes:
+        - name: lvm-config
+          configMap:
+            name: bard-lvm-config
+        - name: dev-dir
+          hostPath: { path: /dev }
+        - name: lvm-run
+          hostPath: { path: /run/lvm }
+        - name: lvm-etc
+          hostPath: { path: /etc/lvm }
+      containers:
+        - name: lvm-plugin
+          image: ghcr.io/kindacoolhamster/bard-plugin-lvm:dev
+          imagePullPolicy: IfNotPresent
+          args: ["--socket=/var/lib/bard/plugins/lvm.sock", "--config=/etc/bard-lvm/config.yaml"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - { name: plugins, mountPath: /var/lib/bard/plugins }
+            - { name: lvm-config, mountPath: /etc/bard-lvm, readOnly: true }
+            - { name: dev-dir, mountPath: /dev }
+            - { name: lvm-run, mountPath: /run/lvm }
+            - { name: lvm-etc, mountPath: /etc/lvm }

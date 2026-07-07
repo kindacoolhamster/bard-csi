@@ -1,0 +1,59 @@
+{{- /*
+BackendCluster CRs register each backend instance with Bard's core dispatcher
+(zone -> instance -> plugin socket). Without one, an enabled plugin's sidecar runs
+but core never routes to it ("no instances configured for backend X"). Rendered
+from each enabled plugin's `backendClusters` list; the plugin.endpoint is derived
+from that plugin's `socket`, so they can't drift. Empty list => none rendered
+(apply your own out-of-band). The per-instance storage config (mons/export/VG,
+keys) stays in the ConfigMaps/Secrets you provide -- only the routing is here.
+*/ -}}
+{{- /*
+Profile-driven: one BackendCluster per high-level `instances` entry (zone defaults to
+the instance id). This is the routing half of the abstraction -- the admin states a
+zone per instance and the chart registers it with core.
+*/ -}}
+{{- range $name, $plugin := .Values.plugins }}
+{{- if and $plugin.enabled (include "bard-csi.usesProfile" (dict "name" $name "plugin" $plugin)) }}
+{{- $prof := fromYaml (include "bard-csi.profile" $name) }}
+{{- range $id, $inst := $plugin.instances }}
+---
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: {{ printf "%s-%s" $id $name }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+spec:
+  backendType: {{ $name }}
+  instance: {{ $id }}
+  zone: {{ $inst.zone | default $id }}
+  default: {{ $inst.default | default false }}
+  plugin:
+    endpoint: /var/lib/bard/plugins/{{ $prof.socket }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /*
+Override path: explicit backendClusters (for custom plugins / advanced use, no
+`instances`). Unchanged behavior.
+*/ -}}
+{{- range $name, $plugin := .Values.plugins }}
+{{- if and $plugin.enabled $plugin.backendClusters }}
+{{- range $bc := $plugin.backendClusters }}
+---
+apiVersion: bard.io/v1alpha1
+kind: BackendCluster
+metadata:
+  name: {{ $bc.name | required (printf "plugins.%s.backendClusters[].name is required" $name) }}
+  labels:
+    {{- include "bard-csi.labels" $ | nindent 4 }}
+spec:
+  backendType: {{ $name }}
+  instance: {{ $bc.instance | default $bc.name }}
+  zone: {{ $bc.zone | required (printf "plugins.%s.backendClusters[].zone is required" $name) }}
+  default: {{ $bc.default | default false }}
+  plugin:
+    endpoint: /var/lib/bard/plugins/{{ $plugin.socket }}
+{{- end }}
+{{- end }}
+{{- end }}

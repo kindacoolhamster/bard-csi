@@ -1,0 +1,76 @@
+# Helm values for the k3s topology-dispatch test, written in the HIGH-LEVEL schema:
+# a Ceph admin states only Ceph terms (mons/pool/user/zone) and the chart fills in
+# all Bard-internal plumbing (config ConfigMap, BackendCluster CRs, plugin sidecar
+# args/mounts/host flags). One bard-rbd StorageClass provisions into TWO backends,
+# picked per-volume by the scheduled pod's zone; each instance's pool-scoped cephx
+# key means a misroute can't write the wrong pool.
+#
+#   zone galileo -> k3s-server, k3s-agent  -> instance galileo, pool k8s-csi-test
+#   zone zoneb   -> k3s-agent2             -> instance zoneb,   pool k8s-csi-zoneb
+#
+# Install (cephx keys come from a Secret you create, NOT from values):
+#   kubectl -n kube-system create secret generic bard-ceph-keys \
+#     --from-literal=galileo=$(ceph auth get-key client.k8s-csi-test) \
+#     --from-literal=zoneb=$(ceph auth get-key client.k8s-csi-zoneb)
+#   helm install bard-csi charts/bard-csi -n kube-system -f hack/values-topology-k3s.yaml
+#
+# NOTE: no `configMaps`, no `backendClusters`, and no bard-ceph-kms here -- all of
+# that is derived from `instances`. No KMS is configured, so the chart emits no
+# --kms-config (the crashloop that the old hand-wired values had to work around with
+# an empty bard-ceph-kms ConfigMap is gone by construction).
+
+namespaceOverride: kube-system
+
+# Local dev images are tagged :dev (the chart would otherwise default to AppVersion).
+image:
+  repository: ghcr.io/kindacoolhamster/bard-csi
+  tag: dev
+  pullPolicy: IfNotPresent
+
+zoneLabel: topology.kubernetes.io/zone
+
+sidecars:
+  # csi-addons stays OFF (no CRDs/controller-manager wired for it here).
+  csiAddons:
+    enabled: false
+
+plugins:
+  ceph-rbd:
+    enabled: true
+    image:
+      repository: ghcr.io/kindacoolhamster/bard-plugin-ceph-rbd
+      tag: dev
+      pullPolicy: IfNotPresent
+    # The admin-created Secret holding one cephx key per instance id.
+    keysSecret: bard-ceph-keys
+    # Each instance in Ceph terms; the chart renders the plugin config + a
+    # BackendCluster (zone defaults to the instance id) from this. krbd by default
+    # (production); set `mounter: rbd-nbd` per instance only where krbd can't run.
+    instances:
+      galileo:
+        monitors: ["192.168.1.225:3300"]
+        pool: k8s-csi-test
+        user: k8s-csi-test
+        zone: galileo
+        default: true
+      zoneb:
+        monitors: ["192.168.1.225:3300"]
+        pool: k8s-csi-zoneb
+        user: k8s-csi-zoneb
+        zone: zoneb
+
+# One topology-aware StorageClass spanning both backends. WaitForFirstConsumer makes
+# it topology-aware: provisioning defers until the pod is scheduled, so the chosen
+# node's zone selects the backend.
+storageClasses:
+  - name: bard-rbd
+    parameters:
+      backend: ceph-rbd
+      fsType: ext4
+    reclaimPolicy: Delete
+    allowVolumeExpansion: true
+    volumeBindingMode: WaitForFirstConsumer
+
+volumeSnapshotClasses:
+  - name: bard-rbd-snapshot
+    deletionPolicy: Delete

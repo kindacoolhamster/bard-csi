@@ -1,0 +1,121 @@
+# CD: on a version tag (v1.2.3), publish (1) the static plugin/core binaries as
+# GitHub Release artifacts, and (2) the Helm chart as a signed OCI package on
+# GHCR, versioned from the tag. See RELEASING.md for the full runbook.
+#
+# The BYO-base story in docs/hardened-images.md rests on "start from the static
+# binary" -- the binaries job is where those come from, so a downstream pipeline
+# can COPY one into its own hardened base instead of rebuilding from source.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the GitHub Release
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build static binaries
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOFLAGS: -mod=mod
+        run: |
+          mkdir -p dist
+          ver="${GITHUB_REF_NAME:-dev}"
+          for cmd in bard-csi bard-plugin-ceph-rbd bard-plugin-cephfs bard-plugin-nfs bard-plugin-lvm bard-plugin-iscsi; do
+            out="dist/${cmd}-${GOOS}-${GOARCH}"
+            go build -ldflags "-X main.version=${ver}" -o "$out" ./cmd/$cmd
+          done
+          # the localpath plugin is a Python script, not a compiled binary -- ship it as-is
+          cp plugins/localpath/bard-plugin-localpath dist/bard-plugin-localpath
+          ( cd dist && sha256sum * > SHA256SUMS-${GOOS}-${GOARCH}.txt )
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
+  # kubectl-bard is a client-side tool (it wraps `kubectl exec` from the
+  # operator's machine), so unlike the server binaries above it also ships for
+  # macOS and Windows. Install: download, rename to `kubectl-bard` (add .exe on
+  # Windows), put it on PATH -- kubectl discovers it as `kubectl bard`.
+  kubectl-plugin:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach to the GitHub Release
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build for client platforms
+        env:
+          CGO_ENABLED: "0"
+          GOFLAGS: -mod=mod
+        run: |
+          mkdir -p dist
+          ver="${GITHUB_REF_NAME:-dev}"
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            export GOOS=${platform%/*} GOARCH=${platform#*/}
+            ext=""; [ "$GOOS" = windows ] && ext=".exe"
+            go build -ldflags "-X main.version=${ver}" \
+              -o "dist/kubectl-bard-${GOOS}-${GOARCH}${ext}" ./cmd/kubectl-bard
+          done
+          ( cd dist && sha256sum * > SHA256SUMS-kubectl-bard.txt )
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+
+  # Package the chart with the TAG's version (Chart.yaml's version/appVersion are
+  # dev placeholders -- the tag is the single source of truth, so cutting a
+  # release never needs a chart-version bump commit), push it as an OCI package,
+  # sign the digest keyless, and attach the .tgz to the GitHub Release.
+  chart:
+    if: startsWith(github.ref, 'refs/tags/')   # needs a semver from the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # attach the packaged chart to the Release
+      packages: write   # push the OCI chart to GHCR
+      id-token: write   # keyless cosign signing (Fulcio OIDC)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v5
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Package with the tag version
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          helm package charts/bard-csi --version "$ver" --app-version "$ver" -d dist
+
+      - name: Push to GHCR (OCI) + sign
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          out=$(helm push "dist/bard-csi-${ver}.tgz" "oci://ghcr.io/${{ github.repository_owner }}/charts" 2>&1)
+          echo "$out"
+          digest=$(echo "$out" | awk '/Digest:/ {print $2}')
+          test -n "$digest"
+          cosign sign --yes "ghcr.io/${{ github.repository_owner }}/charts/bard-csi@${digest}"
+
+      - name: Attach chart to the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.tgz

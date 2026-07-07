@@ -1,0 +1,50 @@
+# NFS plugin config + a StorageClass that uses it. See README.md in this dir for
+# the sidecar additions to Bard's controller/node pods and the bard-csi-config
+# backend entry that ties it together.
+#
+# The NFS plugin's own config: instance id -> NFS server + exported base path.
+# Bard's dispatch maps a zone to one of these instance ids.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bard-nfs-config
+  namespace: kube-system
+data:
+  config.yaml: |
+    instances:
+      nfs-galileo:
+        server: 192.0.2.1
+        export: /srv/nfs/bard
+        # onDelete is the retention policy when a PVC is deleted: delete (default),
+        # retain (keep the data in place), or archive (rename to archived-<name>).
+        # A delete-time setting, so it is per-instance (CSI DeleteVolume carries no
+        # StorageClass params). Set retain/archive to guard against accidental loss.
+        onDelete: delete
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-nfs
+provisioner: csi.bard.io
+parameters:
+  backend: nfs          # routed to the nfs plugin; no CSI secrets needed
+  # Optional: name the exported subdirectory from PVC/PV metadata instead of an
+  # opaque hash, for human-navigable shares (needs the provisioner's
+  # --extra-create-metadata, which Bard's deploy sets). Tokens:
+  # ${pvc.metadata.name} ${pvc.metadata.namespace} ${pv.metadata.name}
+  subDir: "${pvc.metadata.namespace}-${pvc.metadata.name}-${pv.metadata.name}"
+  # Optional: octal mode applied (chmod) to the created directory.
+  mountPermissions: "0770"
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+---
+# NFS snapshots are a gzip tar of the volume's directory under the export's
+# .snapshots/. Crash-consistent (a point-in-time copy of a live directory), not
+# atomic -- quiesce the workload first if you need application consistency; cost
+# and time scale with the data. Restore/clone (dataSource) extract/copy the tree.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: bard-nfs-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete

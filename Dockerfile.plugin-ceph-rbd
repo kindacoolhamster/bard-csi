@@ -1,0 +1,50 @@
+# Container image for the Ceph RBD backend plugin. Unlike Bard core, the plugin
+# carries its own tools: the rbd CLI (control plane + krbd), rbd-nbd (userspace
+# mapper), and the filesystem utilities for format/mount/expand. Runs as a
+# sidecar in Bard's controller + node pods.
+#
+# RUNTIME_BASE is a build-arg (Debian-family default) so you can point at your own
+# base without forking; the binary is CGO_ENABLED=0 static. The apt layer below is
+# Debian-specific -- on a non-Debian hardened base (e.g. Chainguard Wolfi) swap the
+# install to that base's package manager. NOTE: the Ceph client (ceph-common,
+# rbd-nbd, ceph-fuse) is the one dependency NOT in the public Wolfi catalog, so a
+# hardened RBD image needs a licensed/custom APK -- see docs/hardened-images.md.
+ARG RUNTIME_BASE=debian:bookworm-slim
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-ceph-rbd ./cmd/bard-plugin-ceph-rbd
+
+FROM ${RUNTIME_BASE}
+# Ceph client from the UPSTREAM apt repo, not Debian's: bookworm ships Pacific
+# 16.2 (EOL), while upstream tracks the current stable with its CVE cadence --
+# and it keeps this image a few hundred MB of client tools instead of the ~GB
+# full-cluster quay.io/ceph/ceph base ceph-csi builds on. CEPH_RELEASE selects
+# the release codename; match it to (or trail) your cluster. (Size wart, not
+# trimmable via apt: upstream librados links Jaeger tracing -> libthrift, whose
+# Debian package drags Qt5; ICU is a hard dep of ceph-common/librgw2.)
+ARG CEPH_RELEASE=tentacle
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && install -d /etc/apt/keyrings \
+    && curl -fsSL https://download.ceph.com/keys/release.asc -o /etc/apt/keyrings/ceph.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/etc/apt/keyrings/ceph.asc] https://download.ceph.com/debian-${CEPH_RELEASE} ${VERSION_CODENAME} main" \
+        > /etc/apt/sources.list.d/ceph.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ceph-common \
+        rbd-nbd \
+        cryptsetup-bin \
+        e2fsprogs \
+        xfsprogs \
+        btrfs-progs \
+        util-linux \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/bard-plugin-ceph-rbd /usr/local/bin/bard-plugin-ceph-rbd
+ENTRYPOINT ["/usr/local/bin/bard-plugin-ceph-rbd"]

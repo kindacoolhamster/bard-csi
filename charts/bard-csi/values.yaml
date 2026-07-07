@@ -1,0 +1,267 @@
+# Bard CSI Helm values.
+#
+# SCOPE: this chart assembles the DRIVER RUNTIME (core + CSI sidecars + the backend
+# plugin sidecars you enable). Backend *connection config* (mon addresses, pools,
+# cephx users, KMS endpoints) can optionally travel in this file via `configMaps`
+# below, so `helm install -f values.yaml` brings up the runtime AND its config in
+# one shot. CREDENTIALS are the exception and are intentionally never accepted as
+# values: cephx keys, Vault tokens, and encryption masters stay in Secrets YOU
+# create, which the plugin sidecars reference by name (see plugins[].*.volumes) --
+# keep them out of plaintext with SealedSecrets / External Secrets Operator / SOPS.
+# The network between the driver and a backend is also out of scope.
+
+# -- Namespace the controller Deployment + node DaemonSet run in. The Helm release
+# namespace is used if this is empty. (CSIDriver, CRD, RBAC ClusterRoles, and the
+# StorageClasses are cluster-scoped regardless.)
+namespaceOverride: ""
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -- The backend-agnostic Bard core image. The plugin images are configured per
+# plugin (see `plugins`). An empty tag defaults to .Chart.AppVersion.
+image:
+  repository: ghcr.io/kindacoolhamster/bard-csi
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# -- Pod-level securityContext for the controller + node pods. The default fsGroup
+# group-owns the per-pod `plugins` emptyDir (and its 0660 plugin sockets), so a
+# non-root core -- e.g. a hardened/distroless image whose default user is nonroot
+# (cgr.dev/chainguard/static is 65532) -- can connect to a plugin running as root.
+# Required for hardened core images; harmless with the default root core. Set to {}
+# to omit. See docs/hardened-images.md.
+podSecurityContext:
+  fsGroup: 65532
+
+# -- The node DaemonSet reads each node's zone from this label to report topology
+# (one DaemonSet serves many zones). Label nodes: topology.kubernetes.io/zone=<zone>.
+zoneLabel: topology.kubernetes.io/zone
+
+# -- Publish CSIStorageCapacity (the driver implements GetCapacity). Sets the
+# CSIDriver storageCapacity field + the provisioner --enable-capacity flag + RBAC.
+storageCapacity: true
+
+# -- CSIDriver seLinuxMount: mount RWO/RWOP volumes with `-o context=` so kubelet
+# labels at mount time instead of recursively relabelling (SELinux clusters). Safe
+# with mixed backends -- shared RWX (CephFS/NFS) volumes are not context-mounted.
+# Set false only on Kubernetes older than the SELinuxMount feature (<1.25).
+seLinuxMount: true
+
+# -- Prometheus /metrics endpoint for the core (gRPC request counts by status code,
+# handler-latency histogram, in-flight gauge). Adds --metrics-addr to the controller
+# + node core and a containerPort; scrape it with a podMonitor/annotations. The node
+# runs hostNetwork, so its port binds the host.
+metrics:
+  enabled: false
+  port: 9809
+
+controller:
+  replicas: 1
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  resources: {}
+
+node:
+  nodeSelector: {}
+  tolerations: []
+  resources: {}
+  # -- kubelet's plugin/registration dirs. Override for distros that don't use the
+  # default /var/lib/kubelet (e.g. some managed Kubernetes).
+  kubeletDir: /var/lib/kubelet
+  # -- Cap volumes the scheduler places per node (NodeGetInfo MaxVolumesPerNode).
+  # 0 = unlimited. Set where a mounter is device-limited, e.g. rbd-nbd is bounded
+  # by the node's /dev/nbdN count (nbds_max); krbd has no such limit.
+  maxVolumesPerNode: 0
+
+# CSI sidecars (chart-managed, version-pinned). Disable any your cluster doesn't
+# need; RBAC is templated to match. Versions are coherent for Kubernetes 1.34.
+sidecars:
+  provisioner:
+    enabled: true
+    image: registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+    extraArgs: []
+  resizer:
+    enabled: true
+    image: registry.k8s.io/sig-storage/csi-resizer:v2.2.0
+    extraArgs: []
+  snapshotter:
+    enabled: true
+    image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+    # -- Enable VolumeGroupSnapshot (adds --feature-gates=CSIVolumeGroupSnapshot
+    # to the sidecar + RBAC). REQUIRES a matching external-snapshotter install:
+    # the group CRDs + a snapshot-controller v8.2.0 with the same gate. See README.
+    groupSnapshots: true
+    extraArgs: []
+  healthMonitor:
+    enabled: true
+    image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.11.0
+    monitorInterval: 60s
+  registrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.10.0
+  livenessProbe:
+    enabled: true
+    image: registry.k8s.io/sig-storage/livenessprobe:v2.12.0
+  csiAddons:
+    # -- Enable the csi-addons sidecar (controller + node) and serve the driver's
+    # --csi-addons-endpoint in both planes. This is the door to every csi-addons
+    # operation a backend advertises: ReclaimSpace (`rbd sparsify` controller-side,
+    # `fstrim` node-side), NetworkFence (+ GetClientsToFence), VolumeReplication
+    # (RBD mirroring / DR), VolumeGroup (consistency groups), and
+    # EncryptionKeyRotation. REQUIRES the cluster-wide csi-addons CRDs +
+    # controller-manager (installed separately, like the snapshot controller).
+    # Default OFF. See deploy/examples/{reclaimspace,networkfence,mirroring,keyrotation}/.
+    enabled: false
+    image: quay.io/csiaddons/k8s-sidecar:v0.12.0
+
+# Control-plane attach (CSI ControllerPublishVolume). Needed ONLY by attach-style
+# backends -- the iSCSI plugin masks a LUN to the node's initiator at publish.
+# Enabling it sets the CSIDriver's attachRequired (a single, cluster-global,
+# IMMUTABLE field -- toggling on an existing install needs the CSIDriver
+# delete+recreated), adds the csi-attacher sidecar, and grants its RBAC. Bard
+# advertises PUBLISH_UNPUBLISH_VOLUME only when a registered backend actually
+# attaches, so node-mapped backends (Ceph RBD/CephFS/NFS/LVM) are unaffected
+# except for a (no-op) VolumeAttachment per volume. Default OFF.
+attach:
+  enabled: false
+  image: registry.k8s.io/sig-storage/csi-attacher:v4.8.1
+  extraArgs: []
+
+# ----------------------------------------------------------------------------
+# Plugins — a MAP keyed by backend type (the key names the sidecar container and
+# matches the BackendCluster's backendType). A map (not a list) so per-field
+# overrides MERGE cleanly with the presets below.
+#
+# TWO WAYS to configure a plugin:
+#
+# (A) HIGH-LEVEL (first-party backends — recommended). Describe your backend in its
+#     OWN terms via `instances`; the chart fills in ALL Bard-internal plumbing
+#     (image, socket, --config/--key-dir args, volume mounts, host flags) from a
+#     built-in profile, and renders the plugin config ConfigMap + a BackendCluster
+#     per instance. You only supply:
+#       enabled       run this plugin
+#       keysSecret    name of the Secret YOU create holding one cephx key per
+#                     instance id (default bard-<backend>-keys). Credentials are
+#                     never taken as values — see the SCOPE note up top.
+#       instances     map of instance-id -> backend-native config + {zone, default}.
+#                     zone defaults to the instance id. Per-backend fields below.
+#       image         optional { repository, tag, pullPolicy } override
+#       encryption    optional { masterKeySecret } — the per-instance encryption
+#                     master key Secret (node, mounted optional; default
+#                     bard-<backend>-encryption). ceph-rbd: LUKS or fscrypt;
+#                     cephfs: fscrypt.
+#       kms           optional { configMap, vaultTokenSecret } — only when set is
+#                     --kms-config passed (so no-KMS installs never reference a
+#                     missing file). Both Ceph backends share the KMS providers.
+#
+# (B) LOW-LEVEL OVERRIDE (custom plugins / full control). OMIT `instances` and
+#     specify socket + controller/node {enabled, args, volumes, privileged, hostDev,
+#     hostNetwork, hostPID, kubeletDir} yourself (--socket is injected). This is the
+#     escape hatch; a plugin with `instances` ignores these fields.
+#
+# Per-instance fields by backend:
+#   ceph-rbd: monitors[], pool, user, zone, default, [mounter: krbd|rbd-nbd], [readAffinity], [radosNamespace], [clusterName]
+#   cephfs:   monitors[], fsName, user, zone, default, [mounter: kernel|fuse|nfs], [subvolumeGroup], [nfsCluster], [nfsServer]
+plugins:
+  ceph-rbd:
+    enabled: false
+    # keysSecret: bard-ceph-keys            # Secret you create: key per instance id
+    instances: {}
+    #   galileo:
+    #     monitors: ["192.0.2.1:3300"]
+    #     pool: k8s-csi-test
+    #     user: k8s-csi-test
+    #     zone: galileo
+    #     default: true
+    #     # mounter: rbd-nbd                 # krbd (default) is preferred on real nodes
+    # encryption:
+    #   masterKeySecret: bard-ceph-encryption
+    # kms:
+    #   configMap: bard-ceph-kms
+    #   vaultTokenSecret: bard-ceph-vault-token
+    # image: { repository: ghcr.io/kindacoolhamster/bard-plugin-ceph-rbd, tag: "", pullPolicy: IfNotPresent }
+
+  cephfs:
+    enabled: false
+    # keysSecret: bard-cephfs-keys
+    instances: {}
+    #   galileo:
+    #     monitors: ["192.0.2.1:3300"]
+    #     fsName: bardfs
+    #     user: k8s-cephfs
+    #     zone: galileo
+    #     default: true
+    #     # mounter: fuse                    # kernel (default), fuse, or nfs
+    # encryption:                            # fscrypt-at-rest (same KMS providers as ceph-rbd)
+    #   masterKeySecret: bard-cephfs-encryption
+    # kms:
+    #   configMap: bard-cephfs-kms
+    #   vaultTokenSecret: bard-cephfs-vault-token
+    # image: { repository: ghcr.io/kindacoolhamster/bard-plugin-cephfs, tag: "", pullPolicy: IfNotPresent }
+
+  # nfs / lvm / iscsi have no high-level profile yet — configure them via the
+  # low-level override (B): set socket + controller/node {args, volumes, host flags}.
+  # iscsi is the ATTACH-style backend and additionally REQUIRES attach.enabled=true
+  # (above) so ControllerPublish masks the LUN to the node. See deploy/examples/.
+  # my-plugin:
+  #   enabled: false
+  #   image: { repository: ghcr.io/me/bard-plugin-x, tag: "" }
+  #   socket: x.sock
+  #   backendClusters: [ { name: x-east, instance: east, zone: east, default: true } ]
+  #   controller: { enabled: true, args: ["--config=/etc/x/config.yaml"], volumes: [...] }
+  #   node:       { enabled: true, privileged: true, hostDev: true, args: [...], volumes: [...] }
+
+# Chart-managed ConfigMaps: extra NON-SECRET config carried in this file instead of a
+# separate `kubectl apply`. NOTE: high-level plugins (those with `instances`) get
+# their config ConfigMap auto-generated — you do NOT list it here. This is only for
+# the low-level override path or a plugin's extra config. Each {name, data} becomes a
+# ConfigMap (release namespace). NEVER put credentials here — those stay Secrets you
+# create out of band (see the SCOPE note up top). Empty by default.
+configMaps: []
+  # - name: bard-ceph-config        # referenced by the ceph-rbd plugin preset
+  #   data:
+  #     config.yaml: |
+  #       instances:
+  #         galileo:
+  #           monitors: "192.0.2.1:3300"
+  #           pool: k8s-csi-test
+  #           user: k8s-csi-test
+  # - name: bard-lvm-config
+  #   data:
+  #     config.yaml: |
+  #       instances:
+  #         galileo: { vg: bard-vg }
+
+# StorageClasses and snapshot/VAC/group classes. Default OFF — these are policy,
+# often managed separately (GitOps). Enable + edit to have the chart create them.
+# NOTE: parameters here select a backend TYPE + tuning, never a cluster/credentials.
+storageClasses: []
+  # - name: bard-rbd
+  #   backend: ceph-rbd
+  #   parameters: { fsType: ext4 }
+  #   reclaimPolicy: Delete
+  #   allowVolumeExpansion: true
+  #   volumeBindingMode: WaitForFirstConsumer
+  #   isDefault: false
+  #   mountOptions: []
+
+volumeSnapshotClasses: []
+  # - name: bard-rbd-snapshot
+  #   deletionPolicy: Delete
+
+volumeGroupSnapshotClasses: []
+  # - name: bard-rbd-group-snapshot
+  #   deletionPolicy: Delete
+
+volumeAttributesClasses: []
+  # - name: bard-rbd-qos
+  #   parameters: { qosIopsLimit: "2000", qosBpsLimit: "104857600" }
+
+# Install the BackendCluster CRD with the chart. Disable if a cluster operator
+# manages CRDs out-of-band. (Helm installs CRDs from crds/ regardless on first
+# install; this flag gates an additional templated copy for upgrade visibility —
+# left false by default to avoid CRD churn.)
+installCRDs: false

@@ -1,0 +1,18 @@
+# Build output
+/bin/
+
+# Real cephx secrets (never commit credentials). Use the *.example.yaml files.
+/hack/secret.yaml
+/hack/secret-cephfs.yaml
+/hack/secret-encryption.yaml
+/hack/secret-vault-token.yaml
+
+# Local dev config: deploy/20-config.yaml with the real mon/KMS addresses
+# (deploy/ ships documentation IPs). Applied after deploy/, like the secret.
+/hack/config-local.yaml
+
+# Machine-specific Claude Code instructions (the public guide is CLAUDE.md)
+/CLAUDE.local.md
+
+# Claude Code session/project data
+.claude/

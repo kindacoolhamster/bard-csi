@@ -1,0 +1,32 @@
+# Fence a failed/partitioned node's client network ranges at the Ceph layer so it
+# can no longer reach the cluster -- the csi-addons NetworkFence operation, the
+# node-scoped complement to Bard's per-volume single-writer fence. A DR/failover
+# orchestrator (e.g. Ramen) creates this before failing a node's volumes over;
+# remove it (or set fenceState: Unfenced) to readmit the node once it is safe.
+#
+# Bard serves the REAL csi-addons FenceController API, so a ceph-csi user's
+# existing NetworkFence resources work unchanged -- with one Bard-specific detail:
+# parameters.clusterID selects the BACKEND INSTANCE (Bard's zone/instance id, e.g.
+# "galileo"), not a Ceph fsid. (parameters.instance is accepted as an alias, and
+# parameters.backend disambiguates if more than one backend can fence.)
+apiVersion: csiaddons.openshift.io/v1alpha1
+kind: NetworkFence
+metadata:
+  name: fence-node-worker3
+spec:
+  driver: csi.bard.io
+  fenceState: Fenced            # Fenced = blocklist the cidrs; Unfenced = remove
+  # The client network range(s) to fence -- typically the failed node's IP/CIDR(s)
+  # as seen by Ceph (its public-network address). Use /32 to fence a single host.
+  cidrs:
+    - 192.168.1.77/32
+  # Bard resolves this to the backend instance whose Ceph cluster to fence on.
+  parameters:
+    clusterID: galileo
+  # Credentials for a cephx user PERMITTED TO MANAGE THE BLOCKLIST. The per-volume
+  # provisioning user (mon 'profile rbd') can add a blocklist entry but CANNOT
+  # remove one (verified: range rm -> EACCES), so unfence would fail with it. Use a
+  # dedicated fence user (see README) and reference its Secret here.
+  secret:
+    name: bard-ceph-fence
+    namespace: kube-system
