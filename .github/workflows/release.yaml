@@ -99,6 +99,16 @@ jobs:
       - uses: azure/setup-helm@v5
       - uses: sigstore/cosign-installer@v3
 
+      # cosign resolves registry credentials from the Docker config, NOT from
+      # helm's registry config -- without this login the signature push 401s
+      # even though the helm push right before it succeeded.
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Package with the tag version
         run: |
           ver="${GITHUB_REF_NAME#v}"
