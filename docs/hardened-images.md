@@ -16,8 +16,8 @@ possible, how to do it, and the honest gaps.
 - **No hardcoded tool paths.** Tools are resolved on `PATH`, so it doesn't matter
   whether your base puts `mount` in `/usr/bin`, `/bin`, or `/sbin`.
 - **Core carries no storage tooling at all.** It proxies every storage op to a
-  plugin over a socket, so the core image is just the static binary — already
-  distroless by default (`gcr.io/distroless/static-debian12`).
+  plugin over a socket, so the core image is just the static binary — already on
+  a minimal base by default (`cgr.dev/chainguard/static`).
 
 This is the payoff of the plugin split: in a monolithic CSI driver the image
 inherits the *union* of every backend's tooling, so the least-hardenable
@@ -31,8 +31,8 @@ Every Dockerfile takes `RUNTIME_BASE`, so swapping the final base is a build-arg
 not a fork:
 
 ```sh
-# core on Chainguard static (verified: binary runs)
-podman build --build-arg RUNTIME_BASE=cgr.dev/chainguard/static \
+# core on Google distroless instead of the default Chainguard static
+podman build --build-arg RUNTIME_BASE=gcr.io/distroless/static-debian12 \
   -t my/bard-csi -f Dockerfile .
 
 # a plugin on your licensed Chainguard org base

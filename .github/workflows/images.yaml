@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       runtime_base:
-        description: "Override RUNTIME_BASE (e.g. cgr.dev/chainguard/static). Blank = Dockerfile default."
+        description: "Override RUNTIME_BASE (e.g. gcr.io/distroless/static-debian12). Blank = Dockerfile default."
         required: false
         default: ""
 
@@ -67,7 +67,7 @@ jobs:
             type=sha
 
       # RUNTIME_BASE is only forwarded when the manual input is set; otherwise the
-      # Dockerfile default (distroless for core, Debian-slim for tool plugins)
+      # Dockerfile default (Chainguard static for core, Debian-slim for tool plugins)
       # stands. This is the seam for a hardened build -- see docs/hardened-images.md.
       - name: Build args
         id: args
