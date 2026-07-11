@@ -19,9 +19,28 @@
 // lookup. The node logs in under a dedicated iscsiadm iface carrying that IQN, so
 // it never touches the host's global initiatorname.
 //
-// Snapshots/clone, CHAP and multipath are deliberately out of scope here (the LVM
-// plugin already demonstrates thin snapshots); this plugin's purpose is the attach
-// path. Like the other plugins it depends only on the public bardplugin SDK.
+// # Snapshots and clone (thin LVs)
+//
+// With a thin pool configured (per instance or per StorageClass `thinPool`),
+// volumes are thin LVs and support cheap copy-on-write snapshots and clones,
+// exactly like the LVM plugin: CreateSnapshot makes a read-only thin snapshot
+// (never exported through LIO -- it is a control-plane object), and
+// restore/clone makes a writable thin snapshot of the source, grows it to the
+// requested size, and exports it through its own target like any other volume.
+// Snapshot/clone of a thick volume is rejected.
+//
+// # CHAP
+//
+// An instance with `chapAuth: true` enforces CHAP on the data path: the target
+// requires authentication (`authentication=1` on the TPG), ControllerPublish
+// sets the credentials on the node's ACL, and NodeStage sets them on the node
+// record before login. Credentials are plugin-resolved per instance from a
+// mounted Secret file (--chap-dir/<instance>) -- they never ride the
+// StorageClass, the volume context, or the PublishContext (which lands in the
+// API-visible VolumeAttachment).
+//
+// Multipath and remote LIO management (targetd) are deliberately out of scope;
+// like the other plugins this depends only on the public bardplugin SDK.
 package iscsiplugin
 
 import (
@@ -55,12 +74,20 @@ var supportedFsTypes = map[string]bool{
 
 // InstanceConfig is the per-instance iSCSI config. The VG backs LUN block devices
 // (like the LVM plugin); Portal is the address nodes connect to; IQNBase is the
-// IQN prefix for derived target/initiator names. No credentials (CHAP is a
-// follow-up); access is controlled by per-node ACLs.
+// IQN prefix for derived target/initiator names. Access is controlled by per-node
+// ACLs, plus CHAP when enabled.
 type InstanceConfig struct {
 	VG      string `json:"vg"`                // VG to carve LUN backstores from
 	Portal  string `json:"portal"`            // iSCSI portal "ip:port" nodes connect to
 	IQNBase string `json:"iqnBase,omitempty"` // IQN prefix (default iqn.2025-01.io.bard)
+	// ThinPool is the instance default thin pool: when set (and not overridden by
+	// the StorageClass thinPool parameter), volumes are thin copy-on-write LVs from
+	// that pre-created pool -- what enables snapshots/clone -- instead of thick ones.
+	ThinPool string `json:"thinPool,omitempty"`
+	// CHAPAuth enforces CHAP on this instance's targets. The credentials are NOT
+	// in this config (it ships in a ConfigMap): they are read from the mounted
+	// Secret file <chap-dir>/<instance> -- see chapFor for the format.
+	CHAPAuth bool `json:"chapAuth,omitempty"`
 }
 
 // Backend implements bardplugin.Backend (+ ControllerPublisher) for iSCSI.
@@ -68,16 +95,18 @@ type Backend struct {
 	instances map[string]InstanceConfig
 	nodeID    string // CSI node id (node plane only); source of this node's initiator IQN
 	stateDir  string // node-plane: records per-staging-path session state for unstage
+	chapDir   string // dir of per-instance CHAP credential files (mounted Secret)
 	run       Runner
 }
 
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
-// the node plane (the controller plane passes "").
-func New(instances map[string]InstanceConfig, nodeID, stateDir string, run Runner) *Backend {
+// the node plane (the controller plane passes ""); chapDir is where per-instance
+// CHAP credential files are mounted (both planes need it when chapAuth is on).
+func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir string, run Runner) *Backend {
 	if run == nil {
 		run = ExecRunner{}
 	}
-	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, run: run}
+	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir, run: run}
 }
 
 func (b *Backend) Info() bardplugin.Info {
@@ -87,7 +116,7 @@ func (b *Backend) Info() bardplugin.Info {
 			BlockDevice:               true, // a LUN is a block device the node formats + mounts
 			RequiresControllerPublish: true, // the headline: attach is a control-plane op
 			Expand:                    true, // lvextend + initiator rescan + fs grow
-			Snapshots:                 false,
+			Snapshots:                 true, // thin instances only; thick ones reject at CreateSnapshot
 		},
 	}
 }
@@ -154,12 +183,126 @@ func (b *Backend) lvSizeBytes(ctx context.Context, vg, lv string) (int64, bool, 
 	return n, true, nil
 }
 
+// paramThinPool is the StorageClass parameter naming the thin pool to provision
+// from. It overrides the instance's thinPool, so thin-vs-thick can be a per-class
+// choice or an instance default.
+const paramThinPool = "thinPool"
+
+// thinPoolFor resolves the thin pool for a new volume: the StorageClass parameter
+// wins, else the instance default; "" means thick.
+func (b *Backend) thinPoolFor(instance string, params map[string]string) string {
+	if p := params[paramThinPool]; p != "" {
+		return p
+	}
+	return b.instances[instance].ThinPool
+}
+
+// isThinLV reports whether an existing LV is a thin volume, read from its
+// attributes (lv_attr starts with 'V') -- the actual truth, independent of
+// config, so snapshot/clone of a source behaves correctly.
+func (b *Backend) isThinLV(ctx context.Context, vg, lv string) (bool, error) {
+	out, err := b.run.Run(ctx, "lvs", "--noheadings", "-o", "lv_attr", vg+"/"+lv)
+	if err != nil {
+		return false, fmt.Errorf("iscsi: lvs attr %s/%s: %w", vg, lv, err)
+	}
+	return strings.HasPrefix(strings.TrimSpace(out), "V"), nil
+}
+
+// snapName derives a bounded, deterministic snapshot LV name from a CSI name.
+func snapName(csiName string) string {
+	sum := sha256.Sum256([]byte(csiName))
+	return "snap-" + hex.EncodeToString(sum[:8])
+}
+
+// lvOrigin returns an LV's origin (the LV it was snapshotted from) and whether
+// the LV exists at all.
+func (b *Backend) lvOrigin(ctx context.Context, vg, lv string) (string, bool, error) {
+	out, err := b.run.Run(ctx, "lvs", "--noheadings", "-o", "origin", vg+"/"+lv)
+	if err != nil {
+		if isNotFound(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("iscsi: lvs origin %s/%s: %w", vg, lv, err)
+	}
+	return strings.TrimSpace(out), true, nil
+}
+
+// thinClone creates lv as a writable copy-on-write thin snapshot of src and
+// activates it (thin snapshots are created with the activation-skip flag set, so
+// the backstore device would otherwise not exist). Idempotent on the create.
+func (b *Backend) thinClone(ctx context.Context, vg, src, lv string) error {
+	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-n", lv, vg+"/"+src); err != nil && !isExists(err) {
+		return fmt.Errorf("iscsi: thin clone %s/%s -> %s: %w", vg, src, lv, err)
+	}
+	if _, err := b.run.Run(ctx, "lvchange", "-ay", "-Ky", vg+"/"+lv); err != nil {
+		return fmt.Errorf("iscsi: activate clone %s/%s: %w", vg, lv, err)
+	}
+	return nil
+}
+
+// extendTo grows an LV to size bytes; a no-op when it is already that large.
+func (b *Backend) extendTo(ctx context.Context, vg, lv string, size int64) error {
+	if size <= 0 {
+		return nil
+	}
+	if _, err := b.run.Run(ctx, "lvextend", "-L", strconv.FormatInt(size, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
+		return fmt.Errorf("iscsi: lvextend %s/%s: %w", vg, lv, err)
+	}
+	return nil
+}
+
+// ---- CHAP ------------------------------------------------------------------
+
+// chapCreds are one instance's CHAP credentials. Mutual (target->initiator) auth
+// is optional and rides the same file.
+type chapCreds struct {
+	User, Password             string
+	MutualUser, MutualPassword string
+}
+
+// chapFor loads the CHAP credentials for an instance, or nil when the instance
+// does not enforce CHAP. The credential file is <chapDir>/<instance> (a mounted
+// Secret key), containing 2 or 4 non-empty lines:
+//
+//	userid
+//	password
+//	mutual-userid    (optional pair: target->initiator auth)
+//	mutual-password
+//
+// Line-per-field avoids delimiter ambiguity (an IQN-style userid contains ':').
+// CHAP enabled without readable, well-formed credentials is an error, not a
+// silent fallback to unauthenticated access.
+func (b *Backend) chapFor(instance string) (*chapCreds, error) {
+	ic, ok := b.instances[instance]
+	if !ok || !ic.CHAPAuth {
+		return nil, nil
+	}
+	path := filepath.Join(b.chapDir, instance)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: chapAuth is on for instance %q but credentials at %s are unreadable: %v", instance, path, err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	switch len(lines) {
+	case 2:
+		return &chapCreds{User: lines[0], Password: lines[1]}, nil
+	case 4:
+		return &chapCreds{User: lines[0], Password: lines[1], MutualUser: lines[2], MutualPassword: lines[3]}, nil
+	default:
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: chap credentials at %s must be 2 lines (userid, password) or 4 (plus mutual pair), got %d", path, len(lines))
+	}
+}
+
 // ---- control plane -------------------------------------------------------
 
 func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolumeRequest) (*bardplugin.CreateVolumeResponse, error) {
-	if req.SourceSnapshot != nil || req.SourceVolume != nil {
-		return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: clone/restore not supported (snapshots are a follow-up)")
-	}
 	ic, err := b.inst(req.Instance)
 	if err != nil {
 		return nil, err
@@ -171,18 +314,61 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if err != nil {
 		return nil, err
 	}
-	if found {
+	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
+	switch {
+	case found:
+		// Idempotent retry: an LV at least as large as requested satisfies the
+		// request. A smaller existing LV is a name clash with a different request
+		// -- except for a clone, which starts at its SOURCE's size: grow it to the
+		// request (resuming a create whose extend never ran).
 		if size < req.CapacityBytes {
-			return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
-				"iscsi: volume %q exists at %d bytes, smaller than requested %d", req.Name, size, req.CapacityBytes)
+			if !isClone {
+				return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
+					"iscsi: volume %q exists at %d bytes, smaller than requested %d", req.Name, size, req.CapacityBytes)
+			}
+			if err := b.extendTo(ctx, vg, lv, req.CapacityBytes); err != nil {
+				return nil, err
+			}
 		}
-	} else {
-		if _, err := b.run.Run(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
-			return nil, fmt.Errorf("iscsi: lvcreate %s/%s: %w", vg, lv, err)
+	default:
+		pool := b.thinPoolFor(req.Instance, req.Parameters)
+		switch {
+		case isClone:
+			// Clone/restore is a writable copy-on-write thin snapshot of the source,
+			// which only exists if the source itself is a thin LV.
+			src := req.SourceVolume
+			if req.SourceSnapshot != nil {
+				src = req.SourceSnapshot
+			}
+			thin, err := b.isThinLV(ctx, vg, src.Name)
+			if err != nil {
+				return nil, err
+			}
+			if !thin {
+				return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: clone/restore requires a thin source volume")
+			}
+			if err := b.thinClone(ctx, vg, src.Name, lv); err != nil {
+				return nil, err
+			}
+			// The clone inherits the SOURCE's virtual size; grow it to the request
+			// so the volume matches its PV (the node grows the filesystem at stage).
+			if err := b.extendTo(ctx, vg, lv, req.CapacityBytes); err != nil {
+				return nil, err
+			}
+		case pool != "":
+			// Thin volume: -V is the virtual (logical) size carved from the pool.
+			if _, err := b.run.Run(ctx, "lvcreate", "-T", vg+"/"+pool, "-V", lvBytes(req.CapacityBytes), "-n", lv); err != nil {
+				return nil, fmt.Errorf("iscsi: lvcreate thin %s/%s: %w", vg, lv, err)
+			}
+		default:
+			// Thick volume: -L fully allocates the size up front.
+			if _, err := b.run.Run(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
+				return nil, fmt.Errorf("iscsi: lvcreate %s/%s: %w", vg, lv, err)
+			}
 		}
-		if size, _, err = b.lvSizeBytes(ctx, vg, lv); err != nil {
-			return nil, err
-		}
+	}
+	if size, _, err = b.lvSizeBytes(ctx, vg, lv); err != nil {
+		return nil, err
 	}
 
 	// 2. The LIO export: backstore + per-volume target + LUN 0. Each step swallows
@@ -199,10 +385,15 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn)+"/luns", "create", backstore(lv)); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: map lun for %s: %w", iqn, err)
 	}
-	// Enforce ACLs: no demo mode (else any initiator could see every LUN), no
-	// auth (CHAP is a follow-up). This is what makes per-node masking real.
+	// Enforce ACLs: no demo mode (else any initiator could see every LUN). This
+	// is what makes per-node masking real. authentication=1 additionally requires
+	// CHAP (the credentials go on each node's ACL at ControllerPublish).
+	auth := "authentication=0"
+	if ic.CHAPAuth {
+		auth = "authentication=1"
+	}
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn), "set", "attribute",
-		"generate_node_acls=0", "demo_mode_write_protect=0", "authentication=0"); err != nil {
+		"generate_node_acls=0", "demo_mode_write_protect=0", auth); err != nil {
 		return nil, fmt.Errorf("iscsi: set tpg attributes for %s: %w", iqn, err)
 	}
 
@@ -247,8 +438,8 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 
 func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolumeRequest) (*bardplugin.ExpandVolumeResponse, error) {
 	vg, lv := req.Volume.Location, req.Volume.Name
-	if _, err := b.run.Run(ctx, "lvextend", "-L", strconv.FormatInt(req.NewSizeBytes, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
-		return nil, fmt.Errorf("iscsi: lvextend %s/%s: %w", vg, lv, err)
+	if err := b.extendTo(ctx, vg, lv, req.NewSizeBytes); err != nil {
+		return nil, err
 	}
 	size, _, err := b.lvSizeBytes(ctx, vg, lv)
 	if err != nil {
@@ -259,13 +450,52 @@ func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolume
 	return &bardplugin.ExpandVolumeResponse{CapacityBytes: size, NodeExpansionRequired: true}, nil
 }
 
-// Snapshots are a follow-up; reject clearly rather than pretend.
-func (b *Backend) CreateSnapshot(_ context.Context, _ *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
-	return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: snapshots not supported")
+// CreateSnapshot makes a read-only copy-on-write thin snapshot of the source LV,
+// exactly like the LVM plugin. Thin only: a thick volume has no cheap snapshot,
+// so it is rejected. The snapshot is a control-plane object -- it gets NO LIO
+// export; a restore clones it into a new volume with its own target.
+func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
+	src := req.SourceVolume // Location=vg, Name=lv
+	thin, err := b.isThinLV(ctx, src.Location, src.Name)
+	if err != nil {
+		return nil, err
+	}
+	if !thin {
+		return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: snapshots require a thin volume (provision from a thinPool)")
+	}
+	vg, snap := src.Location, snapName(req.Name)
+	// Snapshot LVs share the VG namespace, so the derived name can already exist
+	// -- as an idempotent retry against THIS source (fine), or as the same CSI
+	// name against a DIFFERENT source, which must be an AlreadyExists error, not
+	// a silent reuse of the other source's snapshot.
+	if origin, exists, err := b.lvOrigin(ctx, vg, snap); err != nil {
+		return nil, err
+	} else if exists && origin != src.Name {
+		return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
+			"iscsi: snapshot %q already exists for a different source volume (%s)", req.Name, origin)
+	}
+	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-pr", "-n", snap, vg+"/"+src.Name); err != nil && !isExists(err) {
+		return nil, fmt.Errorf("iscsi: snapshot %s/%s: %w", vg, src.Name, err)
+	}
+	size, _, err := b.lvSizeBytes(ctx, vg, src.Name)
+	if err != nil {
+		return nil, err
+	}
+	return &bardplugin.CreateSnapshotResponse{
+		Location:         vg,
+		Name:             snap,
+		SizeBytes:        size,
+		CreationTimeUnix: time.Now().Unix(),
+		ReadyToUse:       true,
+	}, nil
 }
 
-func (b *Backend) DeleteSnapshot(_ context.Context, _ *bardplugin.DeleteSnapshotRequest) error {
-	return bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: snapshots not supported")
+func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnapshotRequest) error {
+	vgsnap := req.Snapshot.Location + "/" + req.Snapshot.Name
+	if _, err := b.run.Run(ctx, "lvremove", "-f", vgsnap); err != nil && !isNotFound(err) {
+		return fmt.Errorf("iscsi: lvremove snapshot %s: %w", vgsnap, err)
+	}
+	return nil
 }
 
 // ---- control-plane attach (ControllerPublisher) --------------------------
@@ -278,10 +508,17 @@ const (
 )
 
 // ControllerPublish masks this volume's LUN to the node by adding an ACL for the
-// node's derived initiator IQN, then returns the connection context the node
-// needs to log in. Idempotent: an existing ACL is fine.
+// node's derived initiator IQN (setting the CHAP credentials on it when the
+// instance enforces CHAP), then returns the connection context the node needs to
+// log in. The credentials are NOT part of that context -- PublishContext lands in
+// the API-visible VolumeAttachment; the node reads its own mounted copy instead.
+// Idempotent: an existing ACL is fine, and re-setting auth converges.
 func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.ControllerPublishRequest) (*bardplugin.ControllerPublishResponse, error) {
 	ic, err := b.inst(req.Volume.Instance)
+	if err != nil {
+		return nil, err
+	}
+	chap, err := b.chapFor(req.Volume.Instance)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +527,16 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 	// Creating the ACL auto-maps the target's single LUN (LUN 0) to this initiator.
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn)+"/acls", "create", initIQN); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: create acl %s on %s: %w", initIQN, iqn, err)
+	}
+	if chap != nil {
+		args := []string{tpgPath(iqn) + "/acls/" + initIQN, "set", "auth",
+			"userid=" + chap.User, "password=" + chap.Password}
+		if chap.MutualUser != "" {
+			args = append(args, "mutual_userid="+chap.MutualUser, "mutual_password="+chap.MutualPassword)
+		}
+		if _, err := b.run.Run(ctx, "targetcli", args...); err != nil {
+			return nil, fmt.Errorf("iscsi: set chap auth on acl %s: %w", initIQN, err)
+		}
 	}
 	return &bardplugin.ControllerPublishResponse{PublishContext: map[string]string{
 		ctxPortal: ic.Portal,
@@ -369,12 +616,28 @@ func byPath(portal, iqn, lun string) string {
 	return "/dev/disk/by-path/ip-" + portal + "-iscsi-" + iqn + "-lun-" + lun
 }
 
-// ensureIface creates the dedicated iscsiadm iface carrying this node's derived
+// ensureIface makes the dedicated iscsiadm iface carry this node's derived
 // initiator IQN, so logins present the IQN the controller put in the ACL without
-// touching the host's global initiatorname. Idempotent.
+// touching the host's global initiatorname.
+//
+// The fast path is a READ: when the iface already carries the IQN, do nothing.
+// That is essential for staging a SECOND volume on a node -- iscsiadm refuses to
+// create or update an iface that a live session is using (exit 15, "Could not
+// create new interface"), so the old create-first flow failed every stage after
+// the first until that session logged out (found live by the multi-volume
+// harness; single-volume tests never see it). Only a missing iface is created,
+// and only a wrong/unset IQN is updated -- and an update refused because of live
+// sessions is then a real conflict (the node id changed under an active mount)
+// that must surface, not be swallowed.
 func (b *Backend) ensureIface(ctx context.Context, initIQN string) error {
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface, "--op", "new"); err != nil && !isExists(err) {
-		return fmt.Errorf("iscsi: create iface: %w", err)
+	out, err := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface)
+	if err == nil && strings.Contains(out, "iface.initiatorname = "+initIQN+"\n") {
+		return nil
+	}
+	if err != nil { // no iface record yet
+		if _, cerr := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface, "--op", "new"); cerr != nil && !isExists(cerr) {
+			return fmt.Errorf("iscsi: create iface: %w", cerr)
+		}
 	}
 	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface, "--op", "update",
 		"-n", "iface.initiatorname", "-v", initIQN); err != nil {
@@ -427,9 +690,20 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 		return err
 	}
 	// Discover the target on the portal, then log in under our iface. Both are
-	// idempotent on a stage retry.
+	// idempotent on a stage retry. When the instance enforces CHAP, the
+	// credentials go on the discovered node record before the login (LIO's
+	// discovery itself stays unauthenticated; only the login is gated).
 	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
 		return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
+	}
+	chap, err := b.chapFor(req.Volume.Instance)
+	if err != nil {
+		return err
+	}
+	if chap != nil {
+		if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+			return err
+		}
 	}
 	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
 		return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
@@ -460,16 +734,44 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	if err := os.MkdirAll(req.StagingPath, 0o750); err != nil {
 		return fmt.Errorf("iscsi: mkdir staging: %w", err)
 	}
-	if out, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "SOURCE", "--mountpoint", req.StagingPath); strings.TrimSpace(out) != "" {
-		return nil // idempotent: already mounted on a retry
+	// Idempotent: skip the mount if the staging path is itself already a mount
+	// (retry); the grow below still runs (a clone retry may have mounted but not
+	// yet grown).
+	if out, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "SOURCE", "--mountpoint", req.StagingPath); strings.TrimSpace(out) == "" {
+		mountArgs := []string{"-t", fsType}
+		if len(req.MountFlags) > 0 {
+			mountArgs = append(mountArgs, "-o", strings.Join(req.MountFlags, ","))
+		}
+		mountArgs = append(mountArgs, dev, req.StagingPath)
+		if _, err := b.run.Run(ctx, "mount", mountArgs...); err != nil {
+			return fmt.Errorf("iscsi: mount %s -> %s: %w", dev, req.StagingPath, err)
+		}
 	}
-	mountArgs := []string{"-t", fsType}
-	if len(req.MountFlags) > 0 {
-		mountArgs = append(mountArgs, "-o", strings.Join(req.MountFlags, ","))
+	// A clone/restore into a LARGER volume carries its SOURCE's filesystem; grow
+	// it to the device once mounted (online for every supported fs, a no-op when
+	// the sizes already match -- i.e. every non-clone stage).
+	return b.growFilesystem(ctx, fsType, dev, req.StagingPath)
+}
+
+// setChapOnNode writes the CHAP credentials onto the node record for (iqn,
+// portal) under our iface, so the subsequent login authenticates. iscsiadm takes
+// one name/value per --op update, so this is a short series of updates.
+func (b *Backend) setChapOnNode(ctx context.Context, iqn, portal string, chap *chapCreds) error {
+	params := [][2]string{
+		{"node.session.auth.authmethod", "CHAP"},
+		{"node.session.auth.username", chap.User},
+		{"node.session.auth.password", chap.Password},
 	}
-	mountArgs = append(mountArgs, dev, req.StagingPath)
-	if _, err := b.run.Run(ctx, "mount", mountArgs...); err != nil {
-		return fmt.Errorf("iscsi: mount %s -> %s: %w", dev, req.StagingPath, err)
+	if chap.MutualUser != "" {
+		params = append(params,
+			[2]string{"node.session.auth.username_in", chap.MutualUser},
+			[2]string{"node.session.auth.password_in", chap.MutualPassword})
+	}
+	for _, p := range params {
+		if _, err := b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface,
+			"--op", "update", "-n", p[0], "-v", p[1]); err != nil {
+			return fmt.Errorf("iscsi: set %s on node record %s: %w", p[0], iqn, err)
+		}
 	}
 	return nil
 }
@@ -557,18 +859,32 @@ func (b *Backend) NodeExpand(ctx context.Context, req *bardplugin.NodeExpandRequ
 	}
 	dev = strings.TrimSpace(dev)
 	fsType, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "FSTYPE", "--target", req.VolumePath)
-	switch strings.TrimSpace(fsType) {
+	if err := b.growFilesystem(ctx, strings.TrimSpace(fsType), dev, req.VolumePath); err != nil {
+		return nil, err
+	}
+	return &bardplugin.NodeExpandResponse{}, nil
+}
+
+// growFilesystem grows a mounted filesystem to its backing device's size --
+// online for every supported filesystem, and a no-op when they already match.
+// Used by NodeExpand (the device grew under a live mount) and NodeStage (a
+// clone/restore into a larger volume carries the source's smaller filesystem).
+func (b *Backend) growFilesystem(ctx context.Context, fsType, dev, mountPoint string) error {
+	var err error
+	switch fsType {
 	case "xfs":
-		_, err = b.run.Run(ctx, "xfs_growfs", req.VolumePath)
+		// xfs grows by mountpoint, not device.
+		_, err = b.run.Run(ctx, "xfs_growfs", mountPoint)
 	case "btrfs":
-		_, err = b.run.Run(ctx, "btrfs", "filesystem", "resize", "max", req.VolumePath)
+		// btrfs grows online by mountpoint to fill the device.
+		_, err = b.run.Run(ctx, "btrfs", "filesystem", "resize", "max", mountPoint)
 	default: // ext2/3/4
 		_, err = b.run.Run(ctx, "resize2fs", dev)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("iscsi: grow filesystem on %s: %w", dev, err)
+		return fmt.Errorf("iscsi: grow %s filesystem on %s: %w", fsType, dev, err)
 	}
-	return &bardplugin.NodeExpandResponse{}, nil
+	return nil
 }
 
 func (b *Backend) ensureFormatted(ctx context.Context, dev, fsType string) error {
@@ -631,37 +947,92 @@ func (b *Backend) NodeReclaimSpace(ctx context.Context, req *bardplugin.NodeRecl
 	return &bardplugin.ReclaimSpaceResponse{PreUsageBytes: -1, PostUsageBytes: -1}, nil
 }
 
+// lvInfo is one row of `lvs` for listing.
+type lvInfo struct {
+	name, attr, origin string
+	size               int64
+}
+
+// listLVs returns the LVs in a VG (name, size, attr, origin) via a separator-
+// delimited lvs so empty fields (no origin) parse deterministically.
+func (b *Backend) listLVs(ctx context.Context, vg string) ([]lvInfo, error) {
+	out, err := b.run.Run(ctx, "lvs", "--noheadings", "--units", "b", "--nosuffix",
+		"--separator", "|", "-o", "lv_name,lv_size,lv_attr,origin", vg)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("iscsi: lvs %s: %w", vg, err)
+	}
+	var rows []lvInfo
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Split(strings.TrimSpace(line), "|")
+		if len(f) < 3 || strings.TrimSpace(f[0]) == "" {
+			continue
+		}
+		size, _ := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
+		origin := ""
+		if len(f) >= 4 {
+			origin = strings.TrimSpace(f[3])
+		}
+		rows = append(rows, lvInfo{name: strings.TrimSpace(f[0]), size: size, attr: strings.TrimSpace(f[2]), origin: origin})
+	}
+	return rows, nil
+}
+
+// isThinPool reports whether an lv_attr marks a thin pool (so it isn't listed as
+// a volume). The thin pool itself can share the "bard-" name prefix (bard-thin).
+func isThinPool(attr string) bool { return len(attr) > 0 && attr[0] == 't' }
+
 // ListVolumes (bardplugin.VolumeLister) enumerates the Bard volume LVs (the
-// "bard-" prefix from lvName) across all instances' VGs. iSCSI has no snapshots,
-// so it implements no SnapshotLister.
+// "bard-" prefix from lvName) across all instances' VGs, excluding thin pools and
+// snapshots. Bard core sorts + paginates.
 func (b *Backend) ListVolumes(ctx context.Context, _ *bardplugin.ListVolumesRequest) (*bardplugin.ListVolumesResponse, error) {
 	var entries []bardplugin.VolumeListEntry
 	for instance, ic := range b.instances {
 		if ic.VG == "" {
 			continue
 		}
-		out, err := b.run.Run(ctx, "lvs", "--noheadings", "--units", "b", "--nosuffix",
-			"--separator", "|", "-o", "lv_name,lv_size,lv_attr", ic.VG)
+		rows, err := b.listLVs(ctx, ic.VG)
 		if err != nil {
-			if isNotFound(err) {
-				continue
-			}
-			return nil, fmt.Errorf("iscsi: lvs %s: %w", ic.VG, err)
+			return nil, err
 		}
-		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-			f := strings.Split(strings.TrimSpace(line), "|")
-			if len(f) < 3 || !strings.HasPrefix(strings.TrimSpace(f[0]), "bard-") {
+		for _, lv := range rows {
+			if !strings.HasPrefix(lv.name, "bard-") || isThinPool(lv.attr) {
 				continue
 			}
-			if attr := strings.TrimSpace(f[2]); len(attr) > 0 && attr[0] == 't' {
-				continue // a thin pool, not a volume
-			}
-			size, _ := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
 			entries = append(entries, bardplugin.VolumeListEntry{
-				Volume:        bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: strings.TrimSpace(f[0])},
-				CapacityBytes: size,
+				Volume:        bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.name},
+				CapacityBytes: lv.size,
 			})
 		}
 	}
 	return &bardplugin.ListVolumesResponse{Entries: entries}, nil
+}
+
+// ListSnapshots (bardplugin.SnapshotLister) enumerates the Bard snapshot LVs (the
+// "snap-" prefix from snapName); each carries its origin LV as the source volume.
+func (b *Backend) ListSnapshots(ctx context.Context, _ *bardplugin.ListSnapshotsRequest) (*bardplugin.ListSnapshotsResponse, error) {
+	var entries []bardplugin.SnapshotListEntry
+	for instance, ic := range b.instances {
+		if ic.VG == "" {
+			continue
+		}
+		rows, err := b.listLVs(ctx, ic.VG)
+		if err != nil {
+			return nil, err
+		}
+		for _, lv := range rows {
+			if !strings.HasPrefix(lv.name, "snap-") || lv.origin == "" {
+				continue
+			}
+			entries = append(entries, bardplugin.SnapshotListEntry{
+				Snapshot:     bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.name},
+				SourceVolume: bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.origin},
+				SizeBytes:    lv.size,
+				ReadyToUse:   true,
+			})
+		}
+	}
+	return &bardplugin.ListSnapshotsResponse{Entries: entries}, nil
 }

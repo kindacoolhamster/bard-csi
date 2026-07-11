@@ -25,6 +25,12 @@ spec:
           hostPath: { path: /etc/lvm }
         - name: configfs
           hostPath: { path: /sys/kernel/config }
+        # Per-instance CHAP credentials (only read for instances with chapAuth:
+        # true); optional so a CHAP-less deploy needs no Secret.
+        - name: iscsi-chap
+          secret:
+            secretName: bard-iscsi-chap
+            optional: true
       containers:
         - name: iscsi-plugin
           image: ghcr.io/kindacoolhamster/bard-plugin-iscsi:dev
@@ -39,3 +45,4 @@ spec:
             - { name: lvm-run, mountPath: /run/lvm }
             - { name: lvm-etc, mountPath: /etc/lvm }
             - { name: configfs, mountPath: /sys/kernel/config }
+            - { name: iscsi-chap, mountPath: /etc/bard-iscsi-chap, readOnly: true }

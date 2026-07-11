@@ -30,6 +30,9 @@ func main() {
 	// node's derived initiator IQN, and a dir to record per-staging session state.
 	nodeID := flag.String("node-id", "", "CSI node id (node plane); source of the initiator IQN")
 	stateDir := flag.String("state-dir", "/var/lib/bard/iscsi", "dir to record node session state")
+	// Both planes: per-instance CHAP credential files (a mounted Secret), read
+	// only for instances with chapAuth: true.
+	chapDir := flag.String("chap-dir", "/etc/bard-iscsi-chap", "dir of per-instance CHAP credential files")
 	flag.Parse()
 
 	raw, err := os.ReadFile(*cfgPath)
@@ -46,7 +49,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	be := iscsiplugin.New(cfg.Instances, *nodeID, *stateDir, nil)
+	be := iscsiplugin.New(cfg.Instances, *nodeID, *stateDir, *chapDir, nil)
 	if err := bardplugin.Serve(ctx, *socket, be); err != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 		os.Exit(1)

@@ -3,8 +3,10 @@
 # backend requires (it is the only attach-style backend).
 #
 # The iSCSI plugin's own config: instance id -> { VG to carve LUN block devices
-# from, the portal nodes connect to, the IQN prefix for derived names }. No
-# credentials (CHAP is a follow-up); access is masked per-node via ACLs.
+# from, the portal nodes connect to, the IQN prefix for derived names, an
+# optional thin pool (enables snapshots/clone), and whether to enforce CHAP }.
+# Access is masked per-node via ACLs; CHAP credentials live in the bard-iscsi-chap
+# Secret (below), NEVER in this ConfigMap.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -17,6 +19,25 @@ data:
         vg: bard-vg
         portal: 192.0.2.1:3260
         # iqnBase: iqn.2025-01.io.bard   # default; target/initiator names derive from it
+        # thinPool: bard-thin            # provision thin LVs from this pool -> snapshots/clone
+        #                                # (pre-create: lvcreate --type thin-pool -L <size> -n bard-thin <vg>;
+        #                                #  the thinPool StorageClass param overrides per class)
+        # chapAuth: true                 # require CHAP; credentials from the Secret below
+---
+# Per-instance CHAP credentials, mounted at /etc/bard-iscsi-chap/<instance> in
+# both plugin sidecars (the controller sets them on each node's ACL, the node
+# logs in with them). One key per instance with chapAuth: true; 2 lines
+# (userid, password) or 4 (plus a mutual userid/password pair). The mount is
+# optional in the sidecar patches, so skip this Secret entirely without CHAP.
+# apiVersion: v1
+# kind: Secret
+# metadata:
+#   name: bard-iscsi-chap
+#   namespace: kube-system
+# stringData:
+#   galileo: |
+#     bard
+#     use-a-long-random-secret-here
 ---
 apiVersion: bard.io/v1alpha1
 kind: BackendCluster

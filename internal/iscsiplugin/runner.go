@@ -50,7 +50,11 @@ func isNotFound(err error) bool {
 func isExists(err error) bool {
 	s := strings.ToLower(errString(err))
 	return strings.Contains(s, "already exists") || strings.Contains(s, "already in") ||
-		strings.Contains(s, "exists in configfs")
+		strings.Contains(s, "exists in configfs") ||
+		// targetcli's duplicate-backstore phrasing carries no "already":
+		// "Storage object block/<name> exists" (verified live; a not-found says
+		// "No storage object named <name>", which does not end in "exists").
+		(strings.Contains(s, "storage object") && strings.HasSuffix(strings.TrimSpace(s), "exists"))
 }
 
 func isNotMounted(err error) bool {

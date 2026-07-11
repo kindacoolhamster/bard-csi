@@ -6,7 +6,7 @@ node), making an iSCSI volume reachable is a *control-plane* operation. Bard's
 controller masks the volume's LUN to the staging node's initiator
 (`ControllerPublishVolume`); only then can that node log in and mount it. A volume
 is an LVM logical volume exported through an LIO target. Block, ReadWriteOnce,
-expandable.
+expandable; with a thin pool also snapshots + clone, and optionally CHAP.
 
 ## Per-node LUN masking — why this needs attach
 
@@ -69,7 +69,30 @@ A pod using the PVC triggers: provision (LV + LIO target) → attach (ACL for th
 scheduled node) → login + mount on that node. Deleting it detaches (ACL removed)
 and reaps the target + backstore + LV.
 
+## Snapshots and clone (thin pool)
+
+Set `thinPool` on the instance (or as a StorageClass `thinPool` parameter) and
+volumes become copy-on-write thin LVs, exactly like the LVM plugin: a
+VolumeSnapshot makes a read-only thin snapshot (a control-plane object — it gets
+no LIO export), and restore/clone makes a writable thin snapshot grown to the
+requested size, exported through its own target. The pool is pre-created once:
+`lvcreate --type thin-pool -L 20G -n bard-thin <vg>`. Snapshot/clone of a thick
+(no-pool) volume is rejected. Needs the external-snapshotter cluster singleton,
+same as every other backend (`hack/install-snapshotter.sh`).
+
+## CHAP
+
+`chapAuth: true` on an instance enforces CHAP on the data path: the target
+requires authentication (`authentication=1`), ControllerPublish sets the
+credentials on the node's ACL, and the node sets them on its record before
+login — a wrong password is rejected by LIO. Credentials come from the
+`bard-iscsi-chap` Secret (one key per instance: 2 lines userid/password, or 4
+with a mutual pair), mounted into **both** plugin sidecars; they never appear in
+the StorageClass, the volume context, or the PublishContext (which is stored in
+the API-visible VolumeAttachment). See the commented Secret in
+[config.yaml](config.yaml).
+
 ## Not yet (follow-ups)
 
-iSCSI snapshots/clone (the LVM plugin already demonstrates thin snapshots), CHAP
-auth, multipath, and remote LIO management for a fully in-cluster control plane.
+Multipath, and remote LIO management (`targetd`) for a fully in-cluster control
+plane on a node that isn't the target host.

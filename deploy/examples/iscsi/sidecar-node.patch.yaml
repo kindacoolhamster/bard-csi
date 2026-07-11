@@ -25,6 +25,12 @@ spec:
           hostPath: { path: /run }
         - name: lib-modules
           hostPath: { path: /lib/modules }
+        # Per-instance CHAP credentials (only read for instances with chapAuth:
+        # true); optional so a CHAP-less deploy needs no Secret.
+        - name: iscsi-chap
+          secret:
+            secretName: bard-iscsi-chap
+            optional: true
       containers:
         - name: iscsi-plugin
           image: ghcr.io/kindacoolhamster/bard-plugin-iscsi:dev
@@ -46,4 +52,5 @@ spec:
             - { name: var-lib-iscsi, mountPath: /var/lib/iscsi }
             - { name: iscsi-run, mountPath: /run }
             - { name: lib-modules, mountPath: /lib/modules, readOnly: true }
+            - { name: iscsi-chap, mountPath: /etc/bard-iscsi-chap, readOnly: true }
             - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }
