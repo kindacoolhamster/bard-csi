@@ -33,6 +33,11 @@ func main() {
 	// Both planes: per-instance CHAP credential files (a mounted Secret), read
 	// only for instances with chapAuth: true.
 	chapDir := flag.String("chap-dir", "/etc/bard-iscsi-chap", "dir of per-instance CHAP credential files")
+	// Node plane, in-cluster: chroot for iscsiadm so the HOST's matched
+	// iscsiadm+DB+iscsid stack is used (a container iscsiadm mis-pairs with the
+	// host iscsid -- see internal/iscsiplugin). Mount the host root and pass it
+	// here (e.g. --iscsiadm-chroot=/host). Empty runs iscsiadm directly.
+	iscsiadmChroot := flag.String("iscsiadm-chroot", "", "chroot dir (host root mount) for iscsiadm; empty = run directly")
 	flag.Parse()
 
 	raw, err := os.ReadFile(*cfgPath)
@@ -49,7 +54,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	be := iscsiplugin.New(cfg.Instances, *nodeID, *stateDir, *chapDir, nil)
+	be := iscsiplugin.New(cfg.Instances, *nodeID, *stateDir, *chapDir, *iscsiadmChroot, nil)
 	if err := bardplugin.Serve(ctx, *socket, be); err != nil {
 		fmt.Fprintf(os.Stderr, "serve: %v\n", err)
 		os.Exit(1)

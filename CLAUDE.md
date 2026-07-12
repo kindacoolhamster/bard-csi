@@ -86,10 +86,7 @@ stage), a **wrong-password CHAP login rejected** by LIO, /controller/unpublish
 orphan). Trap-cleaned like the LVM test; auto-creates the `bard-thin` pool. CHAP
 credentials are per-instance files (`--chap-dir/<instance>`, Secret
 `bard-iscsi-chap`, 2 lines userid/password or 4 with a mutual pair) read by BOTH
-planes -- never in the ConfigMap/StorageClass/PublishContext. The **node plane
-over a real network** (real-kernel k3s VM → target host `:3260` → `/dev/sdX` →
-mount) is separately proven; a fully in-cluster control plane on a non-target
-node needs remote LIO management (`targetd`) -- a follow-up. Each volume = its
+planes -- never in the ConfigMap/StorageClass/PublishContext. Each volume = its
 own target (one LUN), so login/logout is per-volume clean (no session
 ref-counting). Gotchas hit live: `targetcli` create takes the **parent** path +
 `name=` (`/backstores/block create name=x dev=...`), NOT the object path
@@ -100,6 +97,35 @@ learned that phrasing; and `iscsiadm` refuses to create/update an **iface a live
 session is using** (exit 15, "Could not create new interface"), so staging a 2nd
 volume on a node failed until `ensureIface` became read-first -- a bug
 single-volume tests structurally cannot catch.
+
+**Fully IN-CLUSTER live-proven 2026-07-11** on the multipass k3s dogfood cluster
+(target host = `k3s-server` with a loop-backed `bard-vg`, controller pinned there
+via `controller.nodeSelector`; attach flipped on with `helm --set
+attach.enabled=true` after deleting the immutable CSIDriver): provision ->
+CROSS-NODE attach (VolumeAttachment -> ACL for `init-k3s-agent`) -> CHAP login
+from the agent over the VM network -> `/dev/sdX` -> mount -> write; a 2nd volume
+staged on the SAME node (the ensureIface fix, live); VolumeSnapshot -> ready
+(read-only thin LV, no LIO export); point-in-time restore into a LARGER volume
+(post-snapshot writes absent, fs grown at stage); delete-everything reap back to
+just the thin pool -- zero targets/backstores/sessions left. FOUR
+in-cluster-only gotchas found + fixed (none reachable by the host harness):
+(1) the plugin image needs **thin-provisioning-tools** (in-container lvm shells
+to `thin_check`); (2) targetcli 2.1.5x unconditionally enumerates tcmu-runner
+over the SYSTEM D-Bus (`Gio.bus_get_sync`) on every command, so the controller
+sidecar must mount the host `/run/dbus` or every call dies `g-io-error-quark:
+Could not connect`; (3) **an LIO network portal binds in the netns of the
+process that creates it** -- without `hostNetwork` on the controller pod the
+portal listens inside the POD netns (targetcli shows it [OK], initiators get
+connection-refused; a portal from a dead pod netns must be deleted + recreated);
+(4) **iscsiadm+iscsid are a version-matched pair with distro-specific DB paths**
+(Debian `/etc/iscsi`, RHEL `/var/lib/iscsi`), so a container iscsiadm driving
+the host's iscsid puts CHAP node records where the daemon never looks and the
+login hangs at negotiation (LIO dmesg: "iSCSI Login negotiation failed") --
+fixed by running iscsiadm chrooted into the host root (`--iscsiadm-chroot=/host`,
+the standard CSI-driver approach; mount host `/` at `/host`). Plus a
+host-module prereq on the target node: `dm_snapshot` (`lvcreate -s` shells to
+modprobe, impossible in-container; the fixture loads it). A control plane on a
+non-target node still needs remote LIO management (`targetd`) -- a follow-up.
 
 ## Local end-to-end (rootful kind + real Ceph)
 

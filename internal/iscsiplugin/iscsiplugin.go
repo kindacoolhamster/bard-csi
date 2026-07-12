@@ -96,17 +96,43 @@ type Backend struct {
 	nodeID    string // CSI node id (node plane only); source of this node's initiator IQN
 	stateDir  string // node-plane: records per-staging-path session state for unstage
 	chapDir   string // dir of per-instance CHAP credential files (mounted Secret)
-	run       Runner
+	// iscsiadmChroot, when set (node plane, in-cluster), runs every iscsiadm
+	// through `chroot <dir>` so the HOST's own initiator stack is used -- see
+	// the iscsiadm method for why that is required.
+	iscsiadmChroot string
+	run            Runner
 }
 
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
 // the node plane (the controller plane passes ""); chapDir is where per-instance
-// CHAP credential files are mounted (both planes need it when chapAuth is on).
-func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir string, run Runner) *Backend {
+// CHAP credential files are mounted (both planes need it when chapAuth is on);
+// iscsiadmChroot optionally chroots iscsiadm into the host root (node plane,
+// in-cluster -- empty runs it directly, e.g. on a host or in the test harness).
+func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, iscsiadmChroot string, run Runner) *Backend {
 	if run == nil {
 		run = ExecRunner{}
 	}
-	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir, run: run}
+	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir,
+		iscsiadmChroot: iscsiadmChroot, run: run}
+}
+
+// iscsiadm runs iscsiadm, chrooted into the host root when configured.
+//
+// The initiator stack is a MATCHED PAIR: iscsiadm talks a version-sensitive
+// binary IPC to iscsid (over an abstract socket, shared with the host under
+// hostNetwork), and each distro's build reads its own node/iface DB path
+// (Debian /etc/iscsi, RHEL /var/lib/iscsi). A container-shipped iscsiadm
+// driving the HOST's iscsid mis-pairs both halves: the CHAP node record lands
+// where iscsid never looks and the login dies in negotiation (found live
+// in-cluster: LIO logged "iSCSI Login negotiation failed" and the login hung,
+// while the host's own iscsiadm logged straight in). Chrooting makes the node
+// plane use the host's iscsiadm + DB + iscsid, whatever the host distro --
+// the same approach other CSI drivers use for iscsiadm.
+func (b *Backend) iscsiadm(ctx context.Context, args ...string) (string, error) {
+	if b.iscsiadmChroot != "" {
+		return b.run.Run(ctx, "chroot", append([]string{b.iscsiadmChroot, "iscsiadm"}, args...)...)
+	}
+	return b.run.Run(ctx, "iscsiadm", args...)
 }
 
 func (b *Backend) Info() bardplugin.Info {
@@ -630,16 +656,16 @@ func byPath(portal, iqn, lun string) string {
 // sessions is then a real conflict (the node id changed under an active mount)
 // that must surface, not be swallowed.
 func (b *Backend) ensureIface(ctx context.Context, initIQN string) error {
-	out, err := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface)
+	out, err := b.iscsiadm(ctx, "-m", "iface", "-I", iscsiIface)
 	if err == nil && strings.Contains(out, "iface.initiatorname = "+initIQN+"\n") {
 		return nil
 	}
 	if err != nil { // no iface record yet
-		if _, cerr := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface, "--op", "new"); cerr != nil && !isExists(cerr) {
+		if _, cerr := b.iscsiadm(ctx, "-m", "iface", "-I", iscsiIface, "--op", "new"); cerr != nil && !isExists(cerr) {
 			return fmt.Errorf("iscsi: create iface: %w", cerr)
 		}
 	}
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "iface", "-I", iscsiIface, "--op", "update",
+	if _, err := b.iscsiadm(ctx, "-m", "iface", "-I", iscsiIface, "--op", "update",
 		"-n", "iface.initiatorname", "-v", initIQN); err != nil {
 		return fmt.Errorf("iscsi: set iface initiatorname: %w", err)
 	}
@@ -693,7 +719,7 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	// idempotent on a stage retry. When the instance enforces CHAP, the
 	// credentials go on the discovered node record before the login (LIO's
 	// discovery itself stays unauthenticated; only the login is gated).
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
+	if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
 		return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
 	}
 	chap, err := b.chapFor(req.Volume.Instance)
@@ -705,7 +731,7 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 			return err
 		}
 	}
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
+	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
 		return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
 	}
 
@@ -768,7 +794,7 @@ func (b *Backend) setChapOnNode(ctx context.Context, iqn, portal string, chap *c
 			[2]string{"node.session.auth.password_in", chap.MutualPassword})
 	}
 	for _, p := range params {
-		if _, err := b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface,
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface,
 			"--op", "update", "-n", p[0], "-v", p[1]); err != nil {
 			return fmt.Errorf("iscsi: set %s on node record %s: %w", p[0], iqn, err)
 		}
@@ -787,7 +813,7 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 	if !ok {
 		return nil // never staged (or already cleaned): idempotent success
 	}
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
+	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)
 	}
 	// Confirm the device is actually gone before declaring success.
@@ -795,7 +821,7 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 		return fmt.Errorf("iscsi: device %s still present after logout", st.Device)
 	}
 	// Best-effort cleanup of the node record, then drop our state.
-	_, _ = b.run.Run(ctx, "iscsiadm", "-m", "node", "-T", st.IQN, "-p", st.Portal, "--op", "delete")
+	_, _ = b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--op", "delete")
 	b.clearState(req.StagingPath)
 	return nil
 }
@@ -850,7 +876,7 @@ func (b *Backend) NodeUnpublish(ctx context.Context, req *bardplugin.NodeUnpubli
 // then grows the filesystem.
 func (b *Backend) NodeExpand(ctx context.Context, req *bardplugin.NodeExpandRequest) (*bardplugin.NodeExpandResponse, error) {
 	// Rescan all sessions: cheap, and avoids needing the per-volume target here.
-	if _, err := b.run.Run(ctx, "iscsiadm", "-m", "session", "--rescan"); err != nil && !isNotFound(err) {
+	if _, err := b.iscsiadm(ctx, "-m", "session", "--rescan"); err != nil && !isNotFound(err) {
 		return nil, fmt.Errorf("iscsi: session rescan: %w", err)
 	}
 	dev, err := b.run.Run(ctx, "findmnt", "-n", "-o", "SOURCE", "--target", req.VolumePath)

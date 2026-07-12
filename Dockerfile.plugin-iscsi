@@ -18,9 +18,14 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-plugin-iscsi ./cmd/bard-plugin-iscsi
 
 FROM ${RUNTIME_BASE}
+# thin-provisioning-tools: lvm activates/extends a thin pool through thin_check,
+# which must exist INSIDE this container (found live: in-cluster thin provisioning
+# failed "thin_check: execvp failed" while host-side tests passed -- the host lvm
+# has it, the container lvm is the one running here).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         lvm2 \
+        thin-provisioning-tools \
         targetcli-fb \
         open-iscsi \
         e2fsprogs \

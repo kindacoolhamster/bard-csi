@@ -32,13 +32,25 @@ initiatorname.
 ## Locality (read this) — same host-coupling as LVM
 
 LIO lives in the host kernel's configfs, so the **control plane** (lvcreate +
-targetcli) only works where it can reach the target — exactly the shared-host
-constraint the LVM plugin documents. The production-correct logic, **including
-per-node ACL masking**, is proven by driving the plugin binary over its socket
-against a real target (`hack/iscsi-plugin-test.sh`), and the **node plane** (real-
-kernel iSCSI login over the network → `/dev/sdX` → mount) is proven from a k3s VM
-(see CLAUDE.md). A full in-cluster control plane on a node that *isn't* the target
-needs remote LIO management (e.g. `targetd`) — a documented follow-up.
+targetcli) only works where it can reach the target. **Fully in-cluster works
+when the target host is a cluster node**: pin the controller there
+(`--set controller.nodeSelector."kubernetes\.io/hostname"=<target-node>`) and
+every other node attaches over the network — proven end to end on a 2-node k3s
+cluster (provision → cross-node CHAP attach → snapshot → restore, clean reap).
+A control plane on a node that *isn't* the target needs remote LIO management
+(e.g. `targetd`) — a documented follow-up.
+
+In-cluster **node prerequisites** (same class as every host-module gotcha):
+`iscsid` running on every node (any distro's iscsi-initiator package), and on the
+target node the LIO modules + `dm_snapshot` (lvm shells out to modprobe for the
+snapshot target, which an in-container lvm cannot do) — `hack/setup-iscsi-fixture.sh`
+loads all of them. The sidecar patches in this directory carry three hard-won
+in-cluster requirements as comments: the controller pod must be `hostNetwork`
+(an LIO portal binds in the netns of its creating process), it must mount the
+host's `/run/dbus` (targetcli enumerates tcmu-runner over D-Bus unconditionally),
+and the node plugin runs `iscsiadm` **chrooted into the host root**
+(`--iscsiadm-chroot=/host`) because iscsiadm+iscsid are a version-matched pair
+with distro-specific DB paths.
 
 ## Apply
 

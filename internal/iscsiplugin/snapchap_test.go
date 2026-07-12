@@ -58,7 +58,7 @@ func provisionRunner() *fakeRunner {
 // A thin instance provisions from the pool with -T/-V, never -L.
 func TestThinProvisioning(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -81,7 +81,7 @@ func TestThinProvisioning(t *testing.T) {
 // instance, overriding the instance default.
 func TestThinPoolStorageClassParam(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", fr) // no instance default
+	b := New(eastInst(), "", "", "", "", fr) // no instance default
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 		Parameters: map[string]string{paramThinPool: "sc-pool"},
@@ -107,7 +107,7 @@ func TestThinSnapshot(t *testing.T) {
 			return "1073741824\n", nil
 		},
 	}}
-	b := New(thinInst(), "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", fr)
 	resp, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name:         "snap1",
 		SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
@@ -146,7 +146,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 			return "", errors.New("Failed to find logical volume")
 		},
 	}}
-	b := New(eastInst(), "", "", "", thick)
+	b := New(eastInst(), "", "", "", "", thick)
 	if _, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name: "s", SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 	}); err == nil {
@@ -165,7 +165,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 // the LVM plugin doesn't have.
 func TestThinCloneRestoreExports(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "restored", Instance: "east", CapacityBytes: 1 << 30,
 		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "snap-abc"},
@@ -194,7 +194,7 @@ func TestISCSIListSnapshots(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(thinInst(), "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", fr)
 	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +229,7 @@ func chapSetup(t *testing.T, lines string) (map[string]InstanceConfig, string) {
 func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\n")
 	fr := provisionRunner()
-	b := New(inst, "", "", dir, fr)
+	b := New(inst, "", "", dir, "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -245,7 +245,7 @@ func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 func TestControllerPublishSetsChapOnACL(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\nmutualuser\nmutualpass\n")
 	fr := &fakeRunner{}
-	b := New(inst, "", "", dir, fr)
+	b := New(inst, "", "", dir, "", fr)
 	lv := lvName("pvc-1")
 	resp, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv}, NodeID: "n1",
@@ -275,7 +275,7 @@ func TestNodeStageSetsChapBeforeLogin(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
-	b := New(inst, "n1", t.TempDir(), dir, fr)
+	b := New(inst, "n1", t.TempDir(), dir, "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 		StagingPath: t.TempDir() + "/stage",
@@ -308,7 +308,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 		"east": {VG: "bard-vg", Portal: "10.0.0.9:3260", CHAPAuth: true},
 	}
 	fr := &fakeRunner{}
-	b := New(inst, "", "", t.TempDir(), fr) // no credentials file
+	b := New(inst, "", "", t.TempDir(), "", fr) // no credentials file
 	if _, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err == nil {
@@ -319,7 +319,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	}
 
 	instBad, dir := chapSetup(t, "only-a-user\nsecret\ndangling-mutual-user\n") // 3 lines
-	b2 := New(instBad, "", "", dir, &fakeRunner{})
+	b2 := New(instBad, "", "", dir, "", &fakeRunner{})
 	if _, err := b2.chapFor("east"); err == nil {
 		t.Fatal("3-line credentials file must be rejected (mutual needs both lines)")
 	}
@@ -346,7 +346,7 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-2")},
 		StagingPath: t.TempDir() + "/stage",
@@ -358,10 +358,37 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 	}
 }
 
+// With --iscsiadm-chroot set, every iscsiadm runs through chroot into the host
+// root (the host's matched iscsiadm+DB+iscsid stack); other tools stay direct.
+func TestIscsiadmChroot(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"chroot":   func([]string) (string, error) { return "", nil },
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
+	}}
+	b := New(eastInst(), "n1", t.TempDir(), "", "/host", fr)
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: t.TempDir() + "/stage",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fr.ran("iscsiadm") {
+		t.Fatalf("iscsiadm must not run directly when chrooted; calls %v", fr.calls)
+	}
+	if !fr.ran("chroot", "/host", "iscsiadm", "--login") {
+		t.Fatalf("expected chroot /host iscsiadm ... --login; calls %v", fr.calls)
+	}
+	if fr.ran("chroot", "mount") || fr.ran("chroot", "blkid") {
+		t.Fatalf("only iscsiadm is chrooted; calls %v", fr.calls)
+	}
+}
+
 // Without chapAuth nothing changes: no auth on the ACL, authentication=0.
 func TestNoChapByDefault(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -371,7 +398,7 @@ func TestNoChapByDefault(t *testing.T) {
 		t.Fatalf("non-CHAP instance must keep authentication=0; calls %v", fr.calls)
 	}
 	fr2 := &fakeRunner{}
-	b2 := New(eastInst(), "", "", "", fr2)
+	b2 := New(eastInst(), "", "", "", "", fr2)
 	if _, err := b2.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err != nil {

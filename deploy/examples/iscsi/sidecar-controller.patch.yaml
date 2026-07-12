@@ -13,6 +13,12 @@
 spec:
   template:
     spec:
+      # REQUIRED: the kernel binds an LIO network portal in the netns of the
+      # process that creates it. Without hostNetwork the portal lands in the
+      # controller POD's netns -- targetcli shows it [OK], but nothing listens on
+      # the host and initiators get connection-refused. Found live in-cluster; a
+      # portal created from a since-dead pod netns must be deleted + recreated.
+      hostNetwork: true
       volumes:
         - name: iscsi-config
           configMap:
@@ -25,6 +31,13 @@ spec:
           hostPath: { path: /etc/lvm }
         - name: configfs
           hostPath: { path: /sys/kernel/config }
+        # targetcli (2.1.5x) unconditionally enumerates tcmu-runner user backstores
+        # over the SYSTEM D-Bus (Gio.bus_get_sync) on every refresh; without a bus
+        # socket every targetcli call dies "g-io-error-quark: Could not connect".
+        # On a host this is invisible (dbus always runs); in a container the host
+        # socket must be mounted. Found live in-cluster.
+        - name: dbus
+          hostPath: { path: /run/dbus }
         # Per-instance CHAP credentials (only read for instances with chapAuth:
         # true); optional so a CHAP-less deploy needs no Secret.
         - name: iscsi-chap
@@ -45,4 +58,5 @@ spec:
             - { name: lvm-run, mountPath: /run/lvm }
             - { name: lvm-etc, mountPath: /etc/lvm }
             - { name: configfs, mountPath: /sys/kernel/config }
+            - { name: dbus, mountPath: /run/dbus, readOnly: true }
             - { name: iscsi-chap, mountPath: /etc/bard-iscsi-chap, readOnly: true }
