@@ -258,10 +258,10 @@ func (b *Backend) lvOrigin(ctx context.Context, vg, lv string) (string, bool, er
 // activates it (thin snapshots are created with the activation-skip flag set, so
 // the backstore device would otherwise not exist). Idempotent on the create.
 func (b *Backend) thinClone(ctx context.Context, vg, src, lv string) error {
-	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-n", lv, vg+"/"+src); err != nil && !isExists(err) {
+	if _, err := b.lvm(ctx, "lvcreate", "-s", "-n", lv, vg+"/"+src); err != nil && !isExists(err) {
 		return fmt.Errorf("iscsi: thin clone %s/%s -> %s: %w", vg, src, lv, err)
 	}
-	if _, err := b.run.Run(ctx, "lvchange", "-ay", "-Ky", vg+"/"+lv); err != nil {
+	if _, err := b.lvm(ctx, "lvchange", "-ay", "-Ky", vg+"/"+lv); err != nil {
 		return fmt.Errorf("iscsi: activate clone %s/%s: %w", vg, lv, err)
 	}
 	return nil
@@ -272,7 +272,7 @@ func (b *Backend) extendTo(ctx context.Context, vg, lv string, size int64) error
 	if size <= 0 {
 		return nil
 	}
-	if _, err := b.run.Run(ctx, "lvextend", "-L", strconv.FormatInt(size, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
+	if _, err := b.lvm(ctx, "lvextend", "-L", strconv.FormatInt(size, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
 		return fmt.Errorf("iscsi: lvextend %s/%s: %w", vg, lv, err)
 	}
 	return nil
@@ -325,6 +325,24 @@ func (b *Backend) chapFor(instance string) (*chapCreds, error) {
 		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
 			"iscsi: chap credentials at %s must be 2 lines (userid, password) or 4 (plus mutual pair), got %d", path, len(lines))
 	}
+}
+
+// lvmUdevConfig makes lvm create and remove /dev nodes itself instead of
+// deferring to udev. In a container there is no udev to serve an activation
+// (the host udevd's completion handshake lives in the host IPC namespace), so
+// activating an INACTIVE thin pool -- the first volume after a node reboot, or
+// after the last thin LV was removed -- died with "open failed: No such file
+// or directory" on the pool's tmeta node (found live in-cluster on the second
+// round; the first round masked it because a host-side command had left the
+// pool active). Self-managed nodes are also correct on a host WITH udev: the
+// dm uevent flags tell udev's own rules to skip node management.
+const lvmUdevConfig = "activation{udev_sync=0 udev_rules=0}"
+
+// lvm runs a state-changing lvm command (lvcreate/lvchange/lvextend/lvremove)
+// with lvmUdevConfig. Plain reads (lvs, vgs) don't touch device nodes and run
+// directly.
+func (b *Backend) lvm(ctx context.Context, cmd string, args ...string) (string, error) {
+	return b.run.Run(ctx, cmd, append([]string{"--config", lvmUdevConfig}, args...)...)
 }
 
 // redactSecrets replaces every occurrence of the given secret values in err's
@@ -403,12 +421,12 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 			}
 		case pool != "":
 			// Thin volume: -V is the virtual (logical) size carved from the pool.
-			if _, err := b.run.Run(ctx, "lvcreate", "-T", vg+"/"+pool, "-V", lvBytes(req.CapacityBytes), "-n", lv); err != nil {
+			if _, err := b.lvm(ctx, "lvcreate", "-T", vg+"/"+pool, "-V", lvBytes(req.CapacityBytes), "-n", lv); err != nil {
 				return nil, fmt.Errorf("iscsi: lvcreate thin %s/%s: %w", vg, lv, err)
 			}
 		default:
 			// Thick volume: -L fully allocates the size up front.
-			if _, err := b.run.Run(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
+			if _, err := b.lvm(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
 				return nil, fmt.Errorf("iscsi: lvcreate %s/%s: %w", vg, lv, err)
 			}
 		}
@@ -476,7 +494,7 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 	if _, err := b.run.Run(ctx, "targetcli", "/backstores/block", "delete", lv); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: delete backstore %s: %w", lv, err)
 	}
-	if _, err := b.run.Run(ctx, "lvremove", "-f", vg+"/"+lv); err != nil && !isNotFound(err) {
+	if _, err := b.lvm(ctx, "lvremove", "-f", vg+"/"+lv); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: lvremove %s/%s: %w", vg, lv, err)
 	}
 	return nil
@@ -520,7 +538,7 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 		return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
 			"iscsi: snapshot %q already exists for a different source volume (%s)", req.Name, origin)
 	}
-	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-pr", "-n", snap, vg+"/"+src.Name); err != nil && !isExists(err) {
+	if _, err := b.lvm(ctx, "lvcreate", "-s", "-pr", "-n", snap, vg+"/"+src.Name); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: snapshot %s/%s: %w", vg, src.Name, err)
 	}
 	size, _, err := b.lvSizeBytes(ctx, vg, src.Name)
@@ -538,7 +556,7 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 
 func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnapshotRequest) error {
 	vgsnap := req.Snapshot.Location + "/" + req.Snapshot.Name
-	if _, err := b.run.Run(ctx, "lvremove", "-f", vgsnap); err != nil && !isNotFound(err) {
+	if _, err := b.lvm(ctx, "lvremove", "-f", vgsnap); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: lvremove snapshot %s: %w", vgsnap, err)
 	}
 	return nil
@@ -835,7 +853,24 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 	}
 	st, ok := b.loadState(req.StagingPath)
 	if !ok {
-		return nil // never staged (or already cleaned): idempotent success
+		// No session record. That does NOT mean nothing is staged: the record is
+		// lost whenever the plugin container restarts with an unpersisted state
+		// dir (found live in-cluster -- a mid-lifetime pod restart turned every
+		// later unstage into a silent no-op, leaking the session past volume
+		// deletion). Everything needed is derivable -- the target IQN from the
+		// volume name, the portal from the instance, LUN is always 0 -- so
+		// reconstruct and log out anyway; on a node that truly never staged the
+		// volume the logout is a clean isNotFound no-op.
+		ic := b.instances[req.Volume.Instance]
+		base := ic.IQNBase
+		if base == "" {
+			base = defaultIQNBase
+		}
+		if ic.Portal == "" {
+			return nil // instance unknown: nothing derivable, nothing to log out of
+		}
+		iqn := targetIQN(base, req.Volume.Name)
+		st = stagedState{IQN: iqn, Portal: ic.Portal, Device: byPath(ic.Portal, iqn, "0")}
 	}
 	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)

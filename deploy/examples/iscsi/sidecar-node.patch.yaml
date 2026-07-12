@@ -26,6 +26,12 @@ spec:
         # The whole host root, for the iscsiadm chroot (see header comment).
         - name: host-root
           hostPath: { path: / }
+        # Session state (--state-dir) MUST survive plugin pod restarts: it is
+        # what NodeUnstage uses to log the session out, and a restart between
+        # stage and unstage would otherwise leak the session (the plugin also
+        # derives a fallback, but persisted state is the primary path).
+        - name: iscsi-state
+          hostPath: { path: /var/lib/bard/iscsi, type: DirectoryOrCreate }
         # Per-instance CHAP credentials (only read for instances with chapAuth:
         # true); optional so a CHAP-less deploy needs no Secret.
         - name: iscsi-chap
@@ -51,5 +57,6 @@ spec:
             - { name: iscsi-config, mountPath: /etc/bard-iscsi, readOnly: true }
             - { name: dev-dir, mountPath: /dev }
             - { name: host-root, mountPath: /host }
+            - { name: iscsi-state, mountPath: /var/lib/bard/iscsi }
             - { name: iscsi-chap, mountPath: /etc/bard-iscsi-chap, readOnly: true }
             - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }

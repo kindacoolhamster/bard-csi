@@ -358,6 +358,48 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 	}
 }
 
+// NodeUnstage with NO session record (the plugin container restarted since
+// stage) must still log the session out with derived IQN/portal -- silently
+// returning success leaked the session past volume deletion, found live
+// in-cluster after a mid-lifetime pod restart.
+func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
+	}}
+	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	lv := lvName("pvc-1")
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
+		StagingPath: t.TempDir() + "/stage",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !fr.ran("iscsiadm", "--logout", targetIQN(defaultIQNBase, lv), "10.0.0.9:3260") {
+		t.Fatalf("expected a derived-identity logout; calls %v", fr.calls)
+	}
+}
+
+// State-changing lvm commands must carry the self-managed-/dev config: in a
+// container no udev serves activation, so an inactive thin pool (first volume
+// after reboot / after the last LV was removed) fails to activate without it.
+// Reads (lvs) stay plain.
+func TestLvmSelfManagedDevNodes(t *testing.T) {
+	fr := provisionRunner()
+	b := New(thinInst(), "", "", "", "", fr)
+	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
+		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := fr.callArgs("lvcreate")
+	if !hasArg(c, "--config") || !hasArg(c, lvmUdevConfig) {
+		t.Fatalf("lvcreate must disable udev sync/rules (self-managed dev nodes); got %v", c)
+	}
+	if lvs := fr.callArgs("lvs"); hasArg(lvs, "--config") {
+		t.Fatalf("plain reads must not carry the activation config; got %v", lvs)
+	}
+}
+
 // A failed CHAP command must never leak the credentials: command errors embed
 // the full argv (as ExecRunner does), and a plugin error becomes a CSI error --
 // sidecar logs, VolumeAttachment status, kubelet events. Both secret-carrying

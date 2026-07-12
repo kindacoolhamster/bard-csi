@@ -125,8 +125,26 @@ login hangs at negotiation (LIO dmesg: "iSCSI Login negotiation failed") --
 fixed by running iscsiadm chrooted into the host root (`--iscsiadm-chroot=/host`,
 the standard CSI-driver approach; mount host `/` at `/host`). Plus a
 host-module prereq on the target node: `dm_snapshot` (`lvcreate -s` shells to
-modprobe, impossible in-container; the fixture loads it). A control plane on a
-non-target node still needs remote LIO management (`targetd`) -- a follow-up.
+modprobe, impossible in-container; the fixture loads it). A SECOND round on the
+branch tip (2026-07-12, incl. in-cluster online PVC expand 2Gi->3Gi, no pod
+restart) caught two more that only cold/restart states expose: (5) **an
+INACTIVE thin pool cannot be activated by in-container lvm** (no udev to serve
+the activation -- the host udevd's completion handshake lives in the host IPC
+namespace; `.../bard--thin_tmeta: open failed`); round 1 masked it because a
+host-side command had left the pool active, but the first volume after a node
+reboot or after the last LV's removal always hits it. Fixed in the plugin:
+every state-changing lvm command runs with `--config
+'activation{udev_sync=0 udev_rules=0}'` (lvm manages /dev nodes itself; also
+correct on udev hosts -- harness re-proven from an inactive pool). (6) **the
+node session state must survive plugin pod restarts**: stateDir was
+container-ephemeral, so a mid-lifetime pod restart made every later NodeUnstage
+a silent no-op that leaked the iSCSI session past volume deletion. Fixed both
+ways: the node patch persists `/var/lib/bard/iscsi` as a hostPath, AND
+NodeUnstage now derives the session identity (target IQN from the volume name,
+portal from the instance, LUN 0) and logs out even with no record --
+regression-proven live (stage -> kill the node plugin pod -> delete workload ->
+zero leaked sessions). A control plane on a non-target node still needs remote
+LIO management (`targetd`) -- a follow-up.
 
 ## Local end-to-end (rootful kind + real Ceph)
 
