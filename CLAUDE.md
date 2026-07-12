@@ -81,9 +81,10 @@ credential in the publishContext), /node/stage (iscsiadm CHAP login under a
 per-node iface) + publish + write, /snapshot/create (asserts a read-only thin LV
 `Vri-...` with NO LIO export, listed with its origin), restore into a LARGER
 volume (own target; point-in-time -- post-snapshot writes absent; fs grown at
-stage), a **wrong-password CHAP login rejected** by LIO, /controller/unpublish
-(ACL gone), snapshot+volume deletes (targets + backstores + LVs all reaped -- no
-orphan). Trap-cleaned like the LVM test; auto-creates the `bard-thin` pool. CHAP
+stage), **online expand under a live session** (lvextend propagates through the
+LIO block backstore -> session rescan -> fs grown, data intact), a
+**wrong-password CHAP login rejected** by LIO, /controller/unpublish (ACL gone),
+snapshot+volume deletes (targets + backstores + LVs all reaped -- no orphan). Trap-cleaned like the LVM test; auto-creates the `bard-thin` pool. CHAP
 credentials are per-instance files (`--chap-dir/<instance>`, Secret
 `bard-iscsi-chap`, 2 lines userid/password or 4 with a mutual pair) read by BOTH
 planes -- never in the ConfigMap/StorageClass/PublishContext. Each volume = its

@@ -48,6 +48,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -326,6 +327,25 @@ func (b *Backend) chapFor(instance string) (*chapCreds, error) {
 	}
 }
 
+// redactSecrets replaces every occurrence of the given secret values in err's
+// text with "***". Command errors embed the full argv (diagnostic gold
+// everywhere else), but the two CHAP call sites pass credentials ON that argv,
+// and a plugin error becomes a CSI error -- which lands in sidecar logs,
+// VolumeAttachment status, and kubelet pod events. Redacting at the wrap keeps
+// the failure diagnosable without ever putting a password in the cluster.
+func redactSecrets(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	for _, s := range secrets {
+		if s != "" {
+			msg = strings.ReplaceAll(msg, s, "***")
+		}
+	}
+	return errors.New(msg)
+}
+
 // ---- control plane -------------------------------------------------------
 
 func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolumeRequest) (*bardplugin.CreateVolumeResponse, error) {
@@ -561,7 +581,8 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 			args = append(args, "mutual_userid="+chap.MutualUser, "mutual_password="+chap.MutualPassword)
 		}
 		if _, err := b.run.Run(ctx, "targetcli", args...); err != nil {
-			return nil, fmt.Errorf("iscsi: set chap auth on acl %s: %w", initIQN, err)
+			return nil, fmt.Errorf("iscsi: set chap auth on acl %s: %w", initIQN,
+				redactSecrets(err, chap.Password, chap.MutualPassword))
 		}
 	}
 	return &bardplugin.ControllerPublishResponse{PublishContext: map[string]string{
@@ -572,15 +593,17 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 }
 
 // ControllerUnpublish removes the node's ACL, revoking its access. Idempotent: a
-// missing ACL (already detached) succeeds.
+// missing ACL (already detached) succeeds. Like DeleteVolume it does NOT require
+// the instance to still be configured: both IQNs derive from the volume name +
+// node id, and reporting success while leaving the ACL in place would let the
+// node keep reaching the LUN whenever the config entry is missing or broken.
 func (b *Backend) ControllerUnpublish(ctx context.Context, req *bardplugin.ControllerUnpublishRequest) error {
-	ic, err := b.inst(req.Volume.Instance)
-	if err != nil {
-		// Unknown instance: nothing we manage is attached. Treat as detached.
-		return nil
+	base := b.instances[req.Volume.Instance].IQNBase
+	if base == "" {
+		base = defaultIQNBase
 	}
-	iqn := targetIQN(ic.IQNBase, req.Volume.Name)
-	initIQN := initiatorIQN(ic.IQNBase, req.NodeID)
+	iqn := targetIQN(base, req.Volume.Name)
+	initIQN := initiatorIQN(base, req.NodeID)
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn)+"/acls", "delete", initIQN); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: delete acl %s on %s: %w", initIQN, iqn, err)
 	}
@@ -796,7 +819,8 @@ func (b *Backend) setChapOnNode(ctx context.Context, iqn, portal string, chap *c
 	for _, p := range params {
 		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface,
 			"--op", "update", "-n", p[0], "-v", p[1]); err != nil {
-			return fmt.Errorf("iscsi: set %s on node record %s: %w", p[0], iqn, err)
+			return fmt.Errorf("iscsi: set %s on node record %s: %w", p[0], iqn,
+				redactSecrets(err, chap.Password, chap.MutualPassword))
 		}
 	}
 	return nil

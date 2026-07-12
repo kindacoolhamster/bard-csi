@@ -358,6 +358,81 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 	}
 }
 
+// A failed CHAP command must never leak the credentials: command errors embed
+// the full argv (as ExecRunner does), and a plugin error becomes a CSI error --
+// sidecar logs, VolumeAttachment status, kubelet events. Both secret-carrying
+// call sites (targetcli set auth; iscsiadm node-record update) must redact.
+func TestChapErrorsNeverLeakSecrets(t *testing.T) {
+	const pass, mutual = "supersecretpw", "mutualsecretpw"
+	inst, dir := chapSetup(t, "bard\n"+pass+"\nmuser\n"+mutual+"\n")
+	echo := func(name string) func([]string) (string, error) {
+		return func(args []string) (string, error) {
+			return "", errors.New(name + " " + strings.Join(args, " ") + ": exit status 1: boom")
+		}
+	}
+
+	// Controller: targetcli set auth fails, echoing argv (incl. both passwords).
+	frPub := &fakeRunner{results: map[string]func([]string) (string, error){
+		"targetcli": func(args []string) (string, error) {
+			if hasArg(args, "auth") {
+				return echo("targetcli")(args)
+			}
+			return "", nil
+		},
+	}}
+	b := New(inst, "", "", dir, "", frPub)
+	_, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
+		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
+	})
+	if err == nil {
+		t.Fatal("expected the auth failure to surface")
+	}
+	if strings.Contains(err.Error(), pass) || strings.Contains(err.Error(), mutual) {
+		t.Fatalf("CHAP password leaked into the publish error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "***") {
+		t.Fatalf("expected redaction marker in %v", err)
+	}
+
+	// Node: the password node-record update fails, echoing argv.
+	frStage := &fakeRunner{results: map[string]func([]string) (string, error){
+		"iscsiadm": func(args []string) (string, error) {
+			if strings.Contains(strings.Join(args, " "), "node.session.auth.password") {
+				return echo("iscsiadm")(args)
+			}
+			return "", nil
+		},
+	}}
+	b2 := New(inst, "n1", t.TempDir(), dir, "", frStage)
+	err = b2.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
+		StagingPath: t.TempDir() + "/stage",
+	})
+	if err == nil {
+		t.Fatal("expected the node-record failure to surface")
+	}
+	if strings.Contains(err.Error(), pass) {
+		t.Fatalf("CHAP password leaked into the stage error: %v", err)
+	}
+}
+
+// Unpublish must actually revoke the ACL even when the instance is no longer
+// configured -- both IQNs derive from the volume name + node id (like
+// DeleteVolume), and success-without-revocation would leave the node with
+// standing access to the LUN.
+func TestControllerUnpublishUnknownInstanceStillRevokes(t *testing.T) {
+	fr := &fakeRunner{}
+	b := New(map[string]InstanceConfig{}, "", "", "", "", fr) // nothing configured
+	if err := b.ControllerUnpublish(context.Background(), &bardplugin.ControllerUnpublishRequest{
+		Volume: bardplugin.VolumeRef{Instance: "gone", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !fr.ran("targetcli", "acls", "delete", initiatorIQN(defaultIQNBase, "n1")) {
+		t.Fatalf("expected the ACL delete to be attempted with derived IQNs; calls %v", fr.calls)
+	}
+}
+
 // With --iscsiadm-chroot set, every iscsiadm runs through chroot into the host
 // root (the host's matched iscsiadm+DB+iscsid stack); other tools stay direct.
 func TestIscsiadmChroot(t *testing.T) {

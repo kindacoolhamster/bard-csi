@@ -9,6 +9,7 @@
 #   snapshot (read-only thin LV, NOT exported) -> write more (post-snapshot) ->
 #   restore into a LARGER volume (own target; fs grown at stage) ->
 #   point-in-time check (pre-snapshot data present, post-snapshot data absent) ->
+#   ONLINE EXPAND under a live session (lvextend -> rescan -> fs grow, data kept) ->
 #   CHAP negative (wrong-password login rejected) ->
 #   unwind + delete (targets + backstores + LVs + snapshot all reaped)
 #
@@ -144,6 +145,18 @@ GOT2=$(cat "$PUB2/proof.txt")
 FSSIZE=$(df -B1 --output=size "$PUB2" | tail -1 | tr -d ' ')
 [ "$FSSIZE" -gt 1900000000 ] || { echo "FAIL: restored fs not grown to the 2Gi device (fs=$FSSIZE)"; exit 1; }
 echo "  restore: point-in-time data OK, post-snapshot file absent, fs grown to $FSSIZE OK"
+
+echo "## online expand the restored volume 2Gi -> 3Gi (lvextend under a live session + rescan + fs grow)"
+post /volume/expand '{"volume":'"$V2"',"newSizeBytes":3221225472}' | grep -q '"nodeExpansionRequired":true' \
+  || { echo "FAIL: expand must require node expansion"; exit 1; }
+SIZE3=$(lvs --noheadings --units b --nosuffix -o lv_size "$VG/$LV2" | tr -d ' ')
+[ "$SIZE3" = "3221225472" ] || { echo "FAIL: LV not grown to 3Gi (size=$SIZE3)"; exit 1; }
+post /node/expand '{"volume":'"$V2"',"volumePath":"'"$PUB2"'"}' >/dev/null
+FSSIZE3=$(df -B1 --output=size "$PUB2" | tail -1 | tr -d ' ')
+[ "$FSSIZE3" -gt 2900000000 ] || { echo "FAIL: fs not grown online to the 3Gi device (fs=$FSSIZE3)"; exit 1; }
+GOT3=$(cat "$PUB2/proof.txt")
+[ "$GOT3" = "bard-iscsi-proof" ] || { echo "FAIL: data lost across online expand"; exit 1; }
+echo "  LV=3Gi, fs grown online to $FSSIZE3, data intact OK"
 
 echo "## unwind the restored volume"
 post /node/unpublish '{"volume":'"$V2"',"targetPath":"'"$PUB2"'"}' >/dev/null
