@@ -212,6 +212,60 @@ func TestCompliantBackendPasses(t *testing.T) {
 	}
 }
 
+// attachRefBackend adds the control-plane attach surface to the reference
+// backend, recording publish state so the test can assert the tool drives the
+// full attach leg (publish -> idempotent republish -> unpublish -> idempotent
+// re-unpublish -> unpublish-absent) and detaches what it attached.
+type attachRefBackend struct {
+	*refBackend
+	pmu       sync.Mutex
+	published map[string]string // volume name -> node id
+}
+
+func (b *attachRefBackend) ControllerPublish(_ context.Context, req *bardplugin.ControllerPublishRequest) (*bardplugin.ControllerPublishResponse, error) {
+	b.pmu.Lock()
+	defer b.pmu.Unlock()
+	b.published[req.Volume.Name] = req.NodeID
+	return &bardplugin.ControllerPublishResponse{PublishContext: map[string]string{"token": "t-" + req.Volume.Name}}, nil
+}
+
+func (b *attachRefBackend) ControllerUnpublish(_ context.Context, req *bardplugin.ControllerUnpublishRequest) error {
+	b.pmu.Lock()
+	defer b.pmu.Unlock()
+	delete(b.published, req.Volume.Name) // absent = already detached: idempotent success
+	return nil
+}
+
+// TestAttachBackendPublishExercised proves the attach leg is driven for a
+// backend that declares RequiresControllerPublish, and that nothing stays
+// attached afterwards.
+func TestAttachBackendPublishExercised(t *testing.T) {
+	b := &attachRefBackend{refBackend: newRefBackend(), published: map[string]string{}}
+	sock := startPlugin(t, b)
+	results, err := Run(context.Background(), Config{
+		Socket: sock, Instance: "i1", CapacityBytes: 1 << 20, NodeID: "test-node", Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	byName := resultsByName(results)
+	for _, r := range results {
+		if r.Status == Fail {
+			t.Errorf("unexpected FAIL: %s -- %s", r.Name, r.Detail)
+		}
+	}
+	for _, name := range []string{"controller/publish", "controller/unpublish", "controller/unpublish-absent"} {
+		if byName[name].Status != Pass {
+			t.Errorf("check %s: %s -- %s (want PASS)", name, byName[name].Status, byName[name].Detail)
+		}
+	}
+	b.pmu.Lock()
+	defer b.pmu.Unlock()
+	if len(b.published) != 0 {
+		t.Errorf("the tool left attachments behind: %v", b.published)
+	}
+}
+
 // TestViolationsAreCaught breaks re-create idempotency and delete idempotency
 // and requires the matching checks to FAIL (and only sensible ones to fail).
 func TestViolationsAreCaught(t *testing.T) {

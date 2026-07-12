@@ -41,9 +41,15 @@ type Config struct {
 	CapacityBytes int64             // requested size of test volumes (default 16 MiB)
 	NamePrefix    string            // prefix for created names (default "conf-<random>")
 	Node          bool              // also drive the node plane (stage/publish/mount; usually needs root)
-	StagingDir    string            // where staging/target dirs are made (default: a temp dir)
-	OpTimeout     time.Duration     // per-operation timeout (default 2m)
-	Logf          func(format string, args ...any)
+	// NodeID is the CSI node id the attach checks publish to. For an attach
+	// backend (RequiresControllerPublish) whose node plane derives its identity
+	// from the plugin's own node id (e.g. the iSCSI initiator IQN), pass the
+	// SAME value the plugin under test was started with, or the node-plane login
+	// will be rejected. Default "conformance-node".
+	NodeID     string
+	StagingDir string        // where staging/target dirs are made (default: a temp dir)
+	OpTimeout  time.Duration // per-operation timeout (default 2m)
+	Logf       func(format string, args ...any)
 }
 
 // Status is a check outcome. Fail means the plugin violates the contract; Warn
@@ -511,13 +517,68 @@ func (r *runner) run(ctx context.Context) error {
 		r.record("volume/reclaimspace", Pass, "reclaim on a fresh volume succeeds")
 	}
 
+	// ---- controller attach (ControllerPublish/Unpublish) --------------------
+	// For an attach backend the publish MUST precede the node plane: without it
+	// the node's access is not provisioned (e.g. no ACL for its initiator), so a
+	// stage attempt is correctly rejected by the backend.
+	nodeID := r.cfg.NodeID
+	if nodeID == "" {
+		nodeID = "conformance-node"
+	}
+	var pubCtx map[string]string
+	published := false
+	if caps.RequiresControllerPublish {
+		if !haveV1 {
+			r.record("controller/publish", Skip, "prerequisite volume/create failed")
+		} else {
+			pubReq := bardplugin.ControllerPublishRequest{Volume: v1ref, NodeID: nodeID}
+			var resp bardplugin.ControllerPublishResponse
+			if err := r.call(ctx, bardplugin.PathControllerPublish, pubReq, &resp); err != nil {
+				r.record("controller/publish", Fail, "%v", err)
+			} else {
+				published = true
+				pubCtx = resp.PublishContext
+				if err := r.call(ctx, bardplugin.PathControllerPublish, pubReq, &resp); err != nil {
+					r.record("controller/publish", Fail, "repeated publish must succeed (the attacher retries): %v", err)
+				} else {
+					r.record("controller/publish", Pass, "published to node %q (%d publishContext keys), idempotent on repeat", nodeID, len(pubCtx))
+				}
+			}
+		}
+	}
+
 	// ---- node plane ---------------------------------------------------------
 	if !r.cfg.Node {
 		r.record("node", Skip, "node-plane checks disabled (enable with -node; usually needs root)")
 	} else if !haveV1 {
 		r.record("node", Skip, "prerequisite volume/create failed")
+	} else if caps.RequiresControllerPublish && !published {
+		r.record("node", Skip, "prerequisite controller/publish failed")
 	} else {
-		r.nodeChecks(ctx, caps, v1ref)
+		r.nodeChecks(ctx, caps, v1ref, pubCtx)
+	}
+
+	// ---- controller detach ---------------------------------------------------
+	if caps.RequiresControllerPublish && haveV1 {
+		unpubReq := bardplugin.ControllerUnpublishRequest{Volume: v1ref, NodeID: nodeID}
+		if !published {
+			r.record("controller/unpublish", Skip, "prerequisite controller/publish failed")
+		} else if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
+			r.record("controller/unpublish", Fail, "%v", err)
+		} else if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
+			r.record("controller/unpublish", Fail,
+				"second unpublish must succeed, got: %v -- ControllerUnpublish must be idempotent (the attacher retries forever)", err)
+		} else {
+			r.record("controller/unpublish", Pass, "detached; repeat detach is a successful no-op")
+		}
+		if published {
+			if err := r.call(ctx, bardplugin.PathControllerUnpublish,
+				bardplugin.ControllerUnpublishRequest{Volume: v1ref, NodeID: nodeID + "-never-published"}, nil); err != nil {
+				r.record("controller/unpublish-absent", Fail, "unpublishing a never-published node must succeed, got: %v", err)
+			} else {
+				r.record("controller/unpublish-absent", Pass, "unpublish of a never-published node is a successful no-op")
+			}
+		}
 	}
 
 	// ---- delete + required delete semantics ---------------------------------
@@ -569,7 +630,6 @@ func (r *runner) run(ctx context.Context) error {
 		name     string
 		declared bool
 	}{
-		{"controller/publish", caps.RequiresControllerPublish},
 		{"volume/modify", caps.ModifyVolume},
 		{"networkfence", caps.NetworkFence},
 		{"replication", caps.Replication},
@@ -585,7 +645,9 @@ func (r *runner) run(ctx context.Context) error {
 }
 
 // nodeChecks stages, publishes, writes through, and tears down v1 on this node.
-func (r *runner) nodeChecks(ctx context.Context, caps bardplugin.Capabilities, v1ref bardplugin.VolumeRef) {
+// pubCtx is the PublishContext from a preceding ControllerPublish (attach
+// backends; nil otherwise), threaded into NodeStage exactly as core does.
+func (r *runner) nodeChecks(ctx context.Context, caps bardplugin.Capabilities, v1ref bardplugin.VolumeRef, pubCtx map[string]string) {
 	base := r.cfg.StagingDir
 	if base == "" {
 		d, err := os.MkdirTemp("", "bard-conformance-")
@@ -605,7 +667,7 @@ func (r *runner) nodeChecks(ctx context.Context, caps bardplugin.Capabilities, v
 		}
 	}
 
-	stageReq := bardplugin.NodeStageRequest{Volume: v1ref, StagingPath: staging, FsType: r.cfg.FsType}
+	stageReq := bardplugin.NodeStageRequest{Volume: v1ref, StagingPath: staging, FsType: r.cfg.FsType, PublishContext: pubCtx}
 	if err := r.call(ctx, bardplugin.PathNodeStage, stageReq, nil); err != nil {
 		r.record("node/stage", Fail, "%v", err)
 		return

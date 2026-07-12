@@ -37,12 +37,19 @@ func errString(err error) string {
 
 // isNotFound classifies a delete/lookup of an object that is already gone -- the
 // idempotent case. Covers lvm ("Failed to find"), targetcli ("No such",
-// "does not exist") and iscsiadm ("no records"/"no session") phrasings.
+// "does not exist", and the backstore-specific "No storage object named" --
+// found by the conformance double-delete check; like the create side, the
+// backstore delete phrasing carries none of the generic markers) and iscsiadm
+// ("no records"/"no session") phrasings.
 func isNotFound(err error) bool {
 	s := strings.ToLower(errString(err))
 	return strings.Contains(s, "failed to find") || strings.Contains(s, "not found") ||
 		strings.Contains(s, "does not exist") || strings.Contains(s, "no such") ||
-		strings.Contains(s, "no records") || strings.Contains(s, "could not find")
+		strings.Contains(s, "no records") || strings.Contains(s, "could not find") ||
+		strings.Contains(s, "no storage object named") ||
+		// iscsiadm logout with no live session (exit 21): the idempotent-unstage
+		// case, found by the conformance repeated-unstage check.
+		strings.Contains(s, "no matching sessions")
 }
 
 // isExists classifies a create of an object that already exists -- so CreateVolume

@@ -358,6 +358,28 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 	}
 }
 
+// A repeated DeleteVolume must converge: targetcli's absent-backstore phrasing
+// ("No storage object named <x>" -- no generic not-found marker, like its
+// create-side sibling) broke delete idempotency until isNotFound learned it.
+// Found by the conformance tool's double-delete check.
+func TestDeleteVolumeAbsentBackstorePhrasing(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"targetcli": func(args []string) (string, error) {
+			if hasArg(args, "/backstores/block") {
+				return "", errors.New("No storage object named bard-x")
+			}
+			return "", errors.New("No such Target in configfs")
+		},
+		"lvremove": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
+	}}
+	b := New(eastInst(), "", "", "", "", fr)
+	if err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{
+		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
+	}); err != nil {
+		t.Fatalf("delete of an absent volume must be idempotent, got %v", err)
+	}
+}
+
 // NodeUnstage with NO session record (the plugin container restarted since
 // stage) must still log the session out with derived IQN/portal -- silently
 // returning success leaked the session past volume deletion, found live
@@ -365,6 +387,14 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
+		// The derived logout on an already-logged-out node answers with
+		// iscsiadm's real phrasing (exit 21) -- must classify as idempotent.
+		"iscsiadm": func(args []string) (string, error) {
+			if hasArg(args, "--logout") {
+				return "", errors.New("iscsiadm: No matching sessions found")
+			}
+			return "", nil
+		},
 	}}
 	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")

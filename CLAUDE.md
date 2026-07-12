@@ -143,8 +143,17 @@ ways: the node patch persists `/var/lib/bard/iscsi` as a hostPath, AND
 NodeUnstage now derives the session identity (target IQN from the volume name,
 portal from the instance, LUN 0) and logs out even with no record --
 regression-proven live (stage -> kill the node plugin pod -> delete workload ->
-zero leaked sessions). A control plane on a non-target node still needs remote
-LIO management (`targetd`) -- a follow-up.
+zero leaked sessions). **Conformance now covers attach backends** and runs
+against the real fixture via `hack/conformance-iscsi-test.sh` (27 PASS): the
+tool gained the controller/publish -> node -> unpublish leg (`-node-id` must
+match the plugin's `--node-id`), and its first run caught three more bugs --
+two MORE unclassified phrasings (`No storage object named` broke delete
+idempotency; `No matching sessions found` broke repeated unstage via the
+derived-logout fallback) and a hollow NodeReclaimSpace (the backstore never
+advertised UNMAP; now `emulate_tpu=1` best-effort at create, and an
+un-discardable stack is a clean no-op instead of a forever-failing job). A
+control plane on a non-target node still needs remote LIO management
+(`targetd`) -- a follow-up.
 
 ## Local end-to-end (rootful kind + real Ceph)
 

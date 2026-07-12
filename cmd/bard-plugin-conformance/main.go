@@ -45,6 +45,7 @@ func main() {
 		staging   = flag.String("staging-dir", "", "directory for staging/target paths (default: a temp dir)")
 		prefix    = flag.String("prefix", "", "name prefix for created resources (default: conf-<random>)")
 		opTimeout = flag.Duration("op-timeout", 2*time.Minute, "per-operation timeout")
+		nodeID    = flag.String("node-id", "", "CSI node id the attach checks publish to; for attach backends whose node identity derives from the plugin's --node-id (iSCSI), pass the same value (default conformance-node)")
 		verbose   = flag.Bool("v", false, "log each check as it runs")
 	)
 	flag.Var(params, "param", "StorageClass-style parameter key=value (repeatable)")
@@ -70,6 +71,7 @@ func main() {
 		CapacityBytes: *size,
 		NamePrefix:    *prefix,
 		Node:          *node,
+		NodeID:        *nodeID,
 		StagingDir:    *staging,
 		OpTimeout:     *opTimeout,
 	}

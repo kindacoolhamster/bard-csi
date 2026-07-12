@@ -443,6 +443,11 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if _, err := b.run.Run(ctx, "targetcli", "/backstores/block", "create", "name="+lv, "dev="+devPath(vg, lv)); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: create backstore %s: %w", lv, err)
 	}
+	// Advertise thin-provisioning UNMAP so a node-side fstrim travels down to
+	// the LV (and, on a thin LV, frees the pool) -- without it the initiator
+	// sees "discard not supported" and NodeReclaimSpace is hollow. Best-effort:
+	// a backing device with no discard support just leaves it off.
+	_, _ = b.run.Run(ctx, "targetcli", backstore(lv), "set", "attribute", "emulate_tpu=1")
 	if _, err := b.run.Run(ctx, "targetcli", "/iscsi", "create", iqn); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: create target %s: %w", iqn, err)
 	}
@@ -1027,6 +1032,11 @@ func (b *Backend) NodeReclaimSpace(ctx context.Context, req *bardplugin.NodeRecl
 		path = req.StagingPath
 	}
 	if _, err := b.run.Run(ctx, "fstrim", path); err != nil {
+		// A stack that cannot discard (no UNMAP end to end) has nothing to
+		// reclaim: a clean no-op, not a permanently failing ReclaimSpaceJob.
+		if strings.Contains(strings.ToLower(err.Error()), "not supported") {
+			return &bardplugin.ReclaimSpaceResponse{PreUsageBytes: -1, PostUsageBytes: -1}, nil
+		}
 		return nil, fmt.Errorf("iscsi: fstrim %s: %w", path, err)
 	}
 	return &bardplugin.ReclaimSpaceResponse{PreUsageBytes: -1, PostUsageBytes: -1}, nil
