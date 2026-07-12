@@ -92,6 +92,11 @@ requested size, exported through its own target. The pool is pre-created once:
 (no-pool) volume is rejected. Needs the external-snapshotter cluster singleton,
 same as every other backend (`hack/install-snapshotter.sh`).
 
+Snapshots are **crash-consistent at the target**: the LV is snapshotted beneath
+the initiator, so writes still in the node's page cache are not included — the
+same semantics as any array-side snapshot (Ceph RBD included). Quiesce or
+`fsync` the workload first if you need application consistency.
+
 ## CHAP
 
 `chapAuth: true` on an instance enforces CHAP on the data path: the target
@@ -100,9 +105,17 @@ credentials on the node's ACL, and the node sets them on its record before
 login — a wrong password is rejected by LIO. Credentials come from the
 `bard-iscsi-chap` Secret (one key per instance: 2 lines userid/password, or 4
 with a mutual pair), mounted into **both** plugin sidecars; they never appear in
-the StorageClass, the volume context, or the PublishContext (which is stored in
-the API-visible VolumeAttachment). See the commented Secret in
-[config.yaml](config.yaml).
+the StorageClass, the volume context, the PublishContext (which is stored in the
+API-visible VolumeAttachment), or in error messages (redacted). See the
+commented Secret in [config.yaml](config.yaml).
+
+Two accepted limitations to know about: `targetcli`/`iscsiadm` only take
+credentials on the command line, so the password is briefly visible in
+`/proc/<pid>/cmdline` on the controller/node host while those commands run
+(inherent to the tools; the same tradeoff every iSCSI driver makes). And
+**discovery is unauthenticated** — anyone who can reach the portal can list
+target IQNs; CHAP + per-node ACLs gate the actual login, but keep the portal on
+a network initiators belong on.
 
 ## Not yet (follow-ups)
 
