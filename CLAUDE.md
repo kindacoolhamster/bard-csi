@@ -135,7 +135,8 @@ host-side command had left the pool active, but the first volume after a node
 reboot or after the last LV's removal always hits it. Fixed in the plugin:
 every state-changing lvm command runs with `--config
 'activation{udev_sync=0 udev_rules=0}'` (lvm manages /dev nodes itself; also
-correct on udev hosts -- harness re-proven from an inactive pool). (6) **the
+correct on udev hosts -- harness re-proven from an inactive pool; ported to
+the LVM plugin too, which shares this logic and had the same latent bug). (6) **the
 node session state must survive plugin pod restarts**: stateDir was
 container-ephemeral, so a mid-lifetime pod restart made every later NodeUnstage
 a silent no-op that leaked the iSCSI session past volume deletion. Fixed both

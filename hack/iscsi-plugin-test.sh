@@ -11,7 +11,9 @@
 #   point-in-time check (pre-snapshot data present, post-snapshot data absent) ->
 #   ONLINE EXPAND under a live session (lvextend -> rescan -> fs grow, data kept) ->
 #   CHAP negative (wrong-password login rejected) ->
-#   unwind + delete (targets + backstores + LVs + snapshot all reaped)
+#   delete the SOURCE first (snapshot must outlive it and STAY LISTED with its
+#   recorded source -- the bardsrc. tag) ->
+#   delete snapshot + restore (targets + backstores + LVs all reaped)
 #
 # Like the LVM plugin, the controller plane is kernel/configfs-backed so it is
 # proven here (binary over socket on galileo) rather than in a nested cluster. The
@@ -185,11 +187,19 @@ if targetcli "/iscsi/$IQN/tpg1/acls" ls "$INITIQN" >/dev/null 2>&1; then
 fi
 echo "  ACL removed OK"
 
-echo "## delete snapshot + volumes -> targets + backstores + LVs all reaped (no orphan)"
+echo "## delete the SOURCE volume first -- its snapshot must survive AND stay listed"
+post /volume/delete '{"volume":'"$V"'}' >/dev/null
+lvs "$VG/$SNAP" >/dev/null 2>&1 || { echo "FAIL: snapshot LV $SNAP must outlive its source"; exit 1; }
+# lvm clears the snapshot's origin here; the create-time bardsrc. tag is what
+# keeps it listed with its source (core drops sourceless snapshots).
+post /snapshot/list '{}' | grep -q '"name":"'"$SNAP"'"' || { echo "FAIL: snapshot must stay listed after its source is deleted"; exit 1; }
+post /snapshot/list '{}' | grep -q '"sourceVolume":{[^}]*"name":"'"$LV"'"' || { echo "FAIL: snapshot must keep its recorded source after the source is deleted"; exit 1; }
+echo "  source deleted, snapshot still listed with source $LV OK"
+
+echo "## delete snapshot + restored volume -> targets + backstores + LVs all reaped (no orphan)"
 post /snapshot/delete '{"snapshot":{"instance":"galileo","location":"'"$VG"'","name":"'"$SNAP"'"}}' >/dev/null
 lvs "$VG/$SNAP" >/dev/null 2>&1 && { echo "FAIL: snapshot LV $SNAP still exists"; exit 1; }
 post /volume/delete '{"volume":'"$V2"'}' >/dev/null
-post /volume/delete '{"volume":'"$V"'}' >/dev/null
 FAILED=0
 for t in "$IQN" "$IQN2"; do targetcli /iscsi ls "$t" >/dev/null 2>&1 && { echo "FAIL: target $t still exists"; FAILED=1; }; done
 for l in "$LV" "$LV2"; do

@@ -119,6 +119,9 @@ func TestThinSnapshot(t *testing.T) {
 	if !hasArg(c, "-s") || !hasArg(c, "-pr") || !hasArg(c, "bard-vg/bard-x") {
 		t.Fatalf("snapshot must be a read-only thin snapshot of the origin; got %v", c)
 	}
+	if !hasArg(c, "--addtag") || !hasArg(c, srcTagPrefix+"bard-x") {
+		t.Fatalf("snapshot create must record its source in a %s tag; got %v", srcTagPrefix, c)
+	}
 	if resp.Name != snapName("snap1") || !resp.ReadyToUse {
 		t.Fatalf("unexpected snapshot response %+v", resp)
 	}
@@ -322,6 +325,100 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	b2 := New(instBad, "", "", dir, "", &fakeRunner{})
 	if _, err := b2.chapFor("east"); err == nil {
 		t.Fatal("3-line credentials file must be rejected (mutual needs both lines)")
+	}
+
+	// targetcli re-parses its argv through configshell, so whitespace or quotes
+	// in a credential would split the `set auth` command at publish time --
+	// reject at load instead.
+	instWS, dirWS := chapSetup(t, "bard\npass word\n")
+	b3 := New(instWS, "", "", dirWS, "", &fakeRunner{})
+	if _, err := b3.chapFor("east"); err == nil {
+		t.Fatal("credentials containing whitespace must be rejected")
+	}
+}
+
+// A missing source LV must surface as NotFound (CSI: restore/snapshot of a
+// deleted source), not a generic lvs failure.
+func TestSnapshotAndCloneMissingSourceNotFound(t *testing.T) {
+	gone := &fakeRunner{results: map[string]func([]string) (string, error){
+		"lvs": func(args []string) (string, error) {
+			return "", errors.New("Failed to find logical volume \"bard-vg/bard-x\"")
+		},
+	}}
+	b := New(thinInst(), "", "", "", "", gone)
+	wantNotFound := func(err error, op string) {
+		t.Helper()
+		var se *bardplugin.StatusError
+		if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeNotFound {
+			t.Fatalf("%s of a missing source must be NotFound, got %v", op, err)
+		}
+	}
+	_, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
+		Name: "s", SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
+	})
+	wantNotFound(err, "snapshot")
+	_, err = b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
+		Name: "c", Instance: "east",
+		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "snap-abc"},
+	})
+	wantNotFound(err, "clone/restore")
+}
+
+// A clone source in a different VG than the instance's is a routing error,
+// rejected fail-fast (thin snapshots cannot cross VGs).
+func TestCloneSourceWrongVGRejected(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"lvs": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
+	}}
+	b := New(thinInst(), "", "", "", "", fr)
+	_, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
+		Name: "c", Instance: "east",
+		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "other-vg", Name: "snap-abc"},
+	})
+	var se *bardplugin.StatusError
+	if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeInvalidArg {
+		t.Fatalf("cross-VG clone source must be InvalidArgument, got %v", err)
+	}
+}
+
+// ListSnapshots must keep reporting a snapshot after its source volume is
+// deleted: the origin column is empty then and the create-time tag supplies
+// the source. A pre-tag snapshot with neither stays dropped (no provenance).
+func TestListSnapshotsSurvivesSourceDeletion(t *testing.T) {
+	vol, snap := lvName("a"), snapName("s")
+	lvsOut := snap + "|1073741824|Vri---tz-k||" + srcTagPrefix + vol + "\n" +
+		"snap-feedfacefeedface|1073741824|Vri---tz-k||\n" // pre-tag orphan
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"lvs": func([]string) (string, error) { return lvsOut, nil },
+	}}
+	b := New(thinInst(), "", "", "", "", fr)
+	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snaps.Entries) != 1 || snaps.Entries[0].Snapshot.Name != snap || snaps.Entries[0].SourceVolume.Name != vol {
+		t.Fatalf("expected the tagged snapshot with its recorded source, got %+v", snaps.Entries)
+	}
+}
+
+// NodePublish of a raw Block volume must not wedge on a restart-lost stage
+// record: the device is derived exactly as NodeUnstage derives it.
+func TestNodePublishBlockDerivedDevice(t *testing.T) {
+	fr := &fakeRunner{}
+	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	lv := lvName("pvc-1")
+	target := t.TempDir() + "/block-target"
+	if err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
+		StagingPath: t.TempDir() + "/stage",
+		TargetPath:  target,
+		Block:       true,
+	}); err != nil {
+		t.Fatalf("block publish with a lost record must derive the device: %v", err)
+	}
+	dev := byPath("10.0.0.9:3260", targetIQN(defaultIQNBase, lv), "0")
+	if !fr.ran("mount", "--bind", dev, target) {
+		t.Fatalf("expected bind mount of the derived by-path device; calls %v", fr.calls)
 	}
 }
 

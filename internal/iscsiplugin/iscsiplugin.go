@@ -224,15 +224,20 @@ func (b *Backend) thinPoolFor(instance string, params map[string]string) string 
 	return b.instances[instance].ThinPool
 }
 
-// isThinLV reports whether an existing LV is a thin volume, read from its
+// isThinLV reports whether an LV exists and is a thin volume, read from its
 // attributes (lv_attr starts with 'V') -- the actual truth, independent of
-// config, so snapshot/clone of a source behaves correctly.
-func (b *Backend) isThinLV(ctx context.Context, vg, lv string) (bool, error) {
+// config, so snapshot/clone of a source behaves correctly. A missing LV is
+// (false, false, nil), so callers can answer with NotFound instead of a
+// generic lvs failure.
+func (b *Backend) isThinLV(ctx context.Context, vg, lv string) (thin, exists bool, err error) {
 	out, err := b.run.Run(ctx, "lvs", "--noheadings", "-o", "lv_attr", vg+"/"+lv)
 	if err != nil {
-		return false, fmt.Errorf("iscsi: lvs attr %s/%s: %w", vg, lv, err)
+		if isNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, fmt.Errorf("iscsi: lvs attr %s/%s: %w", vg, lv, err)
 	}
-	return strings.HasPrefix(strings.TrimSpace(out), "V"), nil
+	return strings.HasPrefix(strings.TrimSpace(out), "V"), true, nil
 }
 
 // snapName derives a bounded, deterministic snapshot LV name from a CSI name.
@@ -240,6 +245,15 @@ func snapName(csiName string) string {
 	sum := sha256.Sum256([]byte(csiName))
 	return "snap-" + hex.EncodeToString(sum[:8])
 }
+
+// srcTagPrefix prefixes the LV tag recording a snapshot's source LV name at
+// create time. `lvs -o origin` goes EMPTY once the source is deleted (a thin
+// snapshot outlives its origin), which silently dropped such snapshots from
+// ListSnapshots -- the same provenance problem the NFS plugin solves with its
+// .snapshots/<id>.src sidecar. The tag survives with the snapshot; origin
+// stays the primary source (covers pre-tag snapshots). Tag charset is
+// [a-zA-Z0-9_+.-], which covers the "bard-<hex>" names.
+const srcTagPrefix = "bardsrc."
 
 // lvOrigin returns an LV's origin (the LV it was snapshotted from) and whether
 // the LV exists at all.
@@ -314,6 +328,15 @@ func (b *Backend) chapFor(instance string) (*chapCreds, error) {
 	for _, l := range strings.Split(string(data), "\n") {
 		if l = strings.TrimSpace(l); l != "" {
 			lines = append(lines, l)
+		}
+	}
+	for _, l := range lines {
+		// targetcli re-joins and re-parses its argv through configshell, so
+		// whitespace or quotes inside a credential would split the `set auth`
+		// command at publish time; reject at load with a clear message instead.
+		if strings.ContainsAny(l, " \t'\"") {
+			return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: chap credentials at %s must not contain whitespace or quotes", path)
 		}
 	}
 	switch len(lines) {
@@ -404,9 +427,20 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 			if req.SourceSnapshot != nil {
 				src = req.SourceSnapshot
 			}
-			thin, err := b.isThinLV(ctx, vg, src.Name)
+			// Thin snapshots cannot cross VGs, so the source must live in this
+			// instance's VG; a mismatched handle is a routing error, not a
+			// missing LV.
+			if src.Location != "" && src.Location != vg {
+				return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+					"iscsi: clone/restore source %s/%s is not in this instance's VG %s", src.Location, src.Name, vg)
+			}
+			thin, exists, err := b.isThinLV(ctx, vg, src.Name)
 			if err != nil {
 				return nil, err
+			}
+			if !exists {
+				return nil, bardplugin.Errorf(bardplugin.CodeNotFound,
+					"iscsi: clone/restore source %s/%s not found", vg, src.Name)
 			}
 			if !thin {
 				return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: clone/restore requires a thin source volume")
@@ -525,9 +559,13 @@ func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolume
 // export; a restore clones it into a new volume with its own target.
 func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
 	src := req.SourceVolume // Location=vg, Name=lv
-	thin, err := b.isThinLV(ctx, src.Location, src.Name)
+	thin, exists, err := b.isThinLV(ctx, src.Location, src.Name)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return nil, bardplugin.Errorf(bardplugin.CodeNotFound,
+			"iscsi: snapshot source %s/%s not found", src.Location, src.Name)
 	}
 	if !thin {
 		return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: snapshots require a thin volume (provision from a thinPool)")
@@ -543,7 +581,9 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 		return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
 			"iscsi: snapshot %q already exists for a different source volume (%s)", req.Name, origin)
 	}
-	if _, err := b.lvm(ctx, "lvcreate", "-s", "-pr", "-n", snap, vg+"/"+src.Name); err != nil && !isExists(err) {
+	// --addtag records the source (see srcTagPrefix): provenance that survives
+	// the source volume's deletion, unlike the origin attribute.
+	if _, err := b.lvm(ctx, "lvcreate", "-s", "-pr", "--addtag", srcTagPrefix+src.Name, "-n", snap, vg+"/"+src.Name); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: snapshot %s/%s: %w", vg, src.Name, err)
 	}
 	size, _, err := b.lvSizeBytes(ctx, vg, src.Name)
@@ -892,11 +932,23 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 
 func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRequest) error {
 	if req.Block {
-		// Raw block: bind-mount the staged device node to the target path.
+		// Raw block: bind-mount the staged device node to the target path. The
+		// stage record names the device; with the record lost (a restart with
+		// an unpersisted state dir -- the same failure NodeUnstage derives its
+		// way out of) the device is equally derivable, so publish must not
+		// wedge on a missing record while the LUN is attached.
 		st, ok := b.loadState(req.StagingPath)
 		dev := st.Device
 		if !ok || dev == "" {
-			return bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: no staged device for %s", req.StagingPath)
+			ic := b.instances[req.Volume.Instance]
+			if ic.Portal == "" {
+				return bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: no staged device for %s", req.StagingPath)
+			}
+			base := ic.IQNBase
+			if base == "" {
+				base = defaultIQNBase
+			}
+			dev = byPath(ic.Portal, targetIQN(base, req.Volume.Name), "0")
 		}
 		if err := os.MkdirAll(filepath.Dir(req.TargetPath), 0o750); err != nil {
 			return fmt.Errorf("iscsi: mkdir target parent: %w", err)
@@ -1042,17 +1094,18 @@ func (b *Backend) NodeReclaimSpace(ctx context.Context, req *bardplugin.NodeRecl
 	return &bardplugin.ReclaimSpaceResponse{PreUsageBytes: -1, PostUsageBytes: -1}, nil
 }
 
-// lvInfo is one row of `lvs` for listing.
+// lvInfo is one row of `lvs` for listing. srcTag is the source LV recorded at
+// snapshot create (srcTagPrefix), which outlives the origin attribute.
 type lvInfo struct {
-	name, attr, origin string
-	size               int64
+	name, attr, origin, srcTag string
+	size                       int64
 }
 
-// listLVs returns the LVs in a VG (name, size, attr, origin) via a separator-
-// delimited lvs so empty fields (no origin) parse deterministically.
+// listLVs returns the LVs in a VG (name, size, attr, origin, source tag) via a
+// separator-delimited lvs so empty fields (no origin) parse deterministically.
 func (b *Backend) listLVs(ctx context.Context, vg string) ([]lvInfo, error) {
 	out, err := b.run.Run(ctx, "lvs", "--noheadings", "--units", "b", "--nosuffix",
-		"--separator", "|", "-o", "lv_name,lv_size,lv_attr,origin", vg)
+		"--separator", "|", "-o", "lv_name,lv_size,lv_attr,origin,lv_tags", vg)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
@@ -1066,11 +1119,18 @@ func (b *Backend) listLVs(ctx context.Context, vg string) ([]lvInfo, error) {
 			continue
 		}
 		size, _ := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
-		origin := ""
+		row := lvInfo{name: strings.TrimSpace(f[0]), size: size, attr: strings.TrimSpace(f[2])}
 		if len(f) >= 4 {
-			origin = strings.TrimSpace(f[3])
+			row.origin = strings.TrimSpace(f[3])
 		}
-		rows = append(rows, lvInfo{name: strings.TrimSpace(f[0]), size: size, attr: strings.TrimSpace(f[2]), origin: origin})
+		if len(f) >= 5 { // lv_tags is comma-separated
+			for _, t := range strings.Split(strings.TrimSpace(f[4]), ",") {
+				if rest, ok := strings.CutPrefix(t, srcTagPrefix); ok {
+					row.srcTag = rest
+				}
+			}
+		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }
@@ -1118,12 +1178,23 @@ func (b *Backend) ListSnapshots(ctx context.Context, _ *bardplugin.ListSnapshots
 			return nil, err
 		}
 		for _, lv := range rows {
-			if !strings.HasPrefix(lv.name, "snap-") || lv.origin == "" {
+			if !strings.HasPrefix(lv.name, "snap-") {
+				continue
+			}
+			// origin is authoritative while the source LV lives; the create-time
+			// tag keeps the snapshot listed after the source is deleted (core
+			// drops entries with no source). A pre-tag snapshot whose source is
+			// gone has no provenance left and stays dropped.
+			src := lv.origin
+			if src == "" {
+				src = lv.srcTag
+			}
+			if src == "" {
 				continue
 			}
 			entries = append(entries, bardplugin.SnapshotListEntry{
 				Snapshot:     bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.name},
-				SourceVolume: bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.origin},
+				SourceVolume: bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: src},
 				SizeBytes:    lv.size,
 				ReadyToUse:   true,
 			})

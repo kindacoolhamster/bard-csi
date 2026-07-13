@@ -138,6 +138,33 @@ func snapName(csiName string) string {
 	return "snap-" + hex.EncodeToString(sum[:8])
 }
 
+// srcTagPrefix prefixes the LV tag recording a snapshot's source LV name at
+// create time. `lvs -o origin` goes EMPTY once the source is deleted (a thin
+// snapshot outlives its origin), which silently dropped such snapshots from
+// ListSnapshots -- the same provenance problem the NFS plugin solves with its
+// .snapshots/<id>.src sidecar. The tag survives with the snapshot; origin
+// stays the primary source (covers pre-tag snapshots). Tag charset is
+// [a-zA-Z0-9_+.-], which covers the "bard-<hex>" names.
+const srcTagPrefix = "bardsrc."
+
+// lvmUdevConfig makes lvm create and remove /dev nodes itself instead of
+// deferring to udev. In a container there is no udev to serve an activation
+// (the host udevd's completion handshake lives in the host IPC namespace), so
+// activating an INACTIVE thin pool -- the first volume after a node reboot, or
+// after the last thin LV was removed -- dies with "open failed: No such file
+// or directory" on the pool's tmeta node (found live in-cluster by the iSCSI
+// plugin, which shares this thin-LV logic). Self-managed nodes are also
+// correct on a host WITH udev: the dm uevent flags tell udev's own rules to
+// skip node management.
+const lvmUdevConfig = "activation{udev_sync=0 udev_rules=0}"
+
+// lvm runs a state-changing lvm command (lvcreate/lvchange/lvextend/lvremove)
+// with lvmUdevConfig. Plain reads (lvs, vgs) don't touch device nodes and run
+// directly.
+func (b *Backend) lvm(ctx context.Context, cmd string, args ...string) (string, error) {
+	return b.run.Run(ctx, cmd, append([]string{"--config", lvmUdevConfig}, args...)...)
+}
+
 // lvOrigin returns an LV's origin (the LV it was snapshotted from) and whether
 // the LV exists at all.
 func (b *Backend) lvOrigin(ctx context.Context, vg, lv string) (string, bool, error) {
@@ -229,12 +256,12 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 			}
 		case pool != "":
 			// Thin volume: -V is the virtual (logical) size carved from the pool.
-			if _, err := b.run.Run(ctx, "lvcreate", "-T", vg+"/"+pool, "-V", lvBytes(req.CapacityBytes), "-n", lv); err != nil {
+			if _, err := b.lvm(ctx, "lvcreate", "-T", vg+"/"+pool, "-V", lvBytes(req.CapacityBytes), "-n", lv); err != nil {
 				return nil, fmt.Errorf("lvm: lvcreate thin %s/%s: %w", vg, lv, err)
 			}
 		default:
 			// Thick volume: -L fully allocates the size up front.
-			if _, err := b.run.Run(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
+			if _, err := b.lvm(ctx, "lvcreate", "-n", lv, "-L", lvBytes(req.CapacityBytes), vg); err != nil {
 				return nil, fmt.Errorf("lvm: lvcreate %s/%s: %w", vg, lv, err)
 			}
 		}
@@ -264,10 +291,10 @@ func lvBytes(b int64) string {
 // activates it (thin snapshots are created with the activation-skip flag set, so
 // the node would otherwise not see the device). Idempotent on the create.
 func (b *Backend) thinClone(ctx context.Context, vg, src, lv string) error {
-	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-n", lv, vg+"/"+src); err != nil && !isAlreadyExists(err) {
+	if _, err := b.lvm(ctx, "lvcreate", "-s", "-n", lv, vg+"/"+src); err != nil && !isAlreadyExists(err) {
 		return fmt.Errorf("lvm: thin clone %s/%s -> %s: %w", vg, src, lv, err)
 	}
-	if _, err := b.run.Run(ctx, "lvchange", "-ay", "-Ky", vg+"/"+lv); err != nil {
+	if _, err := b.lvm(ctx, "lvchange", "-ay", "-Ky", vg+"/"+lv); err != nil {
 		return fmt.Errorf("lvm: activate clone %s/%s: %w", vg, lv, err)
 	}
 	return nil
@@ -275,7 +302,7 @@ func (b *Backend) thinClone(ctx context.Context, vg, src, lv string) error {
 
 func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolumeRequest) error {
 	vglv := req.Volume.Location + "/" + req.Volume.Name
-	if _, err := b.run.Run(ctx, "lvremove", "-f", vglv); err != nil && !isNotFound(err) {
+	if _, err := b.lvm(ctx, "lvremove", "-f", vglv); err != nil && !isNotFound(err) {
 		return fmt.Errorf("lvm: lvremove %s: %w", vglv, err)
 	}
 	return nil
@@ -298,7 +325,7 @@ func (b *Backend) extendTo(ctx context.Context, vg, lv string, size int64) error
 	if size <= 0 {
 		return nil
 	}
-	if _, err := b.run.Run(ctx, "lvextend", "-L", strconv.FormatInt(size, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
+	if _, err := b.lvm(ctx, "lvextend", "-L", strconv.FormatInt(size, 10)+"b", vg+"/"+lv); err != nil && !isNotLarger(err) {
 		return fmt.Errorf("lvm: lvextend %s/%s: %w", vg, lv, err)
 	}
 	return nil
@@ -327,7 +354,9 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 		return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
 			"lvm: snapshot %q already exists for a different source volume (%s)", req.Name, origin)
 	}
-	if _, err := b.run.Run(ctx, "lvcreate", "-s", "-pr", "-n", snap, vg+"/"+src.Name); err != nil && !isAlreadyExists(err) {
+	// --addtag records the source (see srcTagPrefix): provenance that survives
+	// the source volume's deletion, unlike the origin attribute.
+	if _, err := b.lvm(ctx, "lvcreate", "-s", "-pr", "--addtag", srcTagPrefix+src.Name, "-n", snap, vg+"/"+src.Name); err != nil && !isAlreadyExists(err) {
 		return nil, fmt.Errorf("lvm: snapshot %s/%s: %w", vg, src.Name, err)
 	}
 	size, _, err := b.lvSizeBytes(ctx, vg, src.Name)
@@ -345,7 +374,7 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 
 func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnapshotRequest) error {
 	vgsnap := req.Snapshot.Location + "/" + req.Snapshot.Name
-	if _, err := b.run.Run(ctx, "lvremove", "-f", vgsnap); err != nil && !isNotFound(err) {
+	if _, err := b.lvm(ctx, "lvremove", "-f", vgsnap); err != nil && !isNotFound(err) {
 		return fmt.Errorf("lvm: lvremove snapshot %s: %w", vgsnap, err)
 	}
 	return nil
@@ -529,17 +558,18 @@ func (b *Backend) NodeReclaimSpace(ctx context.Context, req *bardplugin.NodeRecl
 	return &bardplugin.ReclaimSpaceResponse{PreUsageBytes: -1, PostUsageBytes: -1}, nil
 }
 
-// lvInfo is one row of `lvs` for listing.
+// lvInfo is one row of `lvs` for listing. srcTag is the source LV recorded at
+// snapshot create (srcTagPrefix), which outlives the origin attribute.
 type lvInfo struct {
-	name, attr, origin string
-	size               int64
+	name, attr, origin, srcTag string
+	size                       int64
 }
 
-// listLVs returns the LVs in a VG (name, size, attr, origin) via a separator-
-// delimited lvs so empty fields (no origin) parse deterministically.
+// listLVs returns the LVs in a VG (name, size, attr, origin, source tag) via a
+// separator-delimited lvs so empty fields (no origin) parse deterministically.
 func (b *Backend) listLVs(ctx context.Context, vg string) ([]lvInfo, error) {
 	out, err := b.run.Run(ctx, "lvs", "--noheadings", "--units", "b", "--nosuffix",
-		"--separator", "|", "-o", "lv_name,lv_size,lv_attr,origin", vg)
+		"--separator", "|", "-o", "lv_name,lv_size,lv_attr,origin,lv_tags", vg)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
@@ -553,11 +583,18 @@ func (b *Backend) listLVs(ctx context.Context, vg string) ([]lvInfo, error) {
 			continue
 		}
 		size, _ := strconv.ParseInt(strings.TrimSpace(f[1]), 10, 64)
-		origin := ""
+		row := lvInfo{name: strings.TrimSpace(f[0]), size: size, attr: strings.TrimSpace(f[2])}
 		if len(f) >= 4 {
-			origin = strings.TrimSpace(f[3])
+			row.origin = strings.TrimSpace(f[3])
 		}
-		rows = append(rows, lvInfo{name: strings.TrimSpace(f[0]), size: size, attr: strings.TrimSpace(f[2]), origin: origin})
+		if len(f) >= 5 { // lv_tags is comma-separated
+			for _, t := range strings.Split(strings.TrimSpace(f[4]), ",") {
+				if rest, ok := strings.CutPrefix(t, srcTagPrefix); ok {
+					row.srcTag = rest
+				}
+			}
+		}
+		rows = append(rows, row)
 	}
 	return rows, nil
 }
@@ -605,12 +642,23 @@ func (b *Backend) ListSnapshots(ctx context.Context, _ *bardplugin.ListSnapshots
 			return nil, err
 		}
 		for _, lv := range rows {
-			if !strings.HasPrefix(lv.name, "snap-") || lv.origin == "" {
+			if !strings.HasPrefix(lv.name, "snap-") {
+				continue
+			}
+			// origin is authoritative while the source LV lives; the create-time
+			// tag keeps the snapshot listed after the source is deleted (core
+			// drops entries with no source). A pre-tag snapshot whose source is
+			// gone has no provenance left and stays dropped.
+			src := lv.origin
+			if src == "" {
+				src = lv.srcTag
+			}
+			if src == "" {
 				continue
 			}
 			entries = append(entries, bardplugin.SnapshotListEntry{
 				Snapshot:     bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.name},
-				SourceVolume: bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: lv.origin},
+				SourceVolume: bardplugin.VolumeRef{Instance: instance, Location: ic.VG, Name: src},
 				SizeBytes:    lv.size,
 				ReadyToUse:   true,
 			})

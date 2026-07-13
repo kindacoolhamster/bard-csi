@@ -266,6 +266,39 @@ func TestAttachBackendPublishExercised(t *testing.T) {
 	}
 }
 
+// createFailingAttachBackend is an attach backend whose CreateVolume always
+// fails, for asserting prerequisite-skip accounting.
+type createFailingAttachBackend struct{ *attachRefBackend }
+
+func (b *createFailingAttachBackend) CreateVolume(context.Context, *bardplugin.CreateVolumeRequest) (*bardplugin.CreateVolumeResponse, error) {
+	return nil, bardplugin.Errorf(bardplugin.CodeInternal, "induced create failure")
+}
+
+// TestAttachChecksAlwaysAccounted: when a prerequisite fails, every attach
+// check still gets a result (Skip, like all other prerequisite-gated checks)
+// -- the check set must be stable across runs, not silently shrink.
+func TestAttachChecksAlwaysAccounted(t *testing.T) {
+	b := &createFailingAttachBackend{&attachRefBackend{refBackend: newRefBackend(), published: map[string]string{}}}
+	sock := startPlugin(t, b)
+	results, err := Run(context.Background(), Config{
+		Socket: sock, Instance: "i1", CapacityBytes: 1 << 20, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	byName := resultsByName(results)
+	for _, name := range []string{"controller/publish", "controller/unpublish", "controller/unpublish-absent"} {
+		r, ok := byName[name]
+		if !ok {
+			t.Errorf("check %s missing from the results entirely (want Skip)", name)
+			continue
+		}
+		if r.Status != Skip {
+			t.Errorf("check %s: %s -- %s (want SKIP)", name, r.Status, r.Detail)
+		}
+	}
+}
+
 // TestViolationsAreCaught breaks re-create idempotency and delete idempotency
 // and requires the matching checks to FAIL (and only sensible ones to fail).
 func TestViolationsAreCaught(t *testing.T) {

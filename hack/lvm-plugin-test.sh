@@ -86,10 +86,18 @@ post /node/unstage   '{"volume":'"$V2"',"stagingPath":"'"$STG2"'"}' >/dev/null
 echo "  restored data: '$GOT'"
 [ "$GOT" = "bard-lvm-thin-proof" ] || { echo "FAIL: restored data mismatch"; exit 1; }
 
+echo "## delete the SOURCE volume first -- its snapshot must survive AND stay listed"
+post /volume/delete '{"volume":'"$V"'}' >/dev/null
+sudo lvs "$VG/$SNAP" >/dev/null 2>&1 || { echo "FAIL: snapshot LV $SNAP must outlive its source"; exit 1; }
+# lvm clears the snapshot's origin here; the create-time bardsrc. tag is what
+# keeps it listed with its source (core drops sourceless snapshots).
+post /snapshot/list '{}' | grep -q '"name":"'"$SNAP"'"' || { echo "FAIL: snapshot must stay listed after its source is deleted"; exit 1; }
+post /snapshot/list '{}' | grep -q '"sourceVolume":{[^}]*"name":"'"$LV"'"' || { echo "FAIL: snapshot must keep its recorded source after the source is deleted"; exit 1; }
+echo "  source deleted, snapshot still listed with source $LV OK"
+
 echo "## teardown (plugin deletes its own LVs; trap is the safety net)"
 post /volume/delete   '{"volume":'"$V2"'}' >/dev/null
 post /snapshot/delete '{"snapshot":{"instance":"galileo","location":"'"$VG"'","name":"'"$SNAP"'"}}' >/dev/null
-post /volume/delete   '{"volume":'"$V"'}' >/dev/null
 CREATED=() # plugin removed them; nothing for the trap to reap
 
 echo "PASS: thin provisioning + CoW snapshot + restore round-trip verified against $VG"

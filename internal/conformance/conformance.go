@@ -559,19 +559,26 @@ func (r *runner) run(ctx context.Context) error {
 	}
 
 	// ---- controller detach ---------------------------------------------------
-	if caps.RequiresControllerPublish && haveV1 {
-		unpubReq := bardplugin.ControllerUnpublishRequest{Volume: v1ref, NodeID: nodeID}
-		if !published {
+	// Both detach checks always get a result for an attach backend -- Skip when
+	// a prerequisite failed -- so the check set is stable across runs.
+	if caps.RequiresControllerPublish {
+		switch {
+		case !haveV1:
+			r.record("controller/unpublish", Skip, "prerequisite volume/create failed")
+			r.record("controller/unpublish-absent", Skip, "prerequisite volume/create failed")
+		case !published:
 			r.record("controller/unpublish", Skip, "prerequisite controller/publish failed")
-		} else if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
-			r.record("controller/unpublish", Fail, "%v", err)
-		} else if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
-			r.record("controller/unpublish", Fail,
-				"second unpublish must succeed, got: %v -- ControllerUnpublish must be idempotent (the attacher retries forever)", err)
-		} else {
-			r.record("controller/unpublish", Pass, "detached; repeat detach is a successful no-op")
-		}
-		if published {
+			r.record("controller/unpublish-absent", Skip, "prerequisite controller/publish failed")
+		default:
+			unpubReq := bardplugin.ControllerUnpublishRequest{Volume: v1ref, NodeID: nodeID}
+			if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
+				r.record("controller/unpublish", Fail, "%v", err)
+			} else if err := r.call(ctx, bardplugin.PathControllerUnpublish, unpubReq, nil); err != nil {
+				r.record("controller/unpublish", Fail,
+					"second unpublish must succeed, got: %v -- ControllerUnpublish must be idempotent (the attacher retries forever)", err)
+			} else {
+				r.record("controller/unpublish", Pass, "detached; repeat detach is a successful no-op")
+			}
 			if err := r.call(ctx, bardplugin.PathControllerUnpublish,
 				bardplugin.ControllerUnpublishRequest{Volume: v1ref, NodeID: nodeID + "-never-published"}, nil); err != nil {
 				r.record("controller/unpublish-absent", Fail, "unpublishing a never-published node must succeed, got: %v", err)
