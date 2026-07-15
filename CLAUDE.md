@@ -72,19 +72,89 @@ go build -o /tmp/bard-plugin-iscsi ./cmd/bard-plugin-iscsi
 sudo bash hack/iscsi-plugin-test.sh /tmp/bard-plugin-iscsi
 ```
 
-`hack/iscsi-plugin-test.sh` drives the **full attach contract**: /info (asserts
-`requiresControllerPublish`), create (LV + LIO backstore + per-volume target),
-/controller/publish (asserts the ACL for `iqn.2025-01.io.bard:init-<node>`
-appears), /node/stage (iscsiadm login under a per-node iface) + publish + write +
-read, /node/unstage (logout, device gone), /controller/unpublish (asserts the ACL
-disappears), /volume/delete (asserts target + backstore + LV all reaped -- no
-orphan). Trap-cleaned like the LVM test. The **node plane over a real network**
-(real-kernel k3s VM → target host `:3260` → `/dev/sdX` → mount) is separately proven;
-a fully in-cluster control plane on a non-target node needs remote LIO management
-(`targetd`) -- a follow-up. Each volume = its own target (one LUN), so login/logout
-is per-volume clean (no session ref-counting). Gotcha hit live: `targetcli` create
-takes the **parent** path + `name=` (`/backstores/block create name=x dev=...`),
-NOT the object path (`/backstores/block/x create ...` -> "No such path").
+`hack/iscsi-plugin-test.sh` drives the **full attach contract plus thin
+snapshots/clone and CHAP** (live-proven 2026-07-10): /info (asserts
+`requiresControllerPublish` AND `snapshots`), create (thin LV + LIO backstore +
+per-volume target with `authentication=1`), /controller/publish (asserts the ACL
+for `iqn.2025-01.io.bard:init-<node>` appears carrying the CHAP userid, and no
+credential in the publishContext), /node/stage (iscsiadm CHAP login under a
+per-node iface) + publish + write, /snapshot/create (asserts a read-only thin LV
+`Vri-...` with NO LIO export, listed with its origin), restore into a LARGER
+volume (own target; point-in-time -- post-snapshot writes absent; fs grown at
+stage), **online expand under a live session** (lvextend propagates through the
+LIO block backstore -> session rescan -> fs grown, data intact), a
+**wrong-password CHAP login rejected** by LIO, /controller/unpublish (ACL gone),
+snapshot+volume deletes (targets + backstores + LVs all reaped -- no orphan). Trap-cleaned like the LVM test; auto-creates the `bard-thin` pool. CHAP
+credentials are per-instance files (`--chap-dir/<instance>`, Secret
+`bard-iscsi-chap`, 2 lines userid/password or 4 with a mutual pair) read by BOTH
+planes -- never in the ConfigMap/StorageClass/PublishContext. Each volume = its
+own target (one LUN), so login/logout is per-volume clean (no session
+ref-counting). Gotchas hit live: `targetcli` create takes the **parent** path +
+`name=` (`/backstores/block create name=x dev=...`), NOT the object path
+(`/backstores/block/x create ...` -> "No such path"); a duplicate **backstore**
+create says `Storage object block/<x> exists` (no "already", unlike
+targets/ACLs/LUNs), which broke idempotent create retries until `isExists`
+learned that phrasing; and `iscsiadm` refuses to create/update an **iface a live
+session is using** (exit 15, "Could not create new interface"), so staging a 2nd
+volume on a node failed until `ensureIface` became read-first -- a bug
+single-volume tests structurally cannot catch.
+
+**Fully IN-CLUSTER live-proven 2026-07-11** on the multipass k3s dogfood cluster
+(target host = `k3s-server` with a loop-backed `bard-vg`, controller pinned there
+via `controller.nodeSelector`; attach flipped on with `helm --set
+attach.enabled=true` after deleting the immutable CSIDriver): provision ->
+CROSS-NODE attach (VolumeAttachment -> ACL for `init-k3s-agent`) -> CHAP login
+from the agent over the VM network -> `/dev/sdX` -> mount -> write; a 2nd volume
+staged on the SAME node (the ensureIface fix, live); VolumeSnapshot -> ready
+(read-only thin LV, no LIO export); point-in-time restore into a LARGER volume
+(post-snapshot writes absent, fs grown at stage); delete-everything reap back to
+just the thin pool -- zero targets/backstores/sessions left. FOUR
+in-cluster-only gotchas found + fixed (none reachable by the host harness):
+(1) the plugin image needs **thin-provisioning-tools** (in-container lvm shells
+to `thin_check`); (2) targetcli 2.1.5x unconditionally enumerates tcmu-runner
+over the SYSTEM D-Bus (`Gio.bus_get_sync`) on every command, so the controller
+sidecar must mount the host `/run/dbus` or every call dies `g-io-error-quark:
+Could not connect`; (3) **an LIO network portal binds in the netns of the
+process that creates it** -- without `hostNetwork` on the controller pod the
+portal listens inside the POD netns (targetcli shows it [OK], initiators get
+connection-refused; a portal from a dead pod netns must be deleted + recreated);
+(4) **iscsiadm+iscsid are a version-matched pair with distro-specific DB paths**
+(Debian `/etc/iscsi`, RHEL `/var/lib/iscsi`), so a container iscsiadm driving
+the host's iscsid puts CHAP node records where the daemon never looks and the
+login hangs at negotiation (LIO dmesg: "iSCSI Login negotiation failed") --
+fixed by running iscsiadm chrooted into the host root (`--iscsiadm-chroot=/host`,
+the standard CSI-driver approach; mount host `/` at `/host`). Plus a
+host-module prereq on the target node: `dm_snapshot` (`lvcreate -s` shells to
+modprobe, impossible in-container; the fixture loads it). A SECOND round on the
+branch tip (2026-07-12, incl. in-cluster online PVC expand 2Gi->3Gi, no pod
+restart) caught two more that only cold/restart states expose: (5) **an
+INACTIVE thin pool cannot be activated by in-container lvm** (no udev to serve
+the activation -- the host udevd's completion handshake lives in the host IPC
+namespace; `.../bard--thin_tmeta: open failed`); round 1 masked it because a
+host-side command had left the pool active, but the first volume after a node
+reboot or after the last LV's removal always hits it. Fixed in the plugin:
+every state-changing lvm command runs with `--config
+'activation{udev_sync=0 udev_rules=0}'` (lvm manages /dev nodes itself; also
+correct on udev hosts -- harness re-proven from an inactive pool; ported to
+the LVM plugin too, which shares this logic and had the same latent bug). (6) **the
+node session state must survive plugin pod restarts**: stateDir was
+container-ephemeral, so a mid-lifetime pod restart made every later NodeUnstage
+a silent no-op that leaked the iSCSI session past volume deletion. Fixed both
+ways: the node patch persists `/var/lib/bard/iscsi` as a hostPath, AND
+NodeUnstage now derives the session identity (target IQN from the volume name,
+portal from the instance, LUN 0) and logs out even with no record --
+regression-proven live (stage -> kill the node plugin pod -> delete workload ->
+zero leaked sessions). **Conformance now covers attach backends** and runs
+against the real fixture via `hack/conformance-iscsi-test.sh` (27 PASS): the
+tool gained the controller/publish -> node -> unpublish leg (`-node-id` must
+match the plugin's `--node-id`), and its first run caught three more bugs --
+two MORE unclassified phrasings (`No storage object named` broke delete
+idempotency; `No matching sessions found` broke repeated unstage via the
+derived-logout fallback) and a hollow NodeReclaimSpace (the backstore never
+advertised UNMAP; now `emulate_tpu=1` best-effort at create, and an
+un-discardable stack is a clean no-op instead of a forever-failing job). A
+control plane on a non-target node still needs remote LIO management
+(`targetd`) -- a follow-up.
 
 ## Local end-to-end (rootful kind + real Ceph)
 
@@ -600,10 +670,14 @@ Record your cluster's actual addresses in `CLAUDE.local.md`.
   is threaded into NodeStage. Because `CSIDriver.attachRequired` is one cluster-
   global immutable field, attach is a deploy/chart toggle (`attach.enabled`, default
   off) that flips it + adds the external-attacher; node-mapped backends no-op the
-  publish. See `deploy/examples/attach/` + `deploy/examples/iscsi/`. The iSCSI
-  remaining follow-ups: snapshots/clone (the LVM plugin already shows thin
-  snapshots), CHAP auth, multipath, and remote LIO management (`targetd`) for a
-  fully in-cluster control plane on a non-target node.
+  publish. See `deploy/examples/attach/` + `deploy/examples/iscsi/`.
+  **iSCSI snapshots/clone + CHAP: DONE** (2026-07-10, branch
+  `feat/iscsi-snapshots-chap`): thin-LV snapshots/restore/clone mirroring the LVM
+  plugin (instance/SC `thinPool`; clone exported through its own target, fs grown
+  at stage) + per-instance CHAP (`chapAuth: true`, creds Secret mounted on both
+  planes) -- all live-proven by the extended `hack/iscsi-plugin-test.sh`. The
+  iSCSI remaining follow-ups: multipath, and remote LIO management (`targetd`)
+  for a fully in-cluster control plane on a non-target node.
 - **ListVolumes / ListSnapshots: DONE (all first-party Go plugins).** Optional CSI
   RPCs, aggregated + paginated (offset token) in core across backends, snapshots
   filterable by source/snapshot id; advertised only when a registered backend

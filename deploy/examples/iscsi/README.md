@@ -6,7 +6,7 @@ node), making an iSCSI volume reachable is a *control-plane* operation. Bard's
 controller masks the volume's LUN to the staging node's initiator
 (`ControllerPublishVolume`); only then can that node log in and mount it. A volume
 is an LVM logical volume exported through an LIO target. Block, ReadWriteOnce,
-expandable.
+expandable; with a thin pool also snapshots + clone, and optionally CHAP.
 
 ## Per-node LUN masking — why this needs attach
 
@@ -32,13 +32,25 @@ initiatorname.
 ## Locality (read this) — same host-coupling as LVM
 
 LIO lives in the host kernel's configfs, so the **control plane** (lvcreate +
-targetcli) only works where it can reach the target — exactly the shared-host
-constraint the LVM plugin documents. The production-correct logic, **including
-per-node ACL masking**, is proven by driving the plugin binary over its socket
-against a real target (`hack/iscsi-plugin-test.sh`), and the **node plane** (real-
-kernel iSCSI login over the network → `/dev/sdX` → mount) is proven from a k3s VM
-(see CLAUDE.md). A full in-cluster control plane on a node that *isn't* the target
-needs remote LIO management (e.g. `targetd`) — a documented follow-up.
+targetcli) only works where it can reach the target. **Fully in-cluster works
+when the target host is a cluster node**: pin the controller there
+(`--set controller.nodeSelector."kubernetes\.io/hostname"=<target-node>`) and
+every other node attaches over the network — proven end to end on a 2-node k3s
+cluster (provision → cross-node CHAP attach → snapshot → restore, clean reap).
+A control plane on a node that *isn't* the target needs remote LIO management
+(e.g. `targetd`) — a documented follow-up.
+
+In-cluster **node prerequisites** (same class as every host-module gotcha):
+`iscsid` running on every node (any distro's iscsi-initiator package), and on the
+target node the LIO modules + `dm_snapshot` (lvm shells out to modprobe for the
+snapshot target, which an in-container lvm cannot do) — `hack/setup-iscsi-fixture.sh`
+loads all of them. The sidecar patches in this directory carry three hard-won
+in-cluster requirements as comments: the controller pod must be `hostNetwork`
+(an LIO portal binds in the netns of its creating process), it must mount the
+host's `/run/dbus` (targetcli enumerates tcmu-runner over D-Bus unconditionally),
+and the node plugin runs `iscsiadm` **chrooted into the host root**
+(`--iscsiadm-chroot=/host`) because iscsiadm+iscsid are a version-matched pair
+with distro-specific DB paths.
 
 ## Apply
 
@@ -69,7 +81,43 @@ A pod using the PVC triggers: provision (LV + LIO target) → attach (ACL for th
 scheduled node) → login + mount on that node. Deleting it detaches (ACL removed)
 and reaps the target + backstore + LV.
 
+## Snapshots and clone (thin pool)
+
+Set `thinPool` on the instance (or as a StorageClass `thinPool` parameter) and
+volumes become copy-on-write thin LVs, exactly like the LVM plugin: a
+VolumeSnapshot makes a read-only thin snapshot (a control-plane object — it gets
+no LIO export), and restore/clone makes a writable thin snapshot grown to the
+requested size, exported through its own target. The pool is pre-created once:
+`lvcreate --type thin-pool -L 20G -n bard-thin <vg>`. Snapshot/clone of a thick
+(no-pool) volume is rejected. Needs the external-snapshotter cluster singleton,
+same as every other backend (`hack/install-snapshotter.sh`).
+
+Snapshots are **crash-consistent at the target**: the LV is snapshotted beneath
+the initiator, so writes still in the node's page cache are not included — the
+same semantics as any array-side snapshot (Ceph RBD included). Quiesce or
+`fsync` the workload first if you need application consistency.
+
+## CHAP
+
+`chapAuth: true` on an instance enforces CHAP on the data path: the target
+requires authentication (`authentication=1`), ControllerPublish sets the
+credentials on the node's ACL, and the node sets them on its record before
+login — a wrong password is rejected by LIO. Credentials come from the
+`bard-iscsi-chap` Secret (one key per instance: 2 lines userid/password, or 4
+with a mutual pair), mounted into **both** plugin sidecars; they never appear in
+the StorageClass, the volume context, the PublishContext (which is stored in the
+API-visible VolumeAttachment), or in error messages (redacted). See the
+commented Secret in [config.yaml](config.yaml).
+
+Two accepted limitations to know about: `targetcli`/`iscsiadm` only take
+credentials on the command line, so the password is briefly visible in
+`/proc/<pid>/cmdline` on the controller/node host while those commands run
+(inherent to the tools; the same tradeoff every iSCSI driver makes). And
+**discovery is unauthenticated** — anyone who can reach the portal can list
+target IQNs; CHAP + per-node ACLs gate the actual login, but keep the portal on
+a network initiators belong on.
+
 ## Not yet (follow-ups)
 
-iSCSI snapshots/clone (the LVM plugin already demonstrates thin snapshots), CHAP
-auth, multipath, and remote LIO management for a fully in-cluster control plane.
+Multipath, and remote LIO management (`targetd`) for a fully in-cluster control
+plane on a node that isn't the target host.

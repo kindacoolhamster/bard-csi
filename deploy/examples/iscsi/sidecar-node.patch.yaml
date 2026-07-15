@@ -5,10 +5,16 @@
 # Node-plane: logs the LUN in (iscsiadm, under a dedicated iface carrying this
 # node's derived initiator IQN -- so the host's global initiatorname is untouched),
 # then formats + mounts. Needs hostNetwork to reach the portal, the host /dev to
-# see the new /dev/sdX, /etc/iscsi + /var/lib/iscsi + /run for the host iscsid, the
-# iscsi modules (/lib/modules), and the kubelet dir with Bidirectional propagation.
+# see the new /dev/sdX, and the kubelet dir with Bidirectional propagation.
 # The pod passes its node name to --node-id (the source of the initiator IQN the
 # controller put in the ACL).
+#
+# iscsiadm runs CHROOTED into the host root (--iscsiadm-chroot=/host): iscsiadm
+# and iscsid are a version-matched pair with distro-specific DB paths, so a
+# container-shipped iscsiadm driving the HOST's iscsid writes CHAP/node records
+# where the daemon never looks and the login dies in negotiation (found live:
+# LIO "iSCSI Login negotiation failed" until the host's own stack was used).
+# The host must run iscsid (every distro's iscsi-initiator package does).
 spec:
   template:
     spec:
@@ -17,14 +23,21 @@ spec:
         - name: iscsi-config
           configMap:
             name: bard-iscsi-config
-        - name: etc-iscsi
-          hostPath: { path: /etc/iscsi }
-        - name: var-lib-iscsi
-          hostPath: { path: /var/lib/iscsi }
-        - name: iscsi-run
-          hostPath: { path: /run }
-        - name: lib-modules
-          hostPath: { path: /lib/modules }
+        # The whole host root, for the iscsiadm chroot (see header comment).
+        - name: host-root
+          hostPath: { path: / }
+        # Session state (--state-dir) MUST survive plugin pod restarts: it is
+        # what NodeUnstage uses to log the session out, and a restart between
+        # stage and unstage would otherwise leak the session (the plugin also
+        # derives a fallback, but persisted state is the primary path).
+        - name: iscsi-state
+          hostPath: { path: /var/lib/bard/iscsi, type: DirectoryOrCreate }
+        # Per-instance CHAP credentials (only read for instances with chapAuth:
+        # true); optional so a CHAP-less deploy needs no Secret.
+        - name: iscsi-chap
+          secret:
+            secretName: bard-iscsi-chap
+            optional: true
       containers:
         - name: iscsi-plugin
           image: ghcr.io/kindacoolhamster/bard-plugin-iscsi:dev
@@ -33,6 +46,7 @@ spec:
             - "--socket=/var/lib/bard/plugins/iscsi.sock"
             - "--config=/etc/bard-iscsi/config.yaml"
             - "--node-id=$(NODE_ID)"
+            - "--iscsiadm-chroot=/host"
           env:
             - name: NODE_ID
               valueFrom: { fieldRef: { fieldPath: spec.nodeName } }
@@ -42,8 +56,7 @@ spec:
             - { name: plugins, mountPath: /var/lib/bard/plugins }
             - { name: iscsi-config, mountPath: /etc/bard-iscsi, readOnly: true }
             - { name: dev-dir, mountPath: /dev }
-            - { name: etc-iscsi, mountPath: /etc/iscsi }
-            - { name: var-lib-iscsi, mountPath: /var/lib/iscsi }
-            - { name: iscsi-run, mountPath: /run }
-            - { name: lib-modules, mountPath: /lib/modules, readOnly: true }
+            - { name: host-root, mountPath: /host }
+            - { name: iscsi-state, mountPath: /var/lib/bard/iscsi }
+            - { name: iscsi-chap, mountPath: /etc/bard-iscsi-chap, readOnly: true }
             - { name: kubelet-dir, mountPath: /var/lib/kubelet, mountPropagation: Bidirectional }

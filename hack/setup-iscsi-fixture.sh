@@ -30,9 +30,12 @@ if ! command -v targetcli >/dev/null; then
   apt-get update -qq && apt-get install -y --no-install-recommends targetcli-fb open-iscsi
 fi
 
-# 2. configfs + LIO kernel modules (target side) and the iSCSI initiator module.
+# 2. configfs + LIO kernel modules (target side), the iSCSI initiator module,
+#    and dm_snapshot (lvcreate -s checks for the snapshot dm target and shells to
+#    modprobe -- which an in-container lvm cannot do, so the HOST must have it
+#    loaded; same class as the rbd/nbd/dm_crypt host-module gotchas).
 mountpoint -q /sys/kernel/config || { echo ">> mounting configfs"; mount -t configfs none /sys/kernel/config; }
-for m in target_core_mod iscsi_target_mod configfs scsi_transport_iscsi iscsi_tcp; do
+for m in target_core_mod iscsi_target_mod configfs scsi_transport_iscsi iscsi_tcp dm_snapshot; do
   modprobe "$m" 2>/dev/null || echo "   (modprobe $m: already builtin or unavailable)"
 done
 

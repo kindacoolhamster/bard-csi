@@ -72,12 +72,12 @@ func eastInst() map[string]InstanceConfig {
 }
 
 func TestInfoAdvertisesAttach(t *testing.T) {
-	b := New(eastInst(), "", "", &fakeRunner{})
+	b := New(eastInst(), "", "", "", "", &fakeRunner{})
 	caps := b.Info().Capabilities
 	if !caps.RequiresControllerPublish {
 		t.Fatal("iSCSI must advertise RequiresControllerPublish")
 	}
-	if !caps.BlockDevice || caps.Snapshots {
+	if !caps.BlockDevice || !caps.Snapshots {
 		t.Fatalf("unexpected caps: %+v", caps)
 	}
 }
@@ -107,7 +107,7 @@ func TestCreateVolumeProvisionsAndExports(t *testing.T) {
 		},
 		"lvcreate": func([]string) (string, error) { created = true; return "", nil },
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 
 	resp, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "pvc-1", Instance: "east", CapacityBytes: 1 << 30,
@@ -143,17 +143,26 @@ func TestCreateVolumeProvisionsAndExports(t *testing.T) {
 }
 
 func TestCreateVolumeIdempotent(t *testing.T) {
-	// LV already exists at size, and every targetcli create reports "already exists".
+	// LV already exists at size, and every targetcli create reports its object as
+	// existing -- with the REAL, per-path phrasings observed live (the backstore
+	// one carries no "already", which broke retries until isExists learned it).
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return "  1073741824\n", nil },
 		"targetcli": func(args []string) (string, error) {
-			if len(args) >= 2 && args[1] == "create" || contains(args, "create") {
+			if !contains(args, "create") {
+				return "", nil
+			}
+			switch {
+			case contains(args, "/backstores/block"):
+				return "", errors.New("Storage object block/bard-x exists")
+			case strings.Contains(strings.Join(args, " "), "/luns"):
+				return "", errors.New("lun for storage object block/bard-x already exists")
+			default:
 				return "", errors.New("This Target already exists in configFS")
 			}
-			return "", nil
 		},
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "pvc-1", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -167,7 +176,7 @@ func TestCreateVolumeIdempotent(t *testing.T) {
 // ControllerPublish masks the LUN to the node and returns the connection context.
 func TestControllerPublishMasksAndReturnsContext(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	lv := lvName("pvc-1")
 	resp, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv}, NodeID: "k3s-agent",
@@ -189,7 +198,7 @@ func TestControllerPublishIdempotent(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"targetcli": func([]string) (string, error) { return "", errors.New("ACL already exists in configFS") },
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	if _, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Name: lvName("pvc-1")}, NodeID: "n",
 	}); err != nil {
@@ -202,7 +211,7 @@ func TestControllerUnpublishRemovesACLAndIsIdempotent(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"targetcli": func([]string) (string, error) { return "", errors.New("No such path in configFS") },
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	if err := b.ControllerUnpublish(context.Background(), &bardplugin.ControllerUnpublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Name: lvName("pvc-1")}, NodeID: "n",
 	}); err != nil {
@@ -218,7 +227,7 @@ func TestDeleteVolumeOrderAndNoOrphan(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvremove": func([]string) (string, error) { return "", errors.New("LV is in use") },
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	lv := lvName("pvc-1")
 	err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
@@ -240,7 +249,7 @@ func TestDeleteVolumeIdempotent(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"targetcli": notFound, "lvremove": notFound,
 	}}
-	b := New(eastInst(), "", "", fr)
+	b := New(eastInst(), "", "", "", "", fr)
 	if err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 	}); err != nil {
@@ -258,7 +267,7 @@ func TestNodeStageLogsInAndRecords(t *testing.T) {
 		"blkid":   func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
 	stateDir := t.TempDir()
-	b := New(eastInst(), "k3s-agent", stateDir, fr)
+	b := New(eastInst(), "k3s-agent", stateDir, "", "", fr)
 	staging := t.TempDir() + "/stage"
 
 	err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
@@ -286,7 +295,7 @@ func TestNodeStageLogsInAndRecords(t *testing.T) {
 // NodeUnstage must refuse to report success while the device is still present.
 func TestNodeUnstageRefusesWhileAttached(t *testing.T) {
 	stateDir := t.TempDir()
-	b := New(eastInst(), "k3s-agent", stateDir, &fakeRunner{results: map[string]func([]string) (string, error){
+	b := New(eastInst(), "k3s-agent", stateDir, "", "", &fakeRunner{results: map[string]func([]string) (string, error){
 		"blockdev": func([]string) (string, error) { return "1073741824\n", nil }, // still there
 	}})
 	staging := t.TempDir() + "/stage"
@@ -300,7 +309,7 @@ func TestNodeUnstageRefusesWhileAttached(t *testing.T) {
 
 func TestNodeUnstageSucceedsWhenDetached(t *testing.T) {
 	stateDir := t.TempDir()
-	b := New(eastInst(), "k3s-agent", stateDir, &fakeRunner{results: map[string]func([]string) (string, error){
+	b := New(eastInst(), "k3s-agent", stateDir, "", "", &fakeRunner{results: map[string]func([]string) (string, error){
 		"blockdev": func([]string) (string, error) { return "0\n", nil }, // device gone
 	}})
 	staging := t.TempDir() + "/stage"
