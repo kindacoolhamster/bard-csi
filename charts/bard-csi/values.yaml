@@ -165,6 +165,7 @@ attach:
 # Per-instance fields by backend:
 #   ceph-rbd: monitors[], pool, user, zone, default, [mounter: krbd|rbd-nbd], [readAffinity], [radosNamespace], [clusterName]
 #   cephfs:   monitors[], fsName, user, zone, default, [mounter: kernel|fuse|nfs], [subvolumeGroup], [nfsCluster], [nfsServer]
+#   iscsi:    vg, portal, zone, default, [portals[]], [iqnBase], [thinPool], [chapAuth]
 plugins:
   ceph-rbd:
     enabled: false
@@ -202,10 +203,26 @@ plugins:
     #   vaultTokenSecret: bard-cephfs-vault-token
     # image: { repository: ghcr.io/kindacoolhamster/bard-plugin-cephfs, tag: "", pullPolicy: IfNotPresent }
 
-  # nfs / lvm / iscsi have no high-level profile yet — configure them via the
-  # low-level override (B): set socket + controller/node {args, volumes, host flags}.
-  # iscsi is the ATTACH-style backend and additionally REQUIRES attach.enabled=true
-  # (above) so ControllerPublish masks the LUN to the node. See deploy/examples/.
+  iscsi:
+    enabled: false
+    instances: {}
+    #   galileo:
+    #     vg: bard-vg
+    #     portal: 192.0.2.1:3260
+    #     zone: galileo
+    #     default: true
+    #     # iqnBase: iqn.2025-01.io.bard    # default; target/initiator names derive from it
+    #     # thinPool: bard-thin             # provision thin LVs from this pool -> snapshots/clone
+    #     # chapAuth: true                  # require CHAP; credentials from the bard-iscsi-chap Secret
+    # image: { repository: ghcr.io/kindacoolhamster/bard-plugin-iscsi, tag: "", pullPolicy: IfNotPresent }
+    # ATTACH-style backend: ControllerPublish masks the LUN to the staging node's
+    # initiator via a targetcli ACL, so this ALSO REQUIRES attach.enabled=true
+    # (above) -- the chart fails the render otherwise (templates/_validate.tpl).
+    # CSIDriver.attachRequired is cluster-global + IMMUTABLE: on an existing
+    # install, delete the CSIDriver before upgrading with attach flipped on.
+
+  # nfs / lvm have no high-level profile yet — configure them via the low-level
+  # override (B): set socket + controller/node {args, volumes, host flags}.
   # my-plugin:
   #   enabled: false
   #   image: { repository: ghcr.io/me/bard-plugin-x, tag: "" }

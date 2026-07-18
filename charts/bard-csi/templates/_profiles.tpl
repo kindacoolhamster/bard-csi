@@ -41,6 +41,58 @@ kmsMount: /etc/bard-cephfs-kms
 vaultMount: /etc/bard-cephfs-vault
 controller: { privileged: false, hostDev: false, hostNetwork: false, hostPID: false, kubeletDir: false }
 node:       { privileged: true,  hostDev: true,  hostNetwork: true,  hostPID: false, kubeletDir: true }
+{{- else if eq $type "iscsi" -}}
+image: ghcr.io/kindacoolhamster/bard-plugin-iscsi
+socket: iscsi.sock
+configMap: bard-iscsi-config
+configMount: /etc/bard-iscsi
+chapMount: /etc/bard-iscsi-chap
+chapSecret: bard-iscsi-chap
+controller: { privileged: true, hostDev: true, hostNetwork: true, hostPID: false, kubeletDir: false }
+node:
+  privileged: true
+  hostDev: true
+  hostNetwork: true
+  hostPID: false
+  kubeletDir: true
+  env:
+    - name: NODE_ID
+      fieldRef: { fieldPath: spec.nodeName }
+# Control plane: lvcreate carves the LUN block device and targetcli drives the
+# host kernel's LIO configfs target -- hostDev above covers /dev, these cover the
+# rest (lvm2's lock/config dirs, configfs, and the D-Bus targetcli 2.1.5x
+# unconditionally enumerates tcmu-runner over -- see CLAUDE.md).
+controllerVolumes:
+  - name: lvm-run
+    mountPath: /run/lvm
+    hostPath: { path: /run/lvm }
+  - name: lvm-etc
+    mountPath: /etc/lvm
+    hostPath: { path: /etc/lvm }
+  - name: configfs
+    mountPath: /sys/kernel/config
+    hostPath: { path: /sys/kernel/config }
+  - name: dbus
+    mountPath: /run/dbus
+    readOnly: true
+    hostPath: { path: /run/dbus }
+nodeVolumes:
+  # Widest hostPath in the chart: iscsiadm runs chrooted here (--iscsiadm-chroot
+  # below) because iscsiadm+iscsid are a version-matched pair with distro-specific
+  # DB paths -- a container iscsiadm driving the host's iscsid writes CHAP/node
+  # records the daemon never looks at, and login hangs in negotiation (CLAUDE.md).
+  - name: host-root
+    mountPath: /host
+    hostPath: { path: / }
+  # Session state must survive plugin pod restarts -- NodeUnstage reads it to log
+  # the session out; without persistence a mid-lifetime restart leaks the session.
+  - name: iscsi-state
+    mountPath: /var/lib/bard/iscsi
+    hostPath: { path: /var/lib/bard/iscsi, type: DirectoryOrCreate }
+nodeArgs:
+  - --node-id=$(NODE_ID)
+  - --iscsiadm-chroot=/host
+  - --state-dir=/var/lib/bard/iscsi
 {{- end -}}
 {{- end -}}
 
@@ -140,17 +192,13 @@ high-level `instances` map, mapping backend-native fields to the plugin's schema
 instances:
 {{- range $id, $inst := .instances }}
   {{ $id }}:
-    monitors: {{ toJson $inst.monitors }}
     {{- if eq $type "ceph-rbd" }}
+    monitors: {{ toJson $inst.monitors }}
     pool: {{ $inst.pool }}
-    {{- else if eq $type "cephfs" }}
-    fsName: {{ $inst.fsName }}
-    {{- end }}
     userID: {{ $inst.user }}
     {{- with $inst.mounter }}
     mounter: {{ . }}
     {{- end }}
-    {{- if eq $type "ceph-rbd" }}
     {{- with $inst.radosNamespace }}
     radosNamespace: {{ . }}
     {{- end }}
@@ -160,8 +208,13 @@ instances:
     {{- with $inst.clusterName }}
     clusterName: {{ . }}
     {{- end }}
+    {{- else if eq $type "cephfs" }}
+    monitors: {{ toJson $inst.monitors }}
+    fsName: {{ $inst.fsName }}
+    userID: {{ $inst.user }}
+    {{- with $inst.mounter }}
+    mounter: {{ . }}
     {{- end }}
-    {{- if eq $type "cephfs" }}
     {{- with $inst.subvolumeGroup }}
     subvolumeGroup: {{ . }}
     {{- end }}
@@ -170,6 +223,21 @@ instances:
     {{- end }}
     {{- with $inst.nfsServer }}
     nfsServer: {{ . }}
+    {{- end }}
+    {{- else if eq $type "iscsi" }}
+    vg: {{ $inst.vg }}
+    portal: {{ $inst.portal }}
+    {{- with $inst.portals }}
+    portals: {{ toJson . }}
+    {{- end }}
+    {{- with $inst.iqnBase }}
+    iqnBase: {{ . }}
+    {{- end }}
+    {{- with $inst.thinPool }}
+    thinPool: {{ . }}
+    {{- end }}
+    {{- if $inst.chapAuth }}
+    chapAuth: true
     {{- end }}
     {{- end }}
 {{- end }}

@@ -1,3 +1,4 @@
+{{- include "bard-csi.validate" . -}}
 {{- /*
 Pod-level host flags are OR-ed across all enabled controller plugins (hostNetwork/hostPID
 are pod-wide, not per-container). needsDev decides whether to define the /dev volume.
