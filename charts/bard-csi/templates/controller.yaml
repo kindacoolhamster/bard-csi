@@ -26,6 +26,15 @@ metadata:
     app: {{ include "bard-csi.fullname" . }}-controller
 spec:
   replicas: {{ .Values.controller.replicas }}
+{{- if $hostNetwork }}
+  # hostNetwork + a nodeSelector pin (the attach/iscsi shape) deadlocks a
+  # RollingUpdate: the surge pod cannot schedule while the old pod holds the
+  # host ports on the pinned node, and the old pod is not removed until the
+  # new one is Ready (found live). Recreate trades a short control-plane gap
+  # for a rollout that always completes.
+  strategy:
+    type: Recreate
+{{- end }}
   selector:
     matchLabels:
       app: {{ include "bard-csi.fullname" . }}-controller
