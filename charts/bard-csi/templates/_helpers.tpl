@@ -45,7 +45,7 @@ referenced by flag; per-plugin config/secret volumes are namespaced "<name>-<vol
 - name: {{ $name }}-plugin
   image: "{{ $plugin.image.repository }}:{{ $plugin.image.tag | default $root.Chart.AppVersion }}"
   imagePullPolicy: {{ $plugin.image.pullPolicy | default "IfNotPresent" }}
-  {{- if and (eq $plane "node") $cfg.privileged }}
+  {{- if $cfg.privileged }}
   securityContext:
     privileged: true
   {{- end }}
@@ -54,10 +54,19 @@ referenced by flag; per-plugin config/secret volumes are namespaced "<name>-<vol
     {{- range $cfg.args }}
     - {{ . | quote }}
     {{- end }}
+  {{- with $cfg.env }}
+  env:
+    {{- range . }}
+    - name: {{ .name }}
+      valueFrom:
+        fieldRef:
+          fieldPath: {{ .fieldRef.fieldPath }}
+    {{- end }}
+  {{- end }}
   volumeMounts:
     - name: plugins
       mountPath: /var/lib/bard/plugins
-    {{- if and (eq $plane "node") $cfg.hostDev }}
+    {{- if $cfg.hostDev }}
     - name: dev-dir
       mountPath: /dev
     {{- end }}

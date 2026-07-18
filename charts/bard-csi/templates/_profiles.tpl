@@ -75,10 +75,15 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{- $keysSecret := $plugin.keysSecret | default $prof.keysSecret -}}
 {{- $kms := $plugin.kms -}}
 {{- /* base args + volumes both planes share */ -}}
-{{- $baseArgs := list (printf "--config=%s/config.yaml" $prof.configMount) (printf "--key-dir=%s" $prof.keysMount) -}}
+{{- $baseArgs := list (printf "--config=%s/config.yaml" $prof.configMount) -}}
 {{- $cfgVol := dict "name" "config" "mountPath" $prof.configMount "readOnly" true "configMap" (dict "name" $prof.configMap) -}}
-{{- $keysVol := dict "name" "keys" "mountPath" $prof.keysMount "readOnly" true "secret" (dict "name" $keysSecret) -}}
-{{- $baseVols := list $cfgVol $keysVol -}}
+{{- $baseVols := list $cfgVol -}}
+{{- /* keys (gated on a keysMount -- some plugins, e.g. iSCSI, have no --key-dir flag; a
+     forced --key-dir would crash-loop a Go flag.ExitOnError binary that lacks it) */ -}}
+{{- if $prof.keysMount -}}
+{{-   $baseArgs = append $baseArgs (printf "--key-dir=%s" $prof.keysMount) -}}
+{{-   $baseVols = append $baseVols (dict "name" "keys" "mountPath" $prof.keysMount "readOnly" true "secret" (dict "name" $keysSecret)) -}}
+{{- end -}}
 {{- /* kms (gated on a kms block -- this is why no kms => no --kms-config => no crashloop) */ -}}
 {{- $kmsArgs := list -}}
 {{- $kmsVols := list -}}
@@ -89,11 +94,23 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{-     $kmsVols = append $kmsVols (dict "name" "vault-token" "mountPath" $prof.vaultMount "readOnly" true "secret" (dict "name" $kms.vaultTokenSecret "optional" true)) -}}
 {{-   end -}}
 {{- end -}}
-{{- /* controller plane: config + keys (+ kms). No privilege/host. */ -}}
-{{- $cArgs := concat $baseArgs $kmsArgs -}}
-{{- $cVols := concat $baseVols $kmsVols -}}
-{{- $controller := dict "enabled" true "args" $cArgs "volumes" $cVols -}}
-{{- /* node plane: base (+ encryption, always optional) (+ kms) + host flags */ -}}
+{{- /* chap (gated on chapMount+chapSecret profile fields -- optional across BOTH planes,
+     e.g. iSCSI's per-instance CHAP credentials) */ -}}
+{{- $chapArgs := list -}}
+{{- $chapVols := list -}}
+{{- if and $prof.chapMount $prof.chapSecret -}}
+{{-   $chapArgs = list (printf "--chap-dir=%s" $prof.chapMount) -}}
+{{-   $chapVols = list (dict "name" "chap" "mountPath" $prof.chapMount "readOnly" true "secret" (dict "name" $prof.chapSecret "optional" true)) -}}
+{{- end -}}
+{{- /* controller plane: base (+ keys) (+ kms) (+ chap) (+ profile extras); host flags
+     come from $prof.controller (privileged/hostDev/hostNetwork/... -- merged below). */ -}}
+{{- $cArgs := concat (concat $baseArgs $kmsArgs) $chapArgs -}}
+{{- $cArgs = concat $cArgs ($prof.controllerArgs | default list) -}}
+{{- $cVols := concat (concat $baseVols $kmsVols) $chapVols -}}
+{{- $cVols = concat $cVols ($prof.controllerVolumes | default list) -}}
+{{- $controller := merge (dict "enabled" true "args" $cArgs "volumes" $cVols) $prof.controller -}}
+{{- /* node plane: base (+ encryption, always optional) (+ kms) (+ chap) (+ profile
+     extras) + host flags */ -}}
 {{- $nArgs := $baseArgs -}}
 {{- $nVols := $baseVols -}}
 {{- if $prof.encryptionMount -}}
@@ -103,6 +120,10 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{- end -}}
 {{- $nArgs = concat $nArgs $kmsArgs -}}
 {{- $nVols = concat $nVols $kmsVols -}}
+{{- $nArgs = concat $nArgs $chapArgs -}}
+{{- $nVols = concat $nVols $chapVols -}}
+{{- $nArgs = concat $nArgs ($prof.nodeArgs | default list) -}}
+{{- $nVols = concat $nVols ($prof.nodeVolumes | default list) -}}
 {{- $node := merge (dict "enabled" true "args" $nArgs "volumes" $nVols) $prof.node -}}
 {{- $out := dict "enabled" true "socket" $prof.socket "image" (dict "repository" ($img.repository | default $prof.image) "tag" ($img.tag | default "") "pullPolicy" ($img.pullPolicy | default "IfNotPresent")) "controller" $controller "node" $node -}}
 {{- toYaml $out -}}
