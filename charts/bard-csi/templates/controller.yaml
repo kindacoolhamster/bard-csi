@@ -1,3 +1,20 @@
+{{- /*
+Pod-level host flags are OR-ed across all enabled controller plugins (hostNetwork/hostPID
+are pod-wide, not per-container). needsDev decides whether to define the /dev volume.
+*/ -}}
+{{- $hostNetwork := false -}}
+{{- $hostPID := false -}}
+{{- $needsDev := false -}}
+{{- range $name, $plugin := .Values.plugins -}}
+{{-   if $plugin.enabled -}}
+{{-     $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) -}}
+{{-     if and $p.controller $p.controller.enabled -}}
+{{-       if $p.controller.hostNetwork }}{{ $hostNetwork = true }}{{ end -}}
+{{-       if $p.controller.hostPID }}{{ $hostPID = true }}{{ end -}}
+{{-       if $p.controller.hostDev }}{{ $needsDev = true }}{{ end -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,6 +34,13 @@ spec:
         app: {{ include "bard-csi.fullname" . }}-controller
     spec:
       serviceAccountName: {{ include "bard-csi.fullname" . }}-controller
+      {{- if $hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- if $hostPID }}
+      hostPID: true
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       # Shared fsGroup so the per-pod `plugins` emptyDir (and the plugin sockets in
       # it, mode 0660) is group-owned, letting a non-root core (e.g. a hardened
@@ -234,6 +258,12 @@ spec:
           emptyDir: {}
         - name: plugins
           emptyDir: {}
+        {{- if $needsDev }}
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- end }}
         {{- range $name, $plugin := .Values.plugins }}
         {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
         {{- if and $plugin.enabled $p.controller $p.controller.enabled }}
