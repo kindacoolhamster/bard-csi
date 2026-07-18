@@ -194,7 +194,12 @@ spec:
             - "--pod-uid=$(POD_UID)"
             - "--leader-election-namespace=$(POD_NAMESPACE)"
             # Required: the sidecar exits "invalid controller port" without it.
-            - "--controller-port=9070"
+            # 9071, not 9070: the node pod's csi-addons sidecar binds 9070 in the
+            # HOST netns (node plane is hostNetwork), and an attach-style profile
+            # (iscsi) puts the controller pod on hostNetwork too -- on a host
+            # running both pods, sharing the port makes this sidecar crashloop
+            # (found live: "listen tcp :9070: bind: address already in use").
+            - "--controller-port=9071"
             - "--v=2"
           env:
             - name: CSIADDONS_ENDPOINT
