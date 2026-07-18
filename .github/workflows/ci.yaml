@@ -48,6 +48,15 @@ jobs:
           helm template charts/bard-csi \
             --set plugins.ceph-rbd.enabled=true \
             --set installCRDs=true >/dev/null
+          # iscsi profile: positive render with attach on (the only attach-style
+          # backend -- see templates/_validate.tpl)
+          helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
+            --set-json 'plugins.iscsi.instances={"galileo":{"vg":"bard-vg","portal":"192.0.2.1:3260","thinPool":"bard-thin","chapAuth":true}}' >/dev/null
+          # iscsi profile: negative guard -- must FAIL the render without attach.enabled
+          if helm template bard charts/bard-csi --set plugins.iscsi.enabled=true \
+            --set-json 'plugins.iscsi.instances={"g":{"vg":"v","portal":"192.0.2.1:3260"}}' >/dev/null 2>&1; then
+            echo "guard did not fire"; exit 1
+          fi
 
   conformance:
     # The wire-contract bar: drive the Python localpath plugin (which shares no

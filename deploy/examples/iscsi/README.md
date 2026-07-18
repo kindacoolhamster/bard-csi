@@ -8,6 +8,34 @@ controller masks the volume's LUN to the staging node's initiator
 is an LVM logical volume exported through an LIO target. Block, ReadWriteOnce,
 expandable; with a thin pool also snapshots + clone, and optionally CHAP.
 
+## Helm users: use the chart profile
+
+If you're installing via the `charts/bard-csi` Helm chart, you can skip the
+"Apply (non-Helm / raw YAML)" section below — Locality, Prerequisites, and CHAP
+still apply. The chart renders the `iscsi` plugin profile natively (the same
+ConfigMap/BackendCluster/sidecar wiring documented there), so there's no
+`kubectl patch` to run by hand and `helm upgrade` keeps the sidecars. Minimal
+values:
+
+```yaml
+attach:
+  enabled: true                            # REQUIRED -- iSCSI is attach-style
+plugins:
+  iscsi:
+    enabled: true
+    instances:
+      galileo: { vg: bard-vg, portal: 192.0.2.1:3260, zone: galileo, default: true }
+controller:
+  nodeSelector: { kubernetes.io/hostname: <target-node> }   # see Locality below
+```
+
+See [charts/bard-csi/README.md](../../../charts/bard-csi/README.md#the-plugin-model)
+for the full field list, the CHAP secret shape, and the immutable-CSIDriver
+note. The "Apply" section below — the raw ConfigMap/StorageClass and the
+sidecar `kubectl patch` files — is the **non-Helm** path (hand-patching a
+`deploy/` install), still fully supported; everything else in this file
+(Locality, Prerequisites, CHAP) applies regardless of how you install.
+
 ## Per-node LUN masking — why this needs attach
 
 `ControllerPublish` adds an ACL for the node's initiator IQN; `ControllerUnpublish`
@@ -52,7 +80,7 @@ and the node plugin runs `iscsiadm` **chrooted into the host root**
 (`--iscsiadm-chroot=/host`) because iscsiadm+iscsid are a version-matched pair
 with distro-specific DB paths.
 
-## Apply
+## Apply (non-Helm / raw YAML)
 
 ```sh
 kubectl apply -f deploy/examples/iscsi/config.yaml   # ConfigMap + BackendCluster + StorageClass
