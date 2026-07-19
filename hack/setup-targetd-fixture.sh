@@ -61,9 +61,12 @@ LVMPY=$(ls "$VENV"/lib/python*/site-packages/targetd/backends/lvm.py)
 "$VENV/bin/python" - "$LVMPY" <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p).read(); orig = s
-old = "requested_plugins = bd.plugin_specs_from_names(REQUESTED_PLUGIN_NAMES)"
+if 'if hasattr(bd, "plugin_specs_from_names")' in s:
+    print(">> compat shim already applied"); sys.exit(0)
+# column-0, newline-bounded anchor: must NOT match the shim's own indented line
+old = "\nrequested_plugins = bd.plugin_specs_from_names(REQUESTED_PLUGIN_NAMES)"
 if old in s:
-    s = s.replace(old, '''if hasattr(bd, "plugin_specs_from_names"):
+    s = s.replace(old, '''\nif hasattr(bd, "plugin_specs_from_names"):
     requested_plugins = bd.plugin_specs_from_names(REQUESTED_PLUGIN_NAMES)
 else:  # libblockdev 3.x: build specs by FIELD assignment (Boxed ctor args are ignored)
     _n2p = {"lvm": bd.Plugin.LVM}
