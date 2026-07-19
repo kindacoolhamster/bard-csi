@@ -42,6 +42,22 @@ done
 # 3. the open-iscsi initiator daemon (node-plane login needs iscsid running).
 systemctl enable --now iscsid 2>/dev/null || service iscsid start 2>/dev/null || true
 
+# 3b. dm-multipath (the multi-portal node plane): the HOST daemon assembles the
+#     per-portal sd devices into one mapper device; the plugin only waits for the
+#     /dev/disk/by-id/dm-uuid-mpath-<wwid> link, which exists under ANY map-naming
+#     policy -- so an existing /etc/multipath.conf is left alone (only created if
+#     absent). find_multipaths yes/on both claim a device once 2 paths share a wwid.
+if ! command -v multipathd >/dev/null; then
+  echo ">> installing multipath-tools"
+  apt-get install -y --no-install-recommends multipath-tools
+fi
+if [[ ! -e /etc/multipath.conf ]]; then
+  echo ">> writing minimal /etc/multipath.conf (find_multipaths yes)"
+  printf 'defaults {\n    find_multipaths yes\n}\n' > /etc/multipath.conf
+  systemctl restart multipathd 2>/dev/null || true
+fi
+systemctl enable --now multipathd 2>/dev/null || service multipathd start 2>/dev/null || true
+
 # 4. the bard-vg the plugin carves LUN backstores from (reuse the LVM fixture).
 if ! vgs bard-vg >/dev/null 2>&1; then
   echo ">> bard-vg missing -- running the LVM fixture to create it"
