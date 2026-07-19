@@ -19,6 +19,14 @@
 # Run as your user (sudo used internally):  bash hack/setup-targetd-fixture.sh
 # Tear down:                                bash hack/setup-targetd-fixture.sh delete
 # API password lands in ~/.bard-targetd-pass (user admin).
+#
+# EXPOSURE: targetd hardcodes its JSON-RPC listener to ALL interfaces
+# (upstream main.py: server_class(("", 18700), ...)); targetd.yaml's
+# portal_addresses only scopes the iSCSI portals, NOT the admin API. Left
+# alone, a "loopback" dev fixture is a LAN-reachable cleartext-basic-auth
+# storage admin API. The script firewalls :18700 to the loopback interface
+# (removed on delete); a real remote deployment must open it deliberately
+# to exactly the controller's subnet.
 set -euo pipefail
 
 VENV="$HOME/bard-targetd-venv"
@@ -30,6 +38,7 @@ PORTAL_ADDRS=${PORTAL_ADDRS:-'"127.0.0.1"'}   # comma-separated, each quoted
 
 if [[ "${1:-}" == "delete" ]]; then
   echo ">> stopping targetd + removing its VG/loop/venv"
+  sudo iptables -D INPUT -p tcp --dport 18700 ! -i lo -j DROP 2>/dev/null || true
   sudo systemctl stop bard-targetd 2>/dev/null || true
   sudo systemctl reset-failed bard-targetd 2>/dev/null || true
   if sudo vgs "$VG" >/dev/null 2>&1; then
@@ -90,23 +99,40 @@ if ! sudo vgs "$VG" >/dev/null 2>&1; then
   sudo vgcreate "$VG" "$LOOP"
 fi
 
-# 5. config + password (generated once, kept across re-runs).
-[ -f "$PASSFILE" ] || { openssl rand -hex 12 > "$PASSFILE"; chmod 600 "$PASSFILE"; }
+# 5. config + password (generated once, kept across re-runs). Mode discipline:
+#    both files are 0600 from the first byte (umask before create -- no
+#    world-readable window), and the password never rides an exec'd argv
+#    (printf is a builtin; the inner shell's argv carries no secret).
+[ -f "$PASSFILE" ] || (umask 077; openssl rand -hex 12 > "$PASSFILE")
 sudo mkdir -p /etc/target
 printf 'password: %s\nblock_pools: [%s]\ntarget_name: %s\nportal_addresses: [%s]\n' \
-  "$(cat "$PASSFILE")" "$VG" "$TARGET_IQN" "$PORTAL_ADDRS" | sudo tee /etc/target/targetd.yaml >/dev/null
-sudo chmod 600 /etc/target/targetd.yaml
+  "$(cat "$PASSFILE")" "$VG" "$TARGET_IQN" "$PORTAL_ADDRS" \
+  | sudo sh -c 'umask 077; cat > /etc/target/targetd.yaml'
+sudo chmod 600 /etc/target/targetd.yaml   # heal a pre-existing looser mode; > keeps modes
 
-# 6. run under systemd (never a bare `&`); restart to pick up config changes.
+# 6. firewall the admin API to loopback BEFORE the daemon starts (targetd's
+#    0.0.0.0:18700 bind is hardcoded upstream -- see EXPOSURE above).
+sudo iptables -C INPUT -p tcp --dport 18700 ! -i lo -j DROP 2>/dev/null \
+  || sudo iptables -I INPUT -p tcp --dport 18700 ! -i lo -j DROP
+
+# 7. run under systemd (never a bare `&`); restart to pick up config changes.
 sudo systemctl stop bard-targetd 2>/dev/null || true
 sudo systemctl reset-failed bard-targetd 2>/dev/null || true
 sudo systemd-run --unit bard-targetd "$VENV/bin/targetd" >/dev/null
-sleep 2
-systemctl is-active --quiet bard-targetd || { echo "FAIL: targetd did not start"; sudo journalctl -u bard-targetd -n 10 --no-pager; exit 1; }
+# python + GI imports take a variable moment: wait for the listener, not a timer
+for i in $(seq 1 30); do
+  systemctl is-active --quiet bard-targetd \
+    || { echo "FAIL: targetd did not start"; sudo journalctl -u bard-targetd -n 10 --no-pager; exit 1; }
+  ss -tln | grep -q ':18700 ' && break
+  [ "$i" -eq 30 ] && { echo "FAIL: targetd never listened on :18700"; exit 1; }
+  sleep 0.5
+done
 
-# 7. smoke: the API must answer pool_list with our VG.
-OUT=$(curl -sS -u admin:"$(cat "$PASSFILE")" -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"pool_list","params":{}}' http://127.0.0.1:18700/targetrpc)
+# 8. smoke: the API must answer pool_list with our VG. Credential via a curl
+#    config on stdin (-K -), never -u argv (visible in /proc/*/cmdline).
+OUT=$(curl -sS -K - -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"pool_list","params":{}}' \
+  http://127.0.0.1:18700/targetrpc <<<"user = \"admin:$(cat "$PASSFILE")\"")
 echo "$OUT" | grep -q "$VG" || { echo "FAIL: pool_list did not report $VG: $OUT"; exit 1; }
 echo ">> targetd ready on :18700 (target $TARGET_IQN, pool $VG)"
 echo ">> API: user admin, password in $PASSFILE"
