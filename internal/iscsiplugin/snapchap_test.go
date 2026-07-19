@@ -847,6 +847,54 @@ func TestNodeStageSinglePortalUnchanged(t *testing.T) {
 // NodeUnstage with a recorded multipath state: umount, THEN flush the map,
 // THEN log out every portal, verify every path device gone, then per-portal
 // --op delete.
+// The pre-logout flush is best-effort: while sessions are up, multipathd can
+// re-assemble the map right after `multipath -f` (find_multipaths + known
+// wwid) -- the exact wedge found live in-cluster. Unstage must still succeed
+// when the POST-logout ground truth finds the map gone.
+func TestNodeUnstageMultipathSurvivesPreLogoutReassembly(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	loggedOut := false
+	fr := &fakeRunner{}
+	fr.results = map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil },
+		"multipath": func([]string) (string, error) {
+			if !loggedOut {
+				return "", errors.New("exit status 1") // flush refused / map re-added
+			}
+			return "", nil
+		},
+		"dmsetup": func([]string) (string, error) {
+			if !loggedOut {
+				return "mpatha", nil // map still resolves pre-logout: flush did not take
+			}
+			return "", errors.New("Device does not exist") // gone once paths died
+		},
+		"iscsiadm": func(args []string) (string, error) {
+			if contains(args, "--logout") {
+				loggedOut = true
+			}
+			return "", nil
+		},
+	}
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", fr)
+	staging := t.TempDir() + "/stage"
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
+	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
+	if err := b.recordState(staging, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatalf("unstage must survive a pre-logout flush failure when the map clears after logout: %v", err)
+	}
+}
+
 func TestNodeUnstageMultipath(t *testing.T) {
 	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
 	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))

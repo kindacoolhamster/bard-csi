@@ -1240,9 +1240,13 @@ func (b *Backend) flushMultipath(ctx context.Context, mapper string) error {
 // success while a leg is still attached), then best-effort drop each portal's
 // node record.
 func (b *Backend) unstageMultipath(ctx context.Context, iqn, mapper string, portals, devices []string) error {
-	if err := b.flushMultipath(ctx, mapper); err != nil {
-		return err
-	}
+	// Pre-logout flush is BEST-EFFORT only: while the sessions (and so the sd
+	// paths) are still alive, multipathd can re-assemble the map the moment
+	// `multipath -f` removes it (find_multipaths + a known wwid). Live-found
+	// in-cluster: the flush "succeeded" but the map was back before the check,
+	// wedging unstage forever. The authoritative map-gone check moves to AFTER
+	// the logouts destroy the paths (multipathd reaps a pathless map).
+	_ = b.flushMultipath(ctx, mapper)
 	for _, portal := range portals {
 		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout"); err != nil && !isNotFound(err) {
 			return fmt.Errorf("iscsi: logout %s (%s): %w", iqn, portal, err)
@@ -1252,6 +1256,11 @@ func (b *Backend) unstageMultipath(ctx context.Context, iqn, mapper string, port
 		if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
 			return fmt.Errorf("iscsi: device %s still present after logout", dev)
 		}
+	}
+	// Ground truth, post-logout: with every path gone the map must not survive.
+	// One more flush covers a multipathd that keeps pathless maps (queueing).
+	if err := b.flushMultipath(ctx, mapper); err != nil {
+		return err
 	}
 	for _, portal := range portals {
 		_, _ = b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--op", "delete")
