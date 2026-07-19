@@ -52,11 +52,13 @@ jobs:
           # backend -- see templates/_validate.tpl)
           helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
             --set-json 'plugins.iscsi.instances={"galileo":{"vg":"bard-vg","portal":"192.0.2.1:3260","thinPool":"bard-thin","chapAuth":true}}' >/dev/null
-          # iscsi profile: negative guard -- must FAIL the render without attach.enabled
-          if helm template bard charts/bard-csi --set plugins.iscsi.enabled=true \
-            --set-json 'plugins.iscsi.instances={"g":{"vg":"v","portal":"192.0.2.1:3260"}}' >/dev/null 2>&1; then
+          # iscsi profile: negative guard -- must FAIL the render without attach.enabled,
+          # and with the intended guard message (not some unrelated render error)
+          if err=$(helm template bard charts/bard-csi --set plugins.iscsi.enabled=true \
+            --set-json 'plugins.iscsi.instances={"g":{"vg":"v","portal":"192.0.2.1:3260"}}' 2>&1 >/dev/null); then
             echo "guard did not fire"; exit 1
           fi
+          echo "$err" | grep -q "requires attach.enabled" || { echo "guard fired for the wrong reason:"; echo "$err"; exit 1; }
 
   conformance:
     # The wire-contract bar: drive the Python localpath plugin (which shares no

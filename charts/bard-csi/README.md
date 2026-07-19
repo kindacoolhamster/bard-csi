@@ -143,7 +143,9 @@ or PublishContext.
 **Controller placement.** LIO (the target daemon) lives in the host kernel's
 configfs, so the controller pod must run *on* the target host: pin it with
 `controller.nodeSelector` (`kubernetes.io/hostname: <target-node>`) as shown
-above. See the
+above. Because the iscsi profile's controller is `hostNetwork` and pinned to that
+one host, `controller.replicas` must stay at its default of `1` -- the chart fails
+the render otherwise (`templates/_validate.tpl`). See the
 [Locality section of deploy/examples/iscsi/README.md](../../deploy/examples/iscsi/README.md#locality-read-this--same-host-coupling-as-lvm)
 for the full constraint (a control plane on a non-target node needs remote LIO
 management via `targetd` — a follow-up).
