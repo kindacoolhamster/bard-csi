@@ -122,6 +122,13 @@ type Backend struct {
 	// the iscsiadm method for why that is required.
 	iscsiadmChroot string
 	run            Runner
+	// sysfsRoot/devRoot let dm-multipath resolution (WWID reads, by-path/by-id
+	// device paths) be pointed at a fake tree in tests -- those are direct file
+	// reads/symlinks the fakeRunner cannot intercept. Production defaults (set in
+	// New) are the real /sys and /dev; kept unexported since New's signature is
+	// the plugin's stable public entry point (used by cmd/bard-plugin-iscsi).
+	sysfsRoot string
+	devRoot   string
 }
 
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
@@ -134,7 +141,7 @@ func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, iscsiad
 		run = ExecRunner{}
 	}
 	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir,
-		iscsiadmChroot: iscsiadmChroot, run: run}
+		iscsiadmChroot: iscsiadmChroot, run: run, sysfsRoot: "/sys", devRoot: "/dev"}
 }
 
 // iscsiadm runs iscsiadm, chrooted into the host root when configured.
@@ -223,6 +230,24 @@ func sanitizeIQN(s string) string {
 func devPath(vg, lv string) string { return "/dev/" + vg + "/" + lv }
 func backstore(lv string) string   { return "/backstores/block/" + lv }
 func tpgPath(iqn string) string    { return "/iscsi/" + iqn + "/tpg1" }
+
+// mpathID derives the dm-uuid "by-id" suffix from a SCSI WWID, matching the
+// scsi_id/multipath convention used to build /dev/disk/by-id/dm-uuid-mpath-<id>:
+// a "naa." WWID becomes "3<hex>", "eui." becomes "2<hex>", "t10." becomes
+// "1<string>" (kept as-is -- t10 vendor IDs are not hex). An unrecognized prefix
+// is an error: guessing would risk polling a mapper link that will never appear.
+func mpathID(wwid string) (string, error) {
+	switch {
+	case strings.HasPrefix(wwid, "naa."):
+		return "3" + strings.TrimPrefix(wwid, "naa."), nil
+	case strings.HasPrefix(wwid, "eui."):
+		return "2" + strings.TrimPrefix(wwid, "eui."), nil
+	case strings.HasPrefix(wwid, "t10."):
+		return "1" + strings.TrimPrefix(wwid, "t10."), nil
+	default:
+		return "", fmt.Errorf("iscsi: unrecognized wwid %q (want a naa./eui./t10. prefix)", wwid)
+	}
+}
 
 // lvSizeBytes returns the LV size and whether it exists.
 func (b *Backend) lvSizeBytes(ctx context.Context, vg, lv string) (int64, bool, error) {
@@ -766,6 +791,13 @@ type stagedState struct {
 	Device string `json:"device"`
 	IQN    string `json:"iqn"`
 	Portal string `json:"portal"`
+	// Portals/Devices/Mapper are additive: set only for a dm-multipath (2+
+	// portal) stage. An old single-path record (or a fresh single-path stage)
+	// loads with them empty, which keeps NodeUnstage/NodePublish on the
+	// single-path branch.
+	Portals []string `json:"portals,omitempty"`
+	Devices []string `json:"devices,omitempty"`
+	Mapper  string   `json:"mapper,omitempty"`
 }
 
 func (b *Backend) statePath(stagingPath string) string {
@@ -808,9 +840,23 @@ func (b *Backend) clearState(stagingPath string) {
 	}
 }
 
-// byPath is the stable device symlink the kernel creates for a logged-in LUN.
-func byPath(portal, iqn, lun string) string {
-	return "/dev/disk/by-path/ip-" + portal + "-iscsi-" + iqn + "-lun-" + lun
+// byPath is the stable device symlink the kernel creates for a logged-in LUN,
+// under devRoot (defaults to /dev; tests point it at a fake tree).
+func (b *Backend) byPath(portal, iqn, lun string) string {
+	return filepath.Join(b.devRoot, "disk", "by-path", "ip-"+portal+"-iscsi-"+iqn+"-lun-"+lun)
+}
+
+// multipathPortals resolves the portal list for a NodeStage request: the
+// PublishContext's explicit "portals" key (set by ControllerPublish for a
+// 2+-portal instance) takes precedence over the instance config, mirroring how
+// portal/targetIqn/lun already fall back to instance config when the context
+// doesn't carry them. NodeUnstage has no PublishContext at all (CSI doesn't
+// carry one on unstage), so its callers go straight to ic.portalList().
+func multipathPortals(pc map[string]string, ic InstanceConfig) []string {
+	if v := pc[ctxPortals]; v != "" {
+		return strings.Split(v, ",")
+	}
+	return ic.portalList()
 }
 
 // ensureIface makes the dedicated iscsiadm iface carry this node's derived
@@ -862,10 +908,55 @@ func (b *Backend) waitForDevice(ctx context.Context, dev string) error {
 	}
 }
 
+// waitForMapper resolves the assembled dm-multipath device from ONE already-
+// logged-in path device: EvalSymlinks the by-path link to the kernel's sd node,
+// read its WWID from sysfs, and poll the dm-uuid "by-id" link that
+// multipathd/udev assemble once every path is up (observed live: ~4s after the
+// 2nd login; same poll cadence as waitForDevice). This NEVER returns a
+// /dev/mapper/<name> path -- host multipath.conf may set user_friendly_names,
+// so only the dm-uuid link (stable, naming-independent) is safe to reference.
+func (b *Backend) waitForMapper(ctx context.Context, pathDev string) (string, error) {
+	sdPath, err := filepath.EvalSymlinks(pathDev)
+	if err != nil {
+		return "", fmt.Errorf("iscsi: resolve path device %s: %w", pathDev, err)
+	}
+	sd := filepath.Base(sdPath)
+	wwidPath := filepath.Join(b.sysfsRoot, "class", "block", sd, "device", "wwid")
+	wwidRaw, err := os.ReadFile(wwidPath)
+	if err != nil {
+		return "", fmt.Errorf("iscsi: read wwid %s: %w", wwidPath, err)
+	}
+	id, err := mpathID(strings.TrimSpace(string(wwidRaw)))
+	if err != nil {
+		return "", err
+	}
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Lstat(mapper); err == nil {
+			return mapper, nil
+		}
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("iscsi: wait for mapper %s: %w", mapper, ctx.Err())
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("iscsi: mapper %s not ready after timeout", mapper)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageRequest) error {
 	ic, err := b.inst(req.Volume.Instance)
 	if err != nil {
 		return err
+	}
+	// dm-multipath: PublishContext's explicit portals list takes precedence over
+	// instance config (mirrors how portal/targetIqn/lun already fall back to
+	// instance config below); 2+ portals hands the ENTIRE stage to the multipath
+	// branch below, which never touches the single-portal code beneath it.
+	if portals := multipathPortals(req.PublishContext, ic); len(portals) >= 2 {
+		return b.nodeStageMultipath(ctx, req, ic, portals)
 	}
 	// Connection details come from ControllerPublish via PublishContext; fall back
 	// to deriving them (so a manual/no-attach run still works).
@@ -873,9 +964,6 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	iqn := req.PublishContext[ctxIQN]
 	lun := req.PublishContext[ctxLUN]
 	if portal == "" {
-		// Node-plane multipath (logging in over every portal) is task 2.2; for now
-		// this fallback keeps single-portal semantics -- the first configured
-		// portal, same as before portalList() existed.
 		portal = ic.portalList()[0]
 	}
 	if iqn == "" {
@@ -909,7 +997,7 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 		return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
 	}
 
-	dev := byPath(portal, iqn, lun)
+	dev := b.byPath(portal, iqn, lun)
 	if err := b.waitForDevice(ctx, dev); err != nil {
 		return err
 	}
@@ -951,6 +1039,94 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	// it to the device once mounted (online for every supported fs, a no-op when
 	// the sizes already match -- i.e. every non-clone stage).
 	return b.growFilesystem(ctx, fsType, dev, req.StagingPath)
+}
+
+// nodeStageMultipath is NodeStage's dm-multipath branch (2+ portals): it logs in
+// under EVERY portal (ensureIface once, then per portal: discovery, CHAP, login
+// -- the SAME per-portal order the single-path code above already uses),
+// resolves the kernel-assembled multipath device from one path's WWID, and
+// formats/mounts/grows against the MAPPER, never a single leg -- so
+// multipathd, not the filesystem, owns path failover.
+func (b *Backend) nodeStageMultipath(ctx context.Context, req *bardplugin.NodeStageRequest, ic InstanceConfig, portals []string) error {
+	iqn := req.PublishContext[ctxIQN]
+	if iqn == "" {
+		iqn = targetIQN(ic.IQNBase, req.Volume.Name)
+	}
+	lun := req.PublishContext[ctxLUN]
+	if lun == "" {
+		lun = "0"
+	}
+	initIQN := initiatorIQN(ic.IQNBase, b.nodeID)
+
+	if err := b.ensureIface(ctx, initIQN); err != nil {
+		return err
+	}
+	chap, err := b.chapFor(req.Volume.Instance)
+	if err != nil {
+		return err
+	}
+
+	devs := make([]string, 0, len(portals))
+	for _, portal := range portals {
+		if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
+			return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
+		}
+		if chap != nil {
+			if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+				return err
+			}
+		}
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
+			return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
+		}
+		dev := b.byPath(portal, iqn, lun)
+		if err := b.waitForDevice(ctx, dev); err != nil {
+			return err
+		}
+		devs = append(devs, dev)
+	}
+
+	// Every path shares the same WWID (same LUN); resolve the assembled mapper
+	// from whichever one -- the first, since all are now logged in.
+	mapper, err := b.waitForMapper(ctx, devs[0])
+	if err != nil {
+		return err
+	}
+	if err := b.recordState(req.StagingPath, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		return err
+	}
+
+	if req.Block {
+		return nil // raw block: device published directly, nothing to format/mount
+	}
+	fsType := req.FsType
+	if fsType == "" {
+		fsType = defaultFsType
+	}
+	if !supportedFsTypes[fsType] {
+		return bardplugin.Errorf(bardplugin.CodeInvalidArg,
+			"iscsi: unsupported fsType %q (supported: ext4, ext3, ext2, xfs, btrfs)", fsType)
+	}
+	if err := b.ensureFormatted(ctx, mapper, fsType); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(req.StagingPath, 0o750); err != nil {
+		return fmt.Errorf("iscsi: mkdir staging: %w", err)
+	}
+	if out, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "SOURCE", "--mountpoint", req.StagingPath); strings.TrimSpace(out) == "" {
+		mountArgs := []string{"-t", fsType}
+		if len(req.MountFlags) > 0 {
+			mountArgs = append(mountArgs, "-o", strings.Join(req.MountFlags, ","))
+		}
+		mountArgs = append(mountArgs, mapper, req.StagingPath)
+		if _, err := b.run.Run(ctx, "mount", mountArgs...); err != nil {
+			return fmt.Errorf("iscsi: mount %s -> %s: %w", mapper, req.StagingPath, err)
+		}
+	}
+	return b.growFilesystem(ctx, fsType, mapper, req.StagingPath)
 }
 
 // setChapOnNode writes the CHAP credentials onto the node record for (iqn,
@@ -1003,12 +1179,15 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 		if len(pl) == 0 {
 			return nil // instance unknown: nothing derivable, nothing to log out of
 		}
-		// Node-plane multipath (a session per portal) is task 2.2; for now this
-		// derived-logout fallback keeps single-portal semantics -- the first
-		// configured portal, same as before portalList() existed.
-		portal := pl[0]
 		iqn := targetIQN(base, req.Volume.Name)
-		st = stagedState{IQN: iqn, Portal: portal, Device: byPath(portal, iqn, "0")}
+		if len(pl) >= 2 {
+			return b.nodeUnstageDerivedMultipath(ctx, req, iqn, pl)
+		}
+		portal := pl[0]
+		st = stagedState{IQN: iqn, Portal: portal, Device: b.byPath(portal, iqn, "0")}
+	}
+	if len(st.Portals) >= 2 {
+		return b.nodeUnstageMultipath(ctx, req, st)
 	}
 	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)
@@ -1023,6 +1202,105 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 	return nil
 }
 
+// flushMultipath removes a dm-multipath map so its underlying paths can be
+// logged out cleanly. Retries once (multipathd can be mid-reconfigure right
+// after a path drops), then confirms the map is actually gone via `dmsetup
+// info` (which errors once the device node no longer exists) rather than
+// trusting `multipath -f`'s exit code alone. A no-op when there is no known
+// mapper (nothing was ever assembled).
+func (b *Backend) flushMultipath(ctx context.Context, mapper string) error {
+	if mapper == "" {
+		return nil
+	}
+	_, err := b.run.Run(ctx, "multipath", "-f", mapper)
+	if err != nil {
+		_, err = b.run.Run(ctx, "multipath", "-f", mapper) // one retry
+	}
+	if _, derr := b.run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "name", mapper); derr == nil {
+		// dmsetup still resolves the map: the flush did not actually take.
+		if err != nil {
+			return fmt.Errorf("iscsi: flush multipath map %s: %w", mapper, err)
+		}
+		return fmt.Errorf("iscsi: multipath map %s still present after flush", mapper)
+	}
+	return nil
+}
+
+// unstageMultipath is the shared multipath teardown core for both the
+// state-based and derived NodeUnstage branches: flush the map (if known)
+// BEFORE logging any path out -- logging out from under a live map leaves it
+// stuck holding a dead path -- then log out every portal (tolerating
+// no-session), verify every known path device is actually gone (never report
+// success while a leg is still attached), then best-effort drop each portal's
+// node record.
+func (b *Backend) unstageMultipath(ctx context.Context, iqn, mapper string, portals, devices []string) error {
+	if err := b.flushMultipath(ctx, mapper); err != nil {
+		return err
+	}
+	for _, portal := range portals {
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout"); err != nil && !isNotFound(err) {
+			return fmt.Errorf("iscsi: logout %s (%s): %w", iqn, portal, err)
+		}
+	}
+	for _, dev := range devices {
+		if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+			return fmt.Errorf("iscsi: device %s still present after logout", dev)
+		}
+	}
+	for _, portal := range portals {
+		_, _ = b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--op", "delete")
+	}
+	return nil
+}
+
+// nodeUnstageMultipath is NodeUnstage's dm-multipath branch when a state record
+// is present (st.Portals has 2+ entries): tear down using the RECORDED mapper
+// and device list, then clear the state.
+func (b *Backend) nodeUnstageMultipath(ctx context.Context, req *bardplugin.NodeUnstageRequest, st stagedState) error {
+	if err := b.unstageMultipath(ctx, st.IQN, st.Mapper, st.Portals, st.Devices); err != nil {
+		return err
+	}
+	b.clearState(req.StagingPath)
+	return nil
+}
+
+// derivedMapper resolves a 2+-portal instance's assembled multipath device from
+// whichever configured portal still has a live path device -- used by both
+// NodeUnstage's and NodePublish's fallbacks when the state record is lost.
+// Returns ("", nil) when no configured portal has a live device (nothing to
+// resolve, nothing to flush); a live device whose wwid/mapper cannot be
+// resolved is a real error, not a silent skip.
+func (b *Backend) derivedMapper(ctx context.Context, iqn string, portals []string) (string, error) {
+	for _, portal := range portals {
+		dev := b.byPath(portal, iqn, "0")
+		if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+			return b.waitForMapper(ctx, dev)
+		}
+	}
+	return "", nil
+}
+
+// nodeUnstageDerivedMultipath is NodeUnstage's derived-identity fallback for a
+// LOST state record on a 2+-portal instance: resolve whichever path device (if
+// any) is still live to its mapper -- so a live map is flushed before any
+// logout, exactly the state-based order, just without a recorded device list to
+// rely on -- then run the same teardown core.
+func (b *Backend) nodeUnstageDerivedMultipath(ctx context.Context, req *bardplugin.NodeUnstageRequest, iqn string, portals []string) error {
+	devices := make([]string, len(portals))
+	for i, portal := range portals {
+		devices[i] = b.byPath(portal, iqn, "0")
+	}
+	mapper, err := b.derivedMapper(ctx, iqn, portals)
+	if err != nil {
+		return err
+	}
+	if err := b.unstageMultipath(ctx, iqn, mapper, portals, devices); err != nil {
+		return err
+	}
+	b.clearState(req.StagingPath)
+	return nil
+}
+
 func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRequest) error {
 	if req.Block {
 		// Raw block: bind-mount the staged device node to the target path. The
@@ -1032,6 +1310,11 @@ func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRe
 		// wedge on a missing record while the LUN is attached.
 		st, ok := b.loadState(req.StagingPath)
 		dev := st.Device
+		if ok && st.Mapper != "" {
+			// A recorded multipath stage must bind-mount the MAPPER, never one leg
+			// -- that would defeat the entire point of multipath.
+			dev = st.Mapper
+		}
 		if !ok || dev == "" {
 			ic := b.instances[req.Volume.Instance]
 			pl := ic.portalList()
@@ -1042,10 +1325,20 @@ func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRe
 			if base == "" {
 				base = defaultIQNBase
 			}
-			// Node-plane multipath (a session per portal) is task 2.2; for now this
-			// derived-device fallback keeps single-portal semantics -- the first
-			// configured portal, same as before portalList() existed.
-			dev = byPath(pl[0], targetIQN(base, req.Volume.Name), "0")
+			iqn := targetIQN(base, req.Volume.Name)
+			if len(pl) >= 2 {
+				mapper, err := b.derivedMapper(ctx, iqn, pl)
+				if err != nil {
+					return err
+				}
+				if mapper == "" {
+					return bardplugin.Errorf(bardplugin.CodeInternal,
+						"iscsi: no live path device found to derive the multipath device for %s; refusing to bind-mount a single leg", req.StagingPath)
+				}
+				dev = mapper
+			} else {
+				dev = b.byPath(pl[0], iqn, "0")
+			}
 		}
 		if err := os.MkdirAll(filepath.Dir(req.TargetPath), 0o750); err != nil {
 			return fmt.Errorf("iscsi: mkdir target parent: %w", err)
@@ -1097,11 +1390,42 @@ func (b *Backend) NodeExpand(ctx context.Context, req *bardplugin.NodeExpandRequ
 		return nil, fmt.Errorf("iscsi: resolve device for %s: %w", req.VolumePath, err)
 	}
 	dev = strings.TrimSpace(dev)
+	if isMultipathDevice(dev) {
+		if err := b.resizeMultipath(ctx, dev); err != nil {
+			return nil, err
+		}
+	}
 	fsType, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "FSTYPE", "--target", req.VolumePath)
 	if err := b.growFilesystem(ctx, strings.TrimSpace(fsType), dev, req.VolumePath); err != nil {
 		return nil, err
 	}
 	return &bardplugin.NodeExpandResponse{}, nil
+}
+
+// isMultipathDevice reports whether a mount SOURCE is a dm-multipath device --
+// either the raw /dev/dm-N node or a /dev/mapper/<name> path (host
+// multipath.conf may set user_friendly_names, which resolve through
+// /dev/mapper, not /dev/dm-N -- findmnt reports whichever path the mount table
+// actually recorded). Mount sources come from findmnt output, not devRoot, so
+// this checks the literal /dev prefixes regardless of devRoot.
+func isMultipathDevice(src string) bool {
+	return strings.HasPrefix(src, "/dev/dm-") || strings.HasPrefix(src, "/dev/mapper/")
+}
+
+// resizeMultipath makes multipathd pick up a grown map's new size: resolve the
+// map NAME from the mount source (dmsetup accepts a device path directly), then
+// `multipathd resize map <name>` -- growFilesystem then runs against the SAME
+// mount source, so the fs grow sees the resized map.
+func (b *Backend) resizeMultipath(ctx context.Context, dev string) error {
+	name, err := b.run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "name", dev)
+	if err != nil {
+		return fmt.Errorf("iscsi: resolve multipath map name for %s: %w", dev, err)
+	}
+	name = strings.TrimSpace(name)
+	if _, err := b.run.Run(ctx, "multipathd", "resize", "map", name); err != nil {
+		return fmt.Errorf("iscsi: multipathd resize map %s: %w", name, err)
+	}
+	return nil
 }
 
 // growFilesystem grows a mounted filesystem to its backing device's size --

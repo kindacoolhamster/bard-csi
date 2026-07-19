@@ -3,6 +3,7 @@ package iscsiplugin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -416,7 +417,7 @@ func TestNodePublishBlockDerivedDevice(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("block publish with a lost record must derive the device: %v", err)
 	}
-	dev := byPath("10.0.0.9:3260", targetIQN(defaultIQNBase, lv), "0")
+	dev := b.byPath("10.0.0.9:3260", targetIQN(defaultIQNBase, lv), "0")
 	if !fr.ran("mount", "--bind", dev, target) {
 		t.Fatalf("expected bind mount of the derived by-path device; calls %v", fr.calls)
 	}
@@ -650,5 +651,385 @@ func TestNoChapByDefault(t *testing.T) {
 	}
 	if fr2.ran("targetcli", "set", "auth") {
 		t.Fatalf("no auth must be set without chapAuth; calls %v", fr2.calls)
+	}
+}
+
+// ---- dm-multipath (Task 2.2) -----------------------------------------------
+
+// mpathID: the three recognized WWID prefixes plus an unrecognized one.
+func TestMpathID(t *testing.T) {
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"naa.6001405abc123def", "36001405abc123def", false},
+		{"eui.0011223344556677", "20011223344556677", false},
+		{"t10.ATA     SomeDisk_1234", "1ATA     SomeDisk_1234", false},
+		{"garbage-no-prefix", "", true},
+	}
+	for _, c := range cases {
+		got, err := mpathID(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("mpathID(%q): expected an error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("mpathID(%q): unexpected error %v", c.in, err)
+		}
+		if got != c.want {
+			t.Fatalf("mpathID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// multipathFixture builds a fake sysfs+dev tree under t.TempDir() for a
+// dm-multipath resolution test: one fake "sdX" leg device (with REAL symlinks,
+// so filepath.EvalSymlinks works) per portal in legPortals, all sharing the
+// same wwid (a real multipath LUN presents an identical wwid on every path),
+// plus the assembled dm-uuid by-id link. legPortals may be a SUBSET of a
+// larger portal list, to model "only some paths are still live".
+func multipathFixture(t *testing.T, iqn string, legPortals []string, wwid, id string) (sysfsRoot, devRoot string) {
+	t.Helper()
+	sysfsRoot = t.TempDir()
+	devRoot = t.TempDir()
+	byPathDir := filepath.Join(devRoot, "disk", "by-path")
+	byIDDir := filepath.Join(devRoot, "disk", "by-id")
+	if err := os.MkdirAll(byPathDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(byIDDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, portal := range legPortals {
+		sd := fmt.Sprintf("sd%c", 'a'+i)
+		sdDir := filepath.Join(sysfsRoot, "class", "block", sd, "device")
+		if err := os.MkdirAll(sdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sdDir, "wwid"), []byte(wwid+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sdNode := filepath.Join(devRoot, sd)
+		if err := os.WriteFile(sdNode, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(byPathDir, "ip-"+portal+"-iscsi-"+iqn+"-lun-0")
+		if err := os.Symlink(sdNode, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dmNode := filepath.Join(devRoot, "dm-0")
+	if err := os.WriteFile(dmNode, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dmNode, filepath.Join(byIDDir, "dm-uuid-mpath-"+id)); err != nil {
+		t.Fatal(err)
+	}
+	return sysfsRoot, devRoot
+}
+
+// NodeStage with 2 portals: discovery+CHAP+login PER portal (same order the
+// single-path code already uses), the assembled mapper is resolved from the
+// fake sysfs wwid, the mount source is the dm-uuid by-id link (never
+// /dev/mapper/<name>), and the recorded state carries the full multipath
+// fields.
+func TestNodeStageMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst, dir := chapSetup(t, "bard\nsecretpass\n")
+	ic := inst["east"]
+	ic.Portal = ""
+	ic.Portals = portals
+	inst["east"] = ic
+
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	wwid := "naa.6001405deadbeef00"
+	wantID, err := mpathID(wwid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
+	}}
+	b := New(inst, "n1", t.TempDir(), dir, "", fr)
+	b.sysfsRoot, b.devRoot = multipathFixture(t, iqn, portals, wwid, wantID)
+
+	staging := t.TempDir() + "/stage"
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range portals {
+		discAt, credsAt, loginAt := -1, -1, -1
+		for i, c := range fr.calls {
+			if c[0] != "iscsiadm" || !contains(c, "-p") || !contains(c, p) {
+				continue
+			}
+			joined := strings.Join(c, " ")
+			switch {
+			case strings.Contains(joined, "discovery") && discAt < 0:
+				discAt = i
+			case strings.Contains(joined, "node.session.auth.password") && credsAt < 0:
+				credsAt = i
+			case strings.Contains(joined, "--login") && loginAt < 0:
+				loginAt = i
+			}
+		}
+		if discAt < 0 || credsAt < 0 || loginAt < 0 || !(discAt < credsAt && credsAt < loginAt) {
+			t.Fatalf("expected discovery->chap->login order for portal %s (disc@%d creds@%d login@%d); calls %v",
+				p, discAt, credsAt, loginAt, fr.calls)
+		}
+	}
+
+	wantMapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+wantID)
+	if !fr.ran("mount", wantMapper, staging) {
+		t.Fatalf("expected mount of the assembled mapper %s; calls %v", wantMapper, fr.calls)
+	}
+
+	st, ok := b.loadState(staging)
+	if !ok {
+		t.Fatal("expected recorded state")
+	}
+	if len(st.Portals) != 2 || len(st.Devices) != 2 || st.Mapper != wantMapper {
+		t.Fatalf("expected full multipath state (2 portals, 2 devices, mapper set), got %+v", st)
+	}
+}
+
+// TestNodeStageSinglePortalUnchanged pins the EXACT call sequence for a
+// single-portal instance -- the multipath branch must never fire, and not one
+// argument may change versus the pre-multipath behavior.
+func TestNodeStageSinglePortalUnchanged(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
+	}}
+	b := New(eastInst(), "k3s-agent", t.TempDir(), "", "", fr)
+	staging := t.TempDir() + "/stage"
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	initIQN := initiatorIQN(defaultIQNBase, "k3s-agent")
+	dev := b.byPath("10.0.0.9:3260", iqn, "0")
+	want := [][]string{
+		{"iscsiadm", "-m", "iface", "-I", "bard"},
+		{"iscsiadm", "-m", "iface", "-I", "bard", "--op", "update", "-n", "iface.initiatorname", "-v", initIQN},
+		{"iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", "10.0.0.9:3260", "-I", "bard"},
+		{"iscsiadm", "-m", "node", "-T", iqn, "-p", "10.0.0.9:3260", "-I", "bard", "--login"},
+		{"blockdev", "--getsize64", dev},
+		{"blkid", "-o", "value", "-s", "TYPE", dev},
+		{"mkfs.ext4", dev},
+		{"findmnt", "-n", "-o", "SOURCE", "--mountpoint", staging},
+		{"mount", "-t", "ext4", dev, staging},
+		{"resize2fs", dev},
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("call sequence length mismatch: got %d want %d\ngot:  %v\nwant: %v", len(fr.calls), len(want), fr.calls, want)
+	}
+	for i := range want {
+		if !equalStrings(fr.calls[i], want[i]) {
+			t.Fatalf("call[%d] = %v, want %v\nfull got: %v", i, fr.calls[i], want[i], fr.calls)
+		}
+	}
+}
+
+// NodeUnstage with a recorded multipath state: umount, THEN flush the map,
+// THEN log out every portal, verify every path device gone, then per-portal
+// --op delete.
+func TestNodeUnstageMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
+		"dmsetup":  func([]string) (string, error) { return "", errors.New("Device does not exist") },
+	}}
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", fr)
+	staging := t.TempDir() + "/stage"
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
+	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
+	if err := b.recordState(staging, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushAt := -1
+	for i, c := range fr.calls {
+		if c[0] == "multipath" && contains(c, "-f") {
+			flushAt = i
+			break
+		}
+	}
+	if flushAt < 0 {
+		t.Fatalf("expected multipath -f flush; calls %v", fr.calls)
+	}
+	for _, p := range portals {
+		logoutAt := -1
+		for i, c := range fr.calls {
+			if c[0] == "iscsiadm" && contains(c, "--logout") && contains(c, p) {
+				logoutAt = i
+				break
+			}
+		}
+		if logoutAt < 0 {
+			t.Fatalf("expected a logout on portal %s; calls %v", p, fr.calls)
+		}
+		if logoutAt < flushAt {
+			t.Fatalf("logout on %s (call %d) happened BEFORE the flush (call %d); calls %v", p, logoutAt, flushAt, fr.calls)
+		}
+		if !fr.ran("iscsiadm", "-T", iqn, "-p", p, "--op", "delete") {
+			t.Fatalf("expected a per-portal node record delete for %s; calls %v", p, fr.calls)
+		}
+	}
+	if _, ok := b.loadState(staging); ok {
+		t.Fatal("state must be cleared after a successful multipath unstage")
+	}
+}
+
+// NodeUnstage with NO state record on a 2-portal instance: both sub-cases --
+// a still-live path device resolves its mapper and flushes BEFORE logout; with
+// no live device, it's plain tolerate-no-session logouts and no flush attempt.
+func TestNodeUnstageDerivedMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst := map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+
+	t.Run("device-present-flush-first", func(t *testing.T) {
+		wwid := "naa.6001405abc123def0"
+		id, err := mpathID(wwid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flushed := false
+		fr := &fakeRunner{}
+		b := New(inst, "n1", t.TempDir(), "", "", fr)
+		sysfsRoot, devRoot := multipathFixture(t, iqn, portals[:1], wwid, id) // only portal[0] has a live leg
+		b.sysfsRoot, b.devRoot = sysfsRoot, devRoot
+		liveDev := b.byPath(portals[0], iqn, "0")
+		fr.results = map[string]func([]string) (string, error){
+			"multipath": func([]string) (string, error) { flushed = true; return "", nil },
+			"dmsetup":   func([]string) (string, error) { return "", errors.New("Device does not exist") },
+			"blockdev": func(args []string) (string, error) {
+				dev := args[len(args)-1]
+				if dev == liveDev && !flushed {
+					return "1073741824\n", nil
+				}
+				return "0\n", nil
+			},
+		}
+		staging := t.TempDir() + "/stage"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+			StagingPath: staging,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		wantMapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+		if !fr.ran("multipath", "-f", wantMapper) {
+			t.Fatalf("expected the resolved mapper %s to be flushed; calls %v", wantMapper, fr.calls)
+		}
+	})
+
+	t.Run("devices-absent-plain-logout", func(t *testing.T) {
+		fr := &fakeRunner{results: map[string]func([]string) (string, error){
+			"blockdev": func([]string) (string, error) { return "0\n", nil }, // nothing live anywhere
+			"iscsiadm": func(args []string) (string, error) {
+				if contains(args, "--logout") {
+					return "", errors.New("iscsiadm: No matching sessions found")
+				}
+				return "", nil
+			},
+		}}
+		b := New(inst, "n1", t.TempDir(), "", "", fr)
+		staging := t.TempDir() + "/stage"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+			StagingPath: staging,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if fr.ran("multipath", "-f") {
+			t.Fatalf("nothing to flush when no path device is live; calls %v", fr.calls)
+		}
+		for _, p := range portals {
+			if !fr.ran("iscsiadm", "-T", iqn, "-p", p, "--logout") {
+				t.Fatalf("expected a plain (tolerate-no-session) logout on %s; calls %v", p, fr.calls)
+			}
+		}
+	})
+}
+
+// NodePublish (block mode) with no state record on a 2-portal instance and NO
+// resolvable mapper anywhere must ERROR -- never silently bind-mount a single
+// leg (that would defeat the entire point of multipath).
+func TestNodePublishBlockDerivedMultipathRefusesLeg(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst := map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // nothing live anywhere
+	}}
+	b := New(inst, "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	lv := lvName("pvc-1")
+	target := t.TempDir() + "/block-target"
+	err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
+		StagingPath: t.TempDir() + "/stage",
+		TargetPath:  target,
+		Block:       true,
+	})
+	if err == nil {
+		t.Fatal("block publish with no state and no resolvable mapper must error, not bind a single leg")
+	}
+	if fr.ran("mount") {
+		t.Fatalf("must never bind-mount a single leg for a multipath instance; calls %v", fr.calls)
+	}
+}
+
+// NodeExpand on a dm-multipath mount source: session rescan, resolve the map
+// NAME via dmsetup, multipathd resize map <name>, then resize2fs against the
+// mapper source (the SAME findmnt SOURCE, unchanged).
+func TestNodeExpandMultipath(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"findmnt": func(args []string) (string, error) {
+			if contains(args, "SOURCE") {
+				return "/dev/dm-0\n", nil
+			}
+			return "ext4\n", nil // FSTYPE
+		},
+		"dmsetup": func([]string) (string, error) { return "bard-mpath-abc123\n", nil },
+	}}
+	b := New(eastInst(), "n1", t.TempDir(), "", "", fr)
+	if _, err := b.NodeExpand(context.Background(), &bardplugin.NodeExpandRequest{VolumePath: "/data"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fr.ran("iscsiadm", "-m", "session", "--rescan") {
+		t.Fatal("expected a session rescan")
+	}
+	if !fr.ran("dmsetup", "info", "-c", "--noheadings", "-o", "name", "/dev/dm-0") {
+		t.Fatalf("expected the map name resolved via dmsetup against the mount source; calls %v", fr.calls)
+	}
+	if !fr.ran("multipathd", "resize", "map", "bard-mpath-abc123") {
+		t.Fatalf("expected multipathd resize map with the resolved name; calls %v", fr.calls)
+	}
+	if !fr.ran("resize2fs", "/dev/dm-0") {
+		t.Fatalf("expected resize2fs against the mapper mount source; calls %v", fr.calls)
 	}
 }
