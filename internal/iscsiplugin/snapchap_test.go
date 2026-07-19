@@ -942,7 +942,13 @@ func TestNodeUnstageDerivedMultipath(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		wantMapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+		wantLink := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+		// flushMultipath resolves the by-id symlink before calling multipath -f
+		// (multipath rejects the symlink form with "device not found" -- live-verified).
+		wantMapper, rerr := filepath.EvalSymlinks(wantLink)
+		if rerr != nil {
+			t.Fatalf("resolving fake mapper link: %v", rerr)
+		}
 		if !fr.ran("multipath", "-f", wantMapper) {
 			t.Fatalf("expected the resolved mapper %s to be flushed; calls %v", wantMapper, fr.calls)
 		}

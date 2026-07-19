@@ -1212,6 +1212,12 @@ func (b *Backend) flushMultipath(ctx context.Context, mapper string) error {
 	if mapper == "" {
 		return nil
 	}
+	// multipath -f does NOT resolve the dm-uuid by-id symlink we track ("device
+	// not found", live-verified); it needs the real dm node. dmsetup below DOES
+	// accept the symlink, so only the flush argument is resolved.
+	if resolved, rerr := filepath.EvalSymlinks(mapper); rerr == nil {
+		mapper = resolved
+	}
 	_, err := b.run.Run(ctx, "multipath", "-f", mapper)
 	if err != nil {
 		_, err = b.run.Run(ctx, "multipath", "-f", mapper) // one retry
