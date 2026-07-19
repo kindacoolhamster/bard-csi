@@ -20,7 +20,7 @@ func TestISCSIGetCapacity(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"vgs": func([]string) (string, error) { return "  8053063680\n", nil },
 	}}
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	resp, err := b.GetCapacity(context.Background(), &bardplugin.GetCapacityRequest{Instance: "east"})
 	if err != nil || resp.AvailableBytes != 8053063680 {
 		t.Fatalf("want vg_free 8053063680, got %+v err=%v", resp, err)
@@ -31,7 +31,7 @@ func TestISCSIVolumeHealth(t *testing.T) {
 	gone := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
 	}}
-	b := New(eastInst(), "", "", "", "", gone)
+	b := New(eastInst(), "", "", "", "", "", gone)
 	h, err := b.GetVolumeHealth(context.Background(), &bardplugin.GetVolumeHealthRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}})
 	if err != nil || !h.Abnormal {
@@ -41,7 +41,7 @@ func TestISCSIVolumeHealth(t *testing.T) {
 
 func TestISCSINodeReclaimSpace(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	if _, err := b.NodeReclaimSpace(context.Background(), &bardplugin.NodeReclaimSpaceRequest{VolumePath: "/data"}); err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func TestISCSIListVolumes(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	vols, err := b.ListVolumes(context.Background(), &bardplugin.ListVolumesRequest{})
 	if err != nil {
 		t.Fatal(err)

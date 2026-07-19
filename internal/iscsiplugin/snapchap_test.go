@@ -59,7 +59,7 @@ func provisionRunner() *fakeRunner {
 // A thin instance provisions from the pool with -T/-V, never -L.
 func TestThinProvisioning(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -82,7 +82,7 @@ func TestThinProvisioning(t *testing.T) {
 // instance, overriding the instance default.
 func TestThinPoolStorageClassParam(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", "", fr) // no instance default
+	b := New(eastInst(), "", "", "", "", "", fr) // no instance default
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 		Parameters: map[string]string{paramThinPool: "sc-pool"},
@@ -108,7 +108,7 @@ func TestThinSnapshot(t *testing.T) {
 			return "1073741824\n", nil
 		},
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	resp, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name:         "snap1",
 		SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
@@ -150,7 +150,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 			return "", errors.New("Failed to find logical volume")
 		},
 	}}
-	b := New(eastInst(), "", "", "", "", thick)
+	b := New(eastInst(), "", "", "", "", "", thick)
 	if _, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name: "s", SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 	}); err == nil {
@@ -169,7 +169,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 // the LVM plugin doesn't have.
 func TestThinCloneRestoreExports(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "restored", Instance: "east", CapacityBytes: 1 << 30,
 		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "snap-abc"},
@@ -198,7 +198,7 @@ func TestISCSIListSnapshots(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func chapSetup(t *testing.T, lines string) (map[string]InstanceConfig, string) {
 func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\n")
 	fr := provisionRunner()
-	b := New(inst, "", "", dir, "", fr)
+	b := New(inst, "", "", dir, "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -249,7 +249,7 @@ func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 func TestControllerPublishSetsChapOnACL(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\nmutualuser\nmutualpass\n")
 	fr := &fakeRunner{}
-	b := New(inst, "", "", dir, "", fr)
+	b := New(inst, "", "", dir, "", "", fr)
 	lv := lvName("pvc-1")
 	resp, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv}, NodeID: "n1",
@@ -279,7 +279,7 @@ func TestNodeStageSetsChapBeforeLogin(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
-	b := New(inst, "n1", t.TempDir(), dir, "", fr)
+	b := New(inst, "n1", t.TempDir(), dir, "", "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 		StagingPath: t.TempDir() + "/stage",
@@ -312,7 +312,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 		"east": {VG: "bard-vg", Portal: "10.0.0.9:3260", CHAPAuth: true},
 	}
 	fr := &fakeRunner{}
-	b := New(inst, "", "", t.TempDir(), "", fr) // no credentials file
+	b := New(inst, "", "", t.TempDir(), "", "", fr) // no credentials file
 	if _, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err == nil {
@@ -323,7 +323,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	}
 
 	instBad, dir := chapSetup(t, "only-a-user\nsecret\ndangling-mutual-user\n") // 3 lines
-	b2 := New(instBad, "", "", dir, "", &fakeRunner{})
+	b2 := New(instBad, "", "", dir, "", "", &fakeRunner{})
 	if _, err := b2.chapFor("east"); err == nil {
 		t.Fatal("3-line credentials file must be rejected (mutual needs both lines)")
 	}
@@ -332,7 +332,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	// in a credential would split the `set auth` command at publish time --
 	// reject at load instead.
 	instWS, dirWS := chapSetup(t, "bard\npass word\n")
-	b3 := New(instWS, "", "", dirWS, "", &fakeRunner{})
+	b3 := New(instWS, "", "", dirWS, "", "", &fakeRunner{})
 	if _, err := b3.chapFor("east"); err == nil {
 		t.Fatal("credentials containing whitespace must be rejected")
 	}
@@ -346,7 +346,7 @@ func TestSnapshotAndCloneMissingSourceNotFound(t *testing.T) {
 			return "", errors.New("Failed to find logical volume \"bard-vg/bard-x\"")
 		},
 	}}
-	b := New(thinInst(), "", "", "", "", gone)
+	b := New(thinInst(), "", "", "", "", "", gone)
 	wantNotFound := func(err error, op string) {
 		t.Helper()
 		var se *bardplugin.StatusError
@@ -371,7 +371,7 @@ func TestCloneSourceWrongVGRejected(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	_, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "c", Instance: "east",
 		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "other-vg", Name: "snap-abc"},
@@ -392,7 +392,7 @@ func TestListSnapshotsSurvivesSourceDeletion(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -406,7 +406,7 @@ func TestListSnapshotsSurvivesSourceDeletion(t *testing.T) {
 // record: the device is derived exactly as NodeUnstage derives it.
 func TestNodePublishBlockDerivedDevice(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")
 	target := t.TempDir() + "/block-target"
 	if err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
@@ -444,7 +444,7 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-2")},
 		StagingPath: t.TempDir() + "/stage",
@@ -470,7 +470,7 @@ func TestDeleteVolumeAbsentBackstorePhrasing(t *testing.T) {
 		},
 		"lvremove": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
 	}}
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	if err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 	}); err != nil {
@@ -494,7 +494,7 @@ func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")
 	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
@@ -513,7 +513,7 @@ func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
 // Reads (lvs) stay plain.
 func TestLvmSelfManagedDevNodes(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -550,7 +550,7 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b := New(inst, "", "", dir, "", frPub)
+	b := New(inst, "", "", dir, "", "", frPub)
 	_, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	})
@@ -573,7 +573,7 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b2 := New(inst, "n1", t.TempDir(), dir, "", frStage)
+	b2 := New(inst, "n1", t.TempDir(), dir, "", "", frStage)
 	err = b2.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 		StagingPath: t.TempDir() + "/stage",
@@ -592,7 +592,7 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 // standing access to the LUN.
 func TestControllerUnpublishUnknownInstanceStillRevokes(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(map[string]InstanceConfig{}, "", "", "", "", fr) // nothing configured
+	b := New(map[string]InstanceConfig{}, "", "", "", "", "", fr) // nothing configured
 	if err := b.ControllerUnpublish(context.Background(), &bardplugin.ControllerUnpublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "gone", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err != nil {
@@ -612,7 +612,7 @@ func TestIscsiadmChroot(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "/host", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "/host", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 		StagingPath: t.TempDir() + "/stage",
@@ -633,7 +633,7 @@ func TestIscsiadmChroot(t *testing.T) {
 // Without chapAuth nothing changes: no auth on the ACL, authentication=0.
 func TestNoChapByDefault(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -643,7 +643,7 @@ func TestNoChapByDefault(t *testing.T) {
 		t.Fatalf("non-CHAP instance must keep authentication=0; calls %v", fr.calls)
 	}
 	fr2 := &fakeRunner{}
-	b2 := New(eastInst(), "", "", "", "", fr2)
+	b2 := New(eastInst(), "", "", "", "", "", fr2)
 	if _, err := b2.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err != nil {
@@ -755,7 +755,7 @@ func TestNodeStageMultipath(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
-	b := New(inst, "n1", t.TempDir(), dir, "", fr)
+	b := New(inst, "n1", t.TempDir(), dir, "", "", fr)
 	b.sysfsRoot, b.devRoot = multipathFixture(t, iqn, portals, wwid, wantID)
 
 	staging := t.TempDir() + "/stage"
@@ -811,7 +811,7 @@ func TestNodeStageSinglePortalUnchanged(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
-	b := New(eastInst(), "k3s-agent", t.TempDir(), "", "", fr)
+	b := New(eastInst(), "k3s-agent", t.TempDir(), "", "", "", fr)
 	staging := t.TempDir() + "/stage"
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
@@ -877,7 +877,7 @@ func TestNodeUnstageMultipathSurvivesPreLogoutReassembly(t *testing.T) {
 			return "", nil
 		},
 	}
-	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", fr)
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", "", fr)
 	staging := t.TempDir() + "/stage"
 	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
 	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
@@ -902,7 +902,7 @@ func TestNodeUnstageMultipath(t *testing.T) {
 		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
 		"dmsetup":  func([]string) (string, error) { return "", errors.New("Device does not exist") },
 	}}
-	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", fr)
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", "", fr)
 	staging := t.TempDir() + "/stage"
 	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
 	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
@@ -968,7 +968,7 @@ func TestNodeUnstageDerivedMultipath(t *testing.T) {
 		}
 		flushed := false
 		fr := &fakeRunner{}
-		b := New(inst, "n1", t.TempDir(), "", "", fr)
+		b := New(inst, "n1", t.TempDir(), "", "", "", fr)
 		sysfsRoot, devRoot := multipathFixture(t, iqn, portals[:1], wwid, id) // only portal[0] has a live leg
 		b.sysfsRoot, b.devRoot = sysfsRoot, devRoot
 		liveDev := b.byPath(portals[0], iqn, "0")
@@ -1012,7 +1012,7 @@ func TestNodeUnstageDerivedMultipath(t *testing.T) {
 				return "", nil
 			},
 		}}
-		b := New(inst, "n1", t.TempDir(), "", "", fr)
+		b := New(inst, "n1", t.TempDir(), "", "", "", fr)
 		staging := t.TempDir() + "/stage"
 		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
 			Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
@@ -1040,7 +1040,7 @@ func TestNodePublishBlockDerivedMultipathRefusesLeg(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"blockdev": func([]string) (string, error) { return "0\n", nil }, // nothing live anywhere
 	}}
-	b := New(inst, "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	b := New(inst, "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")
 	target := t.TempDir() + "/block-target"
 	err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
@@ -1070,7 +1070,7 @@ func TestNodeExpandMultipath(t *testing.T) {
 		},
 		"dmsetup": func([]string) (string, error) { return "bard-mpath-abc123\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr)
 	if _, err := b.NodeExpand(context.Background(), &bardplugin.NodeExpandRequest{VolumePath: "/data"}); err != nil {
 		t.Fatal(err)
 	}

@@ -165,6 +165,12 @@ const (
 	CodeNotFound      ErrorCode = "NotFound"
 	CodeAlreadyExists ErrorCode = "AlreadyExists"
 	CodeInvalidArg    ErrorCode = "InvalidArgument"
+	// CodeUnsupported signals a request that is well-formed but permanently
+	// unsupported by this backend/instance (e.g. an operation a particular
+	// management mode cannot do safely). Bard maps it to a TERMINAL,
+	// non-retried CSI failure -- unlike CodeInvalidArg this is not about a bad
+	// request, but a capability the plugin will never grant on retry.
+	CodeUnsupported ErrorCode = "Unsupported"
 )
 
 // Error is the JSON body returned with a non-200 status.

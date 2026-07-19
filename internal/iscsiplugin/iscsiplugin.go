@@ -39,8 +39,9 @@
 // StorageClass, the volume context, or the PublishContext (which lands in the
 // API-visible VolumeAttachment).
 //
-// Multipath and remote LIO management (targetd) are deliberately out of scope;
-// like the other plugins this depends only on the public bardplugin SDK.
+// dm-multipath (instance portals list) and remote LIO management (per-instance
+// management: targetd) are supported; like the other plugins this depends only
+// on the public bardplugin SDK.
 package iscsiplugin
 
 import (
@@ -65,6 +66,10 @@ const (
 	// iscsiIface is the dedicated iscsiadm iface the node logs in under, so the
 	// per-node initiator IQN is set without touching the host initiatorname.
 	iscsiIface = "bard"
+	// mgmtLocal/mgmtTargetd are the recognized InstanceConfig.Management values;
+	// mgmtLocal is also the effective default when Management is "".
+	mgmtLocal   = "local"
+	mgmtTargetd = "targetd"
 )
 
 // supportedFsTypes mirrors the other plugins' allowlist so an unknown type fails
@@ -95,7 +100,31 @@ type InstanceConfig struct {
 	// in this config (it ships in a ConfigMap): they are read from the mounted
 	// Secret file <chap-dir>/<instance> -- see chapFor for the format.
 	CHAPAuth bool `json:"chapAuth,omitempty"`
+
+	// Management selects how this instance's LIO export(s) are administered.
+	// "" or "local" (the default) drives targetcli directly against the
+	// plugin's own host/configfs, as documented above -- unchanged. "targetd"
+	// instead manages a REMOTE LIO host over targetd's JSON-RPC API, for a
+	// control plane that does not run on the target node itself. inst()
+	// rejects any other value.
+	Management string `json:"management,omitempty"`
+	// TargetdEndpoint is the targetd JSON-RPC endpoint (e.g.
+	// "http://host:18700/targetrpc"). Required when Management is "targetd".
+	TargetdEndpoint string `json:"targetdEndpoint,omitempty"`
+	// TargetdPool is the targetd-side storage pool volumes are carved from
+	// (targetd owns this pool remotely -- a targetd instance has no local VG).
+	// Required when Management is "targetd".
+	TargetdPool string `json:"targetdPool,omitempty"`
+	// TargetIQN is the IQN of the single target targetd manages: unlike the
+	// local one-target-per-volume model, targetd exposes every volume as a
+	// LUN under ONE fixed target, matching targetd's API shape. Required when
+	// Management is "targetd".
+	TargetIQN string `json:"targetIqn,omitempty"`
 }
+
+// isTargetd reports whether this instance's LIO export is administered
+// remotely via targetd rather than local targetcli.
+func (ic InstanceConfig) isTargetd() bool { return ic.Management == mgmtTargetd }
 
 // portalList is the single read path for an instance's portal(s): Portals if
 // non-empty, else the single Portal wrapped in a one-element list, else nil.
@@ -117,6 +146,10 @@ type Backend struct {
 	nodeID    string // CSI node id (node plane only); source of this node's initiator IQN
 	stateDir  string // node-plane: records per-staging-path session state for unstage
 	chapDir   string // dir of per-instance CHAP credential files (mounted Secret)
+	// targetdDir is the dir of per-instance targetd JSON-RPC credential files
+	// (mounted Secret), read only for instances with management: targetd --
+	// see targetdCredsFor for the format. Mirrors chapDir.
+	targetdDir string
 	// iscsiadmChroot, when set (node plane, in-cluster), runs every iscsiadm
 	// through `chroot <dir>` so the HOST's own initiator stack is used -- see
 	// the iscsiadm method for why that is required.
@@ -134,14 +167,17 @@ type Backend struct {
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
 // the node plane (the controller plane passes ""); chapDir is where per-instance
 // CHAP credential files are mounted (both planes need it when chapAuth is on);
-// iscsiadmChroot optionally chroots iscsiadm into the host root (node plane,
-// in-cluster -- empty runs it directly, e.g. on a host or in the test harness).
-func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, iscsiadmChroot string, run Runner) *Backend {
+// targetdDir is where per-instance targetd JSON-RPC credential files are mounted
+// (both planes need it for a management: targetd instance -- see
+// targetdCredsFor); iscsiadmChroot optionally chroots iscsiadm into the host
+// root (node plane, in-cluster -- empty runs it directly, e.g. on a host or in
+// the test harness).
+func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, targetdDir, iscsiadmChroot string, run Runner) *Backend {
 	if run == nil {
 		run = ExecRunner{}
 	}
 	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir,
-		iscsiadmChroot: iscsiadmChroot, run: run, sysfsRoot: "/sys", devRoot: "/dev"}
+		targetdDir: targetdDir, iscsiadmChroot: iscsiadmChroot, run: run, sysfsRoot: "/sys", devRoot: "/dev"}
 }
 
 // iscsiadm runs iscsiadm, chrooted into the host root when configured.
@@ -186,8 +222,23 @@ func lvName(csiName string) string {
 func (b *Backend) inst(instance string) (InstanceConfig, error) {
 	ic, ok := b.instances[instance]
 	portals := ic.portalList()
-	if !ok || ic.VG == "" || len(portals) == 0 {
-		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: instance %q not configured (need vg + portal)", instance)
+	switch ic.Management {
+	case "", mgmtLocal:
+		// Local (targetcli-driven) instance -- unchanged validation, byte-for-byte:
+		// an unconfigured instance and a configured-but-underspecified one share
+		// this one error.
+		if !ok || ic.VG == "" || len(portals) == 0 {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: instance %q not configured (need vg + portal)", instance)
+		}
+	case mgmtTargetd:
+		// targetd manages its own remote storage pool -- no local VG here.
+		if !ok || ic.TargetdEndpoint == "" || ic.TargetdPool == "" || ic.TargetIQN == "" || len(portals) == 0 {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q management=targetd not configured (need targetdEndpoint + targetdPool + targetIqn + portal)", instance)
+		}
+	default:
+		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+			"iscsi: instance %q has unknown management %q (want \"local\" or \"targetd\")", instance, ic.Management)
 	}
 	for _, p := range portals {
 		// Bracketed IPv6 portals ("[::1]:3260") are out of scope this round: the
@@ -405,6 +456,61 @@ func (b *Backend) chapFor(instance string) (*chapCreds, error) {
 	}
 }
 
+// targetdCreds is the HTTP Basic Auth identity a targetd-managed instance's
+// JSON-RPC client authenticates with (see the targetd JSON-RPC client, added
+// in a follow-up task).
+type targetdCreds struct {
+	User, Password string
+}
+
+// targetdCredsFor loads the targetd JSON-RPC credentials for a
+// management: targetd instance, or nil when the instance is not
+// targetd-managed. The credential file is <targetdDir>/<instance> (a mounted
+// Secret key), containing exactly 2 non-empty lines:
+//
+//	username
+//	password
+//
+// Reuses chapFor's parsing/whitespace discipline line-for-line (trim blank
+// lines, reject embedded whitespace/quotes): a targetd instance is just as
+// unforgiving about credential hygiene as a CHAP one, and there is no reason
+// to invent a second convention. A targetd instance with unreadable or
+// malformed credentials is an error, not a silent fallback -- and the error
+// names only the file PATH, never its contents.
+func (b *Backend) targetdCredsFor(instance string) (*targetdCreds, error) {
+	ic, ok := b.instances[instance]
+	if !ok || !ic.isTargetd() {
+		return nil, nil
+	}
+	path := filepath.Join(b.targetdDir, instance)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: instance %q is management=targetd but credentials at %s are unreadable: %v", instance, path, err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	for _, l := range lines {
+		// The credentials become an HTTP Basic Auth header; whitespace/quotes
+		// would at best be silently mangled and at worst inject stray header
+		// content -- reject at load instead, matching chapFor's argv-safety
+		// rationale for the same class of mistake.
+		if strings.ContainsAny(l, " \t'\"") {
+			return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: targetd credentials at %s must not contain whitespace or quotes", path)
+		}
+	}
+	if len(lines) != 2 {
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: targetd credentials at %s must be 2 lines (username, password), got %d", path, len(lines))
+	}
+	return &targetdCreds{User: lines[0], Password: lines[1]}, nil
+}
+
 // lvmUdevConfig makes lvm create and remove /dev nodes itself instead of
 // deferring to udev. In a container there is no udev to serve an activation
 // (the host udevd's completion handshake lives in the host IPC namespace), so
@@ -449,6 +555,16 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if err != nil {
 		return nil, err
 	}
+	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
+	if ic.isTargetd() && isClone {
+		// targetd's vol_copy is a synchronous full copy: unsafe to drive under
+		// CSI provisioner retries (a retried CreateVolume could pile up
+		// concurrent full copies, or double-bill the copy time on every retry).
+		// Reject fail-fast rather than silently hang a PVC restore/clone.
+		return nil, bardplugin.Errorf(bardplugin.CodeUnsupported,
+			"iscsi: creating a volume from a snapshot or another volume is not supported on targetd-managed instance %q "+
+				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots and clones", req.Instance)
+	}
 	vg, lv := ic.VG, lvName(req.Name)
 
 	// 1. The backing LV (idempotent via size check, like the LVM plugin).
@@ -456,7 +572,6 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if err != nil {
 		return nil, err
 	}
-	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
 	switch {
 	case found:
 		// Idempotent retry: an LV at least as large as requested satisfies the
@@ -659,6 +774,19 @@ func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolume
 // so it is rejected. The snapshot is a control-plane object -- it gets NO LIO
 // export; a restore clones it into a new volume with its own target.
 func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
+	// Unlike the rest of this method (historically instance-agnostic: it works
+	// purely off src.Location/src.Name), this needs the INSTANCE to know
+	// whether it's targetd-managed -- targetd's vol_copy is a synchronous full
+	// copy, unsafe under provisioner retries.
+	ic, err := b.inst(req.SourceVolume.Instance)
+	if err != nil {
+		return nil, err
+	}
+	if ic.isTargetd() {
+		return nil, bardplugin.Errorf(bardplugin.CodeUnsupported,
+			"iscsi: snapshots are not supported on targetd-managed instance %q "+
+				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots", req.SourceVolume.Instance)
+	}
 	src := req.SourceVolume // Location=vg, Name=lv
 	thin, exists, err := b.isThinLV(ctx, src.Location, src.Name)
 	if err != nil {

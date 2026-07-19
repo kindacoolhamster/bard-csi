@@ -119,6 +119,15 @@ func TestClientServerRoundtrip(t *testing.T) {
 	if !errors.Is(err, backend.ErrAlreadyExists) {
 		t.Fatalf("want ErrAlreadyExists, got %v", err)
 	}
+
+	// Error code mapping: Unsupported -> backend.ErrUnsupported, which the
+	// driver's toStatus maps to codes.Unimplemented -- a terminal, non-retried
+	// CSI failure (see internal/driver/controller.go toStatus).
+	fb.createErr = bardplugin.Errorf(bardplugin.CodeUnsupported, "not supported on this instance")
+	_, err = cl.CreateVolume(ctx, &backend.CreateVolumeRequest{Name: "y", Instance: "east"})
+	if !errors.Is(err, backend.ErrUnsupported) {
+		t.Fatalf("want ErrUnsupported, got %v", err)
+	}
 }
 
 // TestDialContractVersion verifies Dial's wire-contract gate: the SDK-filled

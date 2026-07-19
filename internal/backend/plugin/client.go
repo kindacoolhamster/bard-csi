@@ -122,6 +122,13 @@ func mapError(body []byte, status int) error {
 		return fmt.Errorf("%w: %s", backend.ErrAlreadyExists, e.Message)
 	case bardplugin.CodeInvalidArg:
 		return fmt.Errorf("%w: %s", backend.ErrInvalidArgument, e.Message)
+	case bardplugin.CodeUnsupported:
+		// Same terminal (non-retried) sentinel every optional-capability gap
+		// already uses (GetCapacity, ModifyVolume, ...) -- toStatus maps it to
+		// codes.Unimplemented, so a plugin-declared permanent "no" here gets
+		// the same terminal treatment as a plugin that never implemented the
+		// call at all.
+		return fmt.Errorf("%w: %s", backend.ErrUnsupported, e.Message)
 	default:
 		return fmt.Errorf("plugin error: %s", e.Message)
 	}
