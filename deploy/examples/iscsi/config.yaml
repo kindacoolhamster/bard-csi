@@ -18,6 +18,12 @@ data:
       galileo:
         vg: bard-vg
         portal: 192.0.2.1:3260
+        # portals: ["192.0.2.1:3260", "192.0.2.2:3260"]
+        #                                # 2+ entries turn on dm-multipath: the target gets one
+        #                                # explicit LIO portal per address, the node logs in to
+        #                                # all of them and mounts the multipathd-assembled mapper
+        #                                # device. Needs multipathd running on every node (host
+        #                                # prereq, like iscsid). Overrides `portal` when set.
         # iqnBase: iqn.2025-01.io.bard   # default; target/initiator names derive from it
         # thinPool: bard-thin            # provision thin LVs from this pool -> snapshots/clone
         #                                # (pre-create: lvcreate --type thin-pool -L <size> -n bard-thin <vg>;

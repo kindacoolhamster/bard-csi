@@ -117,7 +117,24 @@ credentials on the command line, so the password is briefly visible in
 target IQNs; CHAP + per-node ACLs gate the actual login, but keep the portal on
 a network initiators belong on.
 
+## Multipath (2+ portals)
+
+Give an instance a `portals` list (see `config.yaml`) and every volume's target
+is created with one **explicit LIO portal per address** (the catch-all default
+portal -- `::0:3260` on current targetcli, `0.0.0.0:3260` historically -- is
+removed so each address is a distinct path). The node plane logs in through
+every portal and mounts the **multipathd-assembled mapper device** (tracked via
+its `/dev/disk/by-id/dm-uuid-mpath-*` link, so the host's map-naming policy
+does not matter); path failover/recovery is the host multipathd's job.
+NodeUnstage flushes the map before logging out -- the authoritative "map gone"
+check runs *after* logout, because a flushed map re-assembles while its paths
+are still live. **Host prereq: multipathd running on every node** (same class
+as iscsid); single-portal instances behave exactly as before, no multipathd
+needed. Proven end to end by `hack/iscsi-multipath-test.sh` (including a
+traffic-cut failover under live I/O) and in-cluster (portal-IP loss under a
+running pod, online expand through the mapper, restart-then-delete leak check).
+
 ## Not yet (follow-ups)
 
-Multipath, and remote LIO management (`targetd`) for a fully in-cluster control
-plane on a node that isn't the target host.
+Remote LIO management (`targetd`) for a fully in-cluster control plane on a
+node that isn't the target host.

@@ -675,9 +675,27 @@ Record your cluster's actual addresses in `CLAUDE.local.md`.
   `feat/iscsi-snapshots-chap`): thin-LV snapshots/restore/clone mirroring the LVM
   plugin (instance/SC `thinPool`; clone exported through its own target, fs grown
   at stage) + per-instance CHAP (`chapAuth: true`, creds Secret mounted on both
-  planes) -- all live-proven by the extended `hack/iscsi-plugin-test.sh`. The
-  iSCSI remaining follow-ups: multipath, and remote LIO management (`targetd`)
-  for a fully in-cluster control plane on a non-target node.
+  planes) -- all live-proven by the extended `hack/iscsi-plugin-test.sh`.
+  **iSCSI dm-multipath: DONE** (2026-07-19, branch feat/iscsi-multipath):
+  instance `portals` list (2+ entries) -> explicit per-address LIO portals
+  (must delete BOTH default-portal forms first -- current targetcli auto-creates
+  `::0:3260` dual-stack, not `0.0.0.0:3260`; deleting a portal only removes the
+  LISTENER, live sessions survive), node logs in through every portal and mounts
+  the multipathd-assembled mapper via its `dm-uuid-mpath-<wwid>` by-id link
+  (name-independent; wwid from sysfs, `naa.<hex>` -> mpath id `3<hex>`; `multipath
+  -f` REJECTS the by-id symlink -- resolve to the dm node first). NodeUnstage
+  flushes best-effort BEFORE logout but takes its authoritative map-gone check
+  AFTER -- a flushed map re-assembles while paths live (wedged in-cluster unstage
+  forever until reordered). PublishContext gains `portals` (additive; `portal`
+  stays = first). Host prereq: multipathd on nodes. Proven: unit suite,
+  `hack/iscsi-multipath-test.sh` (traffic-cut failover under live I/O -- LIO
+  portal delete does NOT fail a path), single-portal harness + conformance
+  regressions, and fully in-cluster (2-node k3s: cross-node 2-path mapper mount,
+  portal-IP loss under live I/O, recovery, online expand through the mapper via
+  in-container `multipathd resize map`, snapshot/restore each with own map,
+  plugin-restart + delete-all -> zero leaked sessions/maps/LVs). The iSCSI
+  remaining follow-up: remote LIO management (`targetd`) for a fully in-cluster
+  control plane on a non-target node.
 - **ListVolumes / ListSnapshots: DONE (all first-party Go plugins).** Optional CSI
   RPCs, aggregated + paginated (offset token) in core across backends, snapshots
   filterable by source/snapshot id; advertised only when a registered backend
