@@ -67,6 +67,29 @@ func (f *fakeRunner) ranArg(name, exactArg string) bool {
 	return false
 }
 
+// callIndex returns the position of the first call to name whose remaining args
+// EXACTLY match wantArgs (length and order), or -1. Needed to pin the multi-portal
+// delete-then-create SEQUENCE, where ran()'s substring-anywhere match can't tell
+// order apart.
+func callIndex(f *fakeRunner, name string, wantArgs ...string) int {
+	for i, c := range f.calls {
+		if c[0] != name || len(c)-1 != len(wantArgs) {
+			continue
+		}
+		match := true
+		for j, a := range wantArgs {
+			if c[1+j] != a {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
 func eastInst() map[string]InstanceConfig {
 	return map[string]InstanceConfig{"east": {VG: "bard-vg", Portal: "10.0.0.9:3260"}}
 }
@@ -79,6 +102,71 @@ func TestInfoAdvertisesAttach(t *testing.T) {
 	}
 	if !caps.BlockDevice || !caps.Snapshots {
 		t.Fatalf("unexpected caps: %+v", caps)
+	}
+}
+
+// TestPortalListFallback pins InstanceConfig.portalList()'s precedence: Portals
+// wins when set (even alongside a legacy Portal), else the single Portal is
+// wrapped into a one-element list, else empty.
+func TestPortalListFallback(t *testing.T) {
+	cases := []struct {
+		name string
+		ic   InstanceConfig
+		want []string
+	}{
+		{"portal-only", InstanceConfig{Portal: "10.0.0.9:3260"}, []string{"10.0.0.9:3260"}},
+		{"portals-only", InstanceConfig{Portals: []string{"10.0.0.9:3260", "10.0.0.10:3260"}}, []string{"10.0.0.9:3260", "10.0.0.10:3260"}},
+		{"both-set-portals-wins", InstanceConfig{Portal: "10.0.0.1:3260", Portals: []string{"10.0.0.9:3260", "10.0.0.10:3260"}}, []string{"10.0.0.9:3260", "10.0.0.10:3260"}},
+		{"neither", InstanceConfig{}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := c.ic.portalList()
+			if !equalStrings(got, c.want) {
+				t.Fatalf("portalList() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestInstPortalsOnlyValid: inst() must accept an instance configured with ONLY
+// Portals (no legacy Portal), and still reject one with neither.
+func TestInstPortalsOnlyValid(t *testing.T) {
+	withPortals := New(map[string]InstanceConfig{
+		"east": {VG: "bard-vg", Portals: []string{"10.0.0.9:3260", "10.0.0.10:3260"}},
+	}, "", "", "", "", &fakeRunner{})
+	if _, err := withPortals.inst("east"); err != nil {
+		t.Fatalf("inst() must accept vg+portals (no single Portal), got %v", err)
+	}
+
+	withNeither := New(map[string]InstanceConfig{
+		"east": {VG: "bard-vg"},
+	}, "", "", "", "", &fakeRunner{})
+	if _, err := withNeither.inst("east"); err == nil {
+		t.Fatal("inst() must reject an instance with neither Portal nor Portals")
+	}
+}
+
+func TestInstRejectsBracketedPortal(t *testing.T) {
+	// Bracketed IPv6 portals are out of scope (splitPortal is proven only for
+	// plain ip:port); inst() must reject them loudly, not mis-split silently.
+	b := New(map[string]InstanceConfig{
+		"east": {VG: "bard-vg", Portals: []string{"10.0.0.9:3260", "[::1]:3260"}},
+	}, "", "", "", "", &fakeRunner{})
+	if _, err := b.inst("east"); err == nil {
+		t.Fatal("inst() must reject a bracketed IPv6 portal")
 	}
 }
 
@@ -173,6 +261,91 @@ func TestCreateVolumeIdempotent(t *testing.T) {
 	}
 }
 
+// TestCreateVolumeExplicitPortals: a 2+-portal instance gets explicit per-address
+// LIO portals on its tpg -- the default targetcli-created portal must be torn
+// down first. Substrate-verified 2026-07-19: modern targetcli auto-creates the
+// default as dual-stack "::0:3260" (IPv6-any, which also holds port 3260 for
+// v4), NOT "0.0.0.0:3260" -- so BOTH forms are attempted for delete, in that
+// order, before the per-portal creates. Also proves the not-found/exists
+// classifiers tolerate the live-observed phrasings ("No such NetworkPortal in
+// configfs" on delete, "already exists in configFS" on create) instead of
+// failing CreateVolume.
+func TestCreateVolumeExplicitPortals(t *testing.T) {
+	created := false
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"lvs": func([]string) (string, error) {
+			if !created {
+				return "", errors.New("Failed to find logical volume")
+			}
+			return "  1073741824\n", nil
+		},
+		"lvcreate": func([]string) (string, error) { created = true; return "", nil },
+		"targetcli": func(args []string) (string, error) {
+			joined := strings.Join(args, " ")
+			switch {
+			case strings.Contains(joined, "/portals delete 0.0.0.0 3260"):
+				// The live default is dual-stack ::0, so the legacy v4-only form is
+				// absent -- a not-found that must be tolerated, not fatal.
+				return "", errors.New("No such NetworkPortal in configfs: 0.0.0.0:3260")
+			case strings.Contains(joined, "/portals delete ::0 3260"):
+				return "", nil // the actual live default, removed cleanly
+			case strings.Contains(joined, "/portals create 10.0.0.10 3260"):
+				// One portal already present from a retried create -- tolerated.
+				return "", errors.New("Network Portal 10.0.0.10:3260 already exists in configFS")
+			default:
+				return "", nil
+			}
+		},
+	}}
+	instances := map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: []string{"10.0.0.9:3260", "10.0.0.10:3260"}}}
+	b := New(instances, "", "", "", "", fr)
+	lv := lvName("pvc-1")
+	tpg := tpgPath(targetIQN(defaultIQNBase, lv))
+
+	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
+		Name: "pvc-1", Instance: "east", CapacityBytes: 1 << 30,
+	}); err != nil {
+		t.Fatalf("CreateVolume must converge despite tolerated not-found/exists on portal calls, got %v", err)
+	}
+
+	idxDel4 := callIndex(fr, "targetcli", tpg+"/portals", "delete", "0.0.0.0", "3260")
+	idxDel6 := callIndex(fr, "targetcli", tpg+"/portals", "delete", "::0", "3260")
+	idxC1 := callIndex(fr, "targetcli", tpg+"/portals", "create", "10.0.0.9", "3260")
+	idxC2 := callIndex(fr, "targetcli", tpg+"/portals", "create", "10.0.0.10", "3260")
+	if idxDel4 < 0 || idxDel6 < 0 || idxC1 < 0 || idxC2 < 0 {
+		t.Fatalf("missing expected portal calls (del4=%d del6=%d c1=%d c2=%d); calls=%v", idxDel4, idxDel6, idxC1, idxC2, fr.calls)
+	}
+	if !(idxDel4 < idxDel6 && idxDel6 < idxC1 && idxC1 < idxC2) {
+		t.Fatalf("expected order: delete 0.0.0.0 3260, delete ::0 3260, create per portal; got indices del4=%d del6=%d c1=%d c2=%d; calls=%v",
+			idxDel4, idxDel6, idxC1, idxC2, fr.calls)
+	}
+}
+
+// TestCreateVolumeSinglePortalNoPortalsCommands is the regression pin: a
+// single-portal instance's CreateVolume must stay byte-identical to before this
+// task -- no /portals delete/create calls at all.
+func TestCreateVolumeSinglePortalNoPortalsCommands(t *testing.T) {
+	created := false
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"lvs": func([]string) (string, error) {
+			if !created {
+				return "", errors.New("Failed to find logical volume")
+			}
+			return "  1073741824\n", nil
+		},
+		"lvcreate": func([]string) (string, error) { created = true; return "", nil },
+	}}
+	b := New(eastInst(), "", "", "", "", fr)
+	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
+		Name: "pvc-1", Instance: "east", CapacityBytes: 1 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fr.ran("targetcli", "/portals") {
+		t.Fatalf("single-portal CreateVolume must not touch /portals at all; calls=%v", fr.calls)
+	}
+}
+
 // ControllerPublish masks the LUN to the node and returns the connection context.
 func TestControllerPublishMasksAndReturnsContext(t *testing.T) {
 	fr := &fakeRunner{}
@@ -203,6 +376,41 @@ func TestControllerPublishIdempotent(t *testing.T) {
 		Volume: bardplugin.VolumeRef{Instance: "east", Name: lvName("pvc-1")}, NodeID: "n",
 	}); err != nil {
 		t.Fatalf("re-publish must be idempotent, got %v", err)
+	}
+}
+
+// TestPublishContextCarriesPortals: a 2+-portal instance's PublishContext keeps
+// `portal` as the first address (unchanged single-portal semantics for the
+// node plane, which lands in task 2.2) and additively gains `portals` as the
+// full comma-joined list. A single-portal instance must NOT carry the `portals`
+// key at all -- the wire contract stays additive-only.
+func TestPublishContextCarriesPortals(t *testing.T) {
+	multi := New(map[string]InstanceConfig{
+		"east": {VG: "bard-vg", Portals: []string{"10.0.0.9:3260", "10.0.0.10:3260"}},
+	}, "", "", "", "", &fakeRunner{})
+	resp, err := multi.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
+		Volume: bardplugin.VolumeRef{Instance: "east", Name: lvName("pvc-1")}, NodeID: "n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc := resp.PublishContext
+	if pc[ctxPortal] != "10.0.0.9:3260" {
+		t.Fatalf("expected ctxPortal = first portal, got %q", pc[ctxPortal])
+	}
+	if pc[ctxPortals] != "10.0.0.9:3260,10.0.0.10:3260" {
+		t.Fatalf("expected ctxPortals = comma-joined full list, got %q", pc[ctxPortals])
+	}
+
+	single := New(eastInst(), "", "", "", "", &fakeRunner{})
+	resp2, err := single.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
+		Volume: bardplugin.VolumeRef{Instance: "east", Name: lvName("pvc-1")}, NodeID: "n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := resp2.PublishContext[ctxPortals]; ok {
+		t.Fatalf("single-portal publish must NOT carry a portals key (regression pin), got %+v", resp2.PublishContext)
 	}
 }
 

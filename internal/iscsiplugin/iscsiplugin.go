@@ -78,9 +78,15 @@ var supportedFsTypes = map[string]bool{
 // IQN prefix for derived target/initiator names. Access is controlled by per-node
 // ACLs, plus CHAP when enabled.
 type InstanceConfig struct {
-	VG      string `json:"vg"`                // VG to carve LUN backstores from
-	Portal  string `json:"portal"`            // iSCSI portal "ip:port" nodes connect to
-	IQNBase string `json:"iqnBase,omitempty"` // IQN prefix (default iqn.2025-01.io.bard)
+	VG     string `json:"vg"`     // VG to carve LUN backstores from
+	Portal string `json:"portal"` // iSCSI portal "ip:port" nodes connect to
+	// Portals is an optional list of "ip:port" portals for dm-multipath (one LIO
+	// network portal per address, so a node logs in over every path). When set it
+	// WINS over the single Portal (even if both are present); Portal alone still
+	// works unchanged for every existing single-path instance. Use portalList() to
+	// read either field, never Portal/Portals directly.
+	Portals []string `json:"portals,omitempty"`
+	IQNBase string   `json:"iqnBase,omitempty"` // IQN prefix (default iqn.2025-01.io.bard)
 	// ThinPool is the instance default thin pool: when set (and not overridden by
 	// the StorageClass thinPool parameter), volumes are thin copy-on-write LVs from
 	// that pre-created pool -- what enables snapshots/clone -- instead of thick ones.
@@ -89,6 +95,20 @@ type InstanceConfig struct {
 	// in this config (it ships in a ConfigMap): they are read from the mounted
 	// Secret file <chap-dir>/<instance> -- see chapFor for the format.
 	CHAPAuth bool `json:"chapAuth,omitempty"`
+}
+
+// portalList is the single read path for an instance's portal(s): Portals if
+// non-empty, else the single Portal wrapped in a one-element list, else nil.
+// Every direct Portal/Portals read in this file goes through this so the
+// single-vs-multi-portal decision lives in exactly one place.
+func (ic InstanceConfig) portalList() []string {
+	if len(ic.Portals) > 0 {
+		return ic.Portals
+	}
+	if ic.Portal != "" {
+		return []string{ic.Portal}
+	}
+	return nil
 }
 
 // Backend implements bardplugin.Backend (+ ControllerPublisher) for iSCSI.
@@ -158,8 +178,18 @@ func lvName(csiName string) string {
 
 func (b *Backend) inst(instance string) (InstanceConfig, error) {
 	ic, ok := b.instances[instance]
-	if !ok || ic.VG == "" || ic.Portal == "" {
+	portals := ic.portalList()
+	if !ok || ic.VG == "" || len(portals) == 0 {
 		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: instance %q not configured (need vg + portal)", instance)
+	}
+	for _, p := range portals {
+		// Bracketed IPv6 portals ("[::1]:3260") are out of scope this round: the
+		// explicit multi-portal split (splitPortal) is only proven against plain
+		// "ip:port". Reject clearly here rather than risk a silent mis-split later.
+		if strings.Contains(p, "[") {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q portal %q: bracketed IPv6 portals are not supported", instance, p)
+		}
 	}
 	if ic.IQNBase == "" {
 		ic.IQNBase = defaultIQNBase
@@ -485,6 +515,13 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if _, err := b.run.Run(ctx, "targetcli", "/iscsi", "create", iqn); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: create target %s: %w", iqn, err)
 	}
+	// dm-multipath: a 2+-portal instance gets one explicit LIO network portal per
+	// configured address, replacing targetcli's auto-created default.
+	if portals := ic.portalList(); len(portals) >= 2 {
+		if err := b.setExplicitPortals(ctx, tpgPath(iqn), portals); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn)+"/luns", "create", backstore(lv)); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: map lun for %s: %w", iqn, err)
 	}
@@ -512,6 +549,45 @@ func lvBytes(b int64) string {
 		b = 1 << 20
 	}
 	return strconv.FormatInt(b, 10) + "b"
+}
+
+// setExplicitPortals replaces a tpg's auto-created default network portal with
+// one explicit portal per configured address -- what makes dm-multipath login
+// possible (a node needs a distinct path per portal to build multiple sessions
+// to the same LUN). Substrate-verified 2026-07-19: modern targetcli auto-creates
+// the default as dual-stack "::0:3260" (IPv6-any, which also holds port 3260 for
+// v4), NOT "0.0.0.0:3260" as older targetcli/kernels did -- so both forms are
+// attempted for delete, in that order, each tolerating not-found (observed live
+// phrasing: "No such NetworkPortal in configfs: ..."). Each create tolerates
+// already-exists so a retried CreateVolume converges.
+func (b *Backend) setExplicitPortals(ctx context.Context, tpg string, portals []string) error {
+	if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "delete", "0.0.0.0", "3260"); err != nil && !isNotFound(err) {
+		return fmt.Errorf("iscsi: delete default portal 0.0.0.0:3260 on %s: %w", tpg, err)
+	}
+	if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "delete", "::0", "3260"); err != nil && !isNotFound(err) {
+		return fmt.Errorf("iscsi: delete default portal ::0:3260 on %s: %w", tpg, err)
+	}
+	for _, p := range portals {
+		ip, port, err := splitPortal(p)
+		if err != nil {
+			return err
+		}
+		if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "create", ip, port); err != nil && !isExists(err) {
+			return fmt.Errorf("iscsi: create portal %s on %s: %w", p, tpg, err)
+		}
+	}
+	return nil
+}
+
+// splitPortal splits an "ip:port" portal string on the LAST colon. Bracketed
+// IPv6 portals are rejected earlier at inst() validation, so any colon here is
+// the ip:port separator, not part of an IPv6 address.
+func splitPortal(portal string) (ip, port string, err error) {
+	i := strings.LastIndex(portal, ":")
+	if i < 0 {
+		return "", "", bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: malformed portal %q (want ip:port)", portal)
+	}
+	return portal[:i], portal[i+1:], nil
 }
 
 // DeleteVolume tears the export down then removes the LV, in dependency order
@@ -610,10 +686,14 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnap
 // ---- control-plane attach (ControllerPublisher) --------------------------
 
 // ctxPortal/ctxIQN/ctxLUN are the PublishContext keys carried to NodeStage.
+// ctxPortals is additive: only present for a 2+-portal instance (dm-multipath),
+// so a single-portal PublishContext is byte-identical to before this field
+// existed.
 const (
-	ctxPortal = "portal"
-	ctxIQN    = "targetIqn"
-	ctxLUN    = "lun"
+	ctxPortal  = "portal"
+	ctxIQN     = "targetIqn"
+	ctxLUN     = "lun"
+	ctxPortals = "portals"
 )
 
 // ControllerPublish masks this volume's LUN to the node by adding an ACL for the
@@ -648,11 +728,16 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 				redactSecrets(err, chap.Password, chap.MutualPassword))
 		}
 	}
-	return &bardplugin.ControllerPublishResponse{PublishContext: map[string]string{
-		ctxPortal: ic.Portal,
+	portals := ic.portalList()
+	pc := map[string]string{
+		ctxPortal: portals[0],
 		ctxIQN:    iqn,
 		ctxLUN:    "0",
-	}}, nil
+	}
+	if len(portals) >= 2 {
+		pc[ctxPortals] = strings.Join(portals, ",")
+	}
+	return &bardplugin.ControllerPublishResponse{PublishContext: pc}, nil
 }
 
 // ControllerUnpublish removes the node's ACL, revoking its access. Idempotent: a
@@ -788,7 +873,10 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	iqn := req.PublishContext[ctxIQN]
 	lun := req.PublishContext[ctxLUN]
 	if portal == "" {
-		portal = ic.Portal
+		// Node-plane multipath (logging in over every portal) is task 2.2; for now
+		// this fallback keeps single-portal semantics -- the first configured
+		// portal, same as before portalList() existed.
+		portal = ic.portalList()[0]
 	}
 	if iqn == "" {
 		iqn = targetIQN(ic.IQNBase, req.Volume.Name)
@@ -911,11 +999,16 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 		if base == "" {
 			base = defaultIQNBase
 		}
-		if ic.Portal == "" {
+		pl := ic.portalList()
+		if len(pl) == 0 {
 			return nil // instance unknown: nothing derivable, nothing to log out of
 		}
+		// Node-plane multipath (a session per portal) is task 2.2; for now this
+		// derived-logout fallback keeps single-portal semantics -- the first
+		// configured portal, same as before portalList() existed.
+		portal := pl[0]
 		iqn := targetIQN(base, req.Volume.Name)
-		st = stagedState{IQN: iqn, Portal: ic.Portal, Device: byPath(ic.Portal, iqn, "0")}
+		st = stagedState{IQN: iqn, Portal: portal, Device: byPath(portal, iqn, "0")}
 	}
 	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
 		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)
@@ -941,14 +1034,18 @@ func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRe
 		dev := st.Device
 		if !ok || dev == "" {
 			ic := b.instances[req.Volume.Instance]
-			if ic.Portal == "" {
+			pl := ic.portalList()
+			if len(pl) == 0 {
 				return bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: no staged device for %s", req.StagingPath)
 			}
 			base := ic.IQNBase
 			if base == "" {
 				base = defaultIQNBase
 			}
-			dev = byPath(ic.Portal, targetIQN(base, req.Volume.Name), "0")
+			// Node-plane multipath (a session per portal) is task 2.2; for now this
+			// derived-device fallback keeps single-portal semantics -- the first
+			// configured portal, same as before portalList() existed.
+			dev = byPath(pl[0], targetIQN(base, req.Volume.Name), "0")
 		}
 		if err := os.MkdirAll(filepath.Dir(req.TargetPath), 0o750); err != nil {
 			return fmt.Errorf("iscsi: mkdir target parent: %w", err)
