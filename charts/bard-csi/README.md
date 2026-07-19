@@ -100,6 +100,56 @@ user, zone, default, [mounter: kernel|fuse|nfs], [subvolumeGroup], [nfsCluster],
 `--kms-config` is emitted **only** when a `kms:` block is present, so a no-KMS
 install never references a missing file.
 
+**iscsi** — the reference *attach-style* backend (`ControllerPublish` masks the
+LUN to the staging node's initiator via a targetcli ACL; see
+[deploy/examples/iscsi/](../../deploy/examples/iscsi/) for the full model):
+
+```yaml
+attach:
+  enabled: true                            # REQUIRED for iscsi -- see below
+plugins:
+  iscsi:
+    enabled: true
+    instances:
+      galileo:
+        vg: bard-vg                        # LVM VG the plugin carves LUN block devices from
+        portal: 192.0.2.1:3260             # iSCSI portal ("ip:port") nodes connect to
+        zone: galileo                      # defaults to the instance id
+        default: true
+        # iqnBase: iqn.2025-01.io.bard     # default; target/initiator IQNs derive from it
+        # thinPool: bard-thin              # thin LVs from this pool -> snapshots/clone
+        # chapAuth: true                   # require CHAP; credentials from bard-iscsi-chap
+controller:
+  nodeSelector: { kubernetes.io/hostname: <target-node> }   # see "Controller placement" below
+```
+
+Per-instance fields: `vg, portal, zone, default, [iqnBase], [thinPool], [chapAuth]`
+— no `keysSecret`/`encryption`/`kms` (the plugin has no `--key-dir`; it takes no
+KMS-backed encryption).
+
+**Requires `attach.enabled: true`.** iSCSI is the one backend that attaches as a
+control-plane operation; the chart `fail`s the render if `plugins.iscsi` has any
+instance enabled without it (`templates/_validate.tpl`). `CSIDriver.attachRequired`
+is a single cluster-global **immutable** field, so on an existing install you must
+`kubectl delete csidriver csi.bard.io` before upgrading with attach flipped on —
+one-time, detaches nothing by itself, but do it in a maintenance window.
+
+**CHAP** (`chapAuth: true` on an instance): credentials come from the
+`bard-iscsi-chap` Secret — one key **per instance id**, value 2 lines (userid,
+password) or 4 (+ a mutual userid/password pair) — mounted `optional: true` on
+**both** planes at `/etc/bard-iscsi-chap`; never in the ConfigMap, StorageClass,
+or PublishContext.
+
+**Controller placement.** LIO (the target daemon) lives in the host kernel's
+configfs, so the controller pod must run *on* the target host: pin it with
+`controller.nodeSelector` (`kubernetes.io/hostname: <target-node>`) as shown
+above. Because the iscsi profile's controller is `hostNetwork` and pinned to that
+one host, `controller.replicas` must stay at its default of `1` -- the chart fails
+the render otherwise (`templates/_validate.tpl`). See the
+[Locality section of deploy/examples/iscsi/README.md](../../deploy/examples/iscsi/README.md#locality-read-this--same-host-coupling-as-lvm)
+for the full constraint (a control plane on a non-target node needs remote LIO
+management via `targetd` — a follow-up).
+
 ### (B) Low-level override — custom plugins / full control
 
 OMIT `instances` and specify the wiring yourself; a plugin with `instances` ignores
@@ -143,9 +193,9 @@ across all enabled node plugins, since they are pod-wide.
 | `sidecars.*.enabled` / `.image` | on / pinned | RBAC tracks what's enabled |
 | `sidecars.snapshotter.groupSnapshots` | `true` | adds the group-snapshot gate + RBAC |
 | `sidecars.csiAddons.enabled` | `false` | csi-addons ops: ReclaimSpace, NetworkFence, VolumeReplication (mirroring/DR), VolumeGroup, EncryptionKeyRotation (sidecar + endpoint + RBAC); needs the csi-addons controller installed separately |
-| `attach.enabled` | `false` | control-plane attach (iSCSI): flips the CSIDriver's `attachRequired` (immutable) + adds the external-attacher + RBAC. Node-mapped backends no-op it |
+| `attach.enabled` | `false` | control-plane attach: flips the CSIDriver's `attachRequired` (immutable) + adds the external-attacher + RBAC. **Required by `plugins.iscsi`** (the chart fails the render otherwise); node-mapped backends no-op it |
 | `node.kubeletDir` | `/var/lib/kubelet` | override for non-standard distros |
-| `plugins` | ceph-rbd + cephfs profiles (disabled) | the backend plugins to run |
+| `plugins` | ceph-rbd + cephfs + iscsi profiles (disabled) | the backend plugins to run |
 | `plugins.<backend>.instances` | `{}` | high-level: backend-native config per instance; generates the config ConfigMap + a BackendCluster (zone→instance) each |
 | `plugins.<backend>.keysSecret` | `bard-<backend>-keys` | name of the credentials Secret you create (one key per instance id; cephx for the Ceph backends) |
 | `storageClasses` / `volume*Classes` | `[]` | optional; off by default |

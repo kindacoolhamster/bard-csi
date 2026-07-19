@@ -41,6 +41,58 @@ kmsMount: /etc/bard-cephfs-kms
 vaultMount: /etc/bard-cephfs-vault
 controller: { privileged: false, hostDev: false, hostNetwork: false, hostPID: false, kubeletDir: false }
 node:       { privileged: true,  hostDev: true,  hostNetwork: true,  hostPID: false, kubeletDir: true }
+{{- else if eq $type "iscsi" -}}
+image: ghcr.io/kindacoolhamster/bard-plugin-iscsi
+socket: iscsi.sock
+configMap: bard-iscsi-config
+configMount: /etc/bard-iscsi
+chapMount: /etc/bard-iscsi-chap
+chapSecret: bard-iscsi-chap
+controller: { privileged: true, hostDev: true, hostNetwork: true, hostPID: false, kubeletDir: false }
+node:
+  privileged: true
+  hostDev: true
+  hostNetwork: true
+  hostPID: false
+  kubeletDir: true
+  env:
+    - name: NODE_ID
+      fieldRef: { fieldPath: spec.nodeName }
+# Control plane: lvcreate carves the LUN block device and targetcli drives the
+# host kernel's LIO configfs target -- hostDev above covers /dev, these cover the
+# rest (lvm2's lock/config dirs, configfs, and the D-Bus targetcli 2.1.5x
+# unconditionally enumerates tcmu-runner over -- see CLAUDE.md).
+controllerVolumes:
+  - name: lvm-run
+    mountPath: /run/lvm
+    hostPath: { path: /run/lvm }
+  - name: lvm-etc
+    mountPath: /etc/lvm
+    hostPath: { path: /etc/lvm }
+  - name: configfs
+    mountPath: /sys/kernel/config
+    hostPath: { path: /sys/kernel/config }
+  - name: dbus
+    mountPath: /run/dbus
+    readOnly: true
+    hostPath: { path: /run/dbus }
+nodeVolumes:
+  # Widest hostPath in the chart: iscsiadm runs chrooted here (--iscsiadm-chroot
+  # below) because iscsiadm+iscsid are a version-matched pair with distro-specific
+  # DB paths -- a container iscsiadm driving the host's iscsid writes CHAP/node
+  # records the daemon never looks at, and login hangs in negotiation (CLAUDE.md).
+  - name: host-root
+    mountPath: /host
+    hostPath: { path: / }
+  # Session state must survive plugin pod restarts -- NodeUnstage reads it to log
+  # the session out; without persistence a mid-lifetime restart leaks the session.
+  - name: iscsi-state
+    mountPath: /var/lib/bard/iscsi
+    hostPath: { path: /var/lib/bard/iscsi, type: DirectoryOrCreate }
+nodeArgs:
+  - --node-id=$(NODE_ID)
+  - --iscsiadm-chroot=/host
+  - --state-dir=/var/lib/bard/iscsi
 {{- end -}}
 {{- end -}}
 
@@ -75,10 +127,15 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{- $keysSecret := $plugin.keysSecret | default $prof.keysSecret -}}
 {{- $kms := $plugin.kms -}}
 {{- /* base args + volumes both planes share */ -}}
-{{- $baseArgs := list (printf "--config=%s/config.yaml" $prof.configMount) (printf "--key-dir=%s" $prof.keysMount) -}}
+{{- $baseArgs := list (printf "--config=%s/config.yaml" $prof.configMount) -}}
 {{- $cfgVol := dict "name" "config" "mountPath" $prof.configMount "readOnly" true "configMap" (dict "name" $prof.configMap) -}}
-{{- $keysVol := dict "name" "keys" "mountPath" $prof.keysMount "readOnly" true "secret" (dict "name" $keysSecret) -}}
-{{- $baseVols := list $cfgVol $keysVol -}}
+{{- $baseVols := list $cfgVol -}}
+{{- /* keys (gated on a keysMount -- some plugins, e.g. iSCSI, have no --key-dir flag; a
+     forced --key-dir would crash-loop a Go flag.ExitOnError binary that lacks it) */ -}}
+{{- if $prof.keysMount -}}
+{{-   $baseArgs = append $baseArgs (printf "--key-dir=%s" $prof.keysMount) -}}
+{{-   $baseVols = append $baseVols (dict "name" "keys" "mountPath" $prof.keysMount "readOnly" true "secret" (dict "name" $keysSecret)) -}}
+{{- end -}}
 {{- /* kms (gated on a kms block -- this is why no kms => no --kms-config => no crashloop) */ -}}
 {{- $kmsArgs := list -}}
 {{- $kmsVols := list -}}
@@ -89,11 +146,23 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{-     $kmsVols = append $kmsVols (dict "name" "vault-token" "mountPath" $prof.vaultMount "readOnly" true "secret" (dict "name" $kms.vaultTokenSecret "optional" true)) -}}
 {{-   end -}}
 {{- end -}}
-{{- /* controller plane: config + keys (+ kms). No privilege/host. */ -}}
-{{- $cArgs := concat $baseArgs $kmsArgs -}}
-{{- $cVols := concat $baseVols $kmsVols -}}
-{{- $controller := dict "enabled" true "args" $cArgs "volumes" $cVols -}}
-{{- /* node plane: base (+ encryption, always optional) (+ kms) + host flags */ -}}
+{{- /* chap (gated on chapMount+chapSecret profile fields -- optional across BOTH planes,
+     e.g. iSCSI's per-instance CHAP credentials) */ -}}
+{{- $chapArgs := list -}}
+{{- $chapVols := list -}}
+{{- if and $prof.chapMount $prof.chapSecret -}}
+{{-   $chapArgs = list (printf "--chap-dir=%s" $prof.chapMount) -}}
+{{-   $chapVols = list (dict "name" "chap" "mountPath" $prof.chapMount "readOnly" true "secret" (dict "name" $prof.chapSecret "optional" true)) -}}
+{{- end -}}
+{{- /* controller plane: base (+ keys) (+ kms) (+ chap) (+ profile extras); host flags
+     come from $prof.controller (privileged/hostDev/hostNetwork/... -- merged below). */ -}}
+{{- $cArgs := concat (concat $baseArgs $kmsArgs) $chapArgs -}}
+{{- $cArgs = concat $cArgs ($prof.controllerArgs | default list) -}}
+{{- $cVols := concat (concat $baseVols $kmsVols) $chapVols -}}
+{{- $cVols = concat $cVols ($prof.controllerVolumes | default list) -}}
+{{- $controller := merge (dict "enabled" true "args" $cArgs "volumes" $cVols) $prof.controller -}}
+{{- /* node plane: base (+ encryption, always optional) (+ kms) (+ chap) (+ profile
+     extras) + host flags */ -}}
 {{- $nArgs := $baseArgs -}}
 {{- $nVols := $baseVols -}}
 {{- if $prof.encryptionMount -}}
@@ -103,6 +172,10 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{- end -}}
 {{- $nArgs = concat $nArgs $kmsArgs -}}
 {{- $nVols = concat $nVols $kmsVols -}}
+{{- $nArgs = concat $nArgs $chapArgs -}}
+{{- $nVols = concat $nVols $chapVols -}}
+{{- $nArgs = concat $nArgs ($prof.nodeArgs | default list) -}}
+{{- $nVols = concat $nVols ($prof.nodeVolumes | default list) -}}
 {{- $node := merge (dict "enabled" true "args" $nArgs "volumes" $nVols) $prof.node -}}
 {{- $out := dict "enabled" true "socket" $prof.socket "image" (dict "repository" ($img.repository | default $prof.image) "tag" ($img.tag | default "") "pullPolicy" ($img.pullPolicy | default "IfNotPresent")) "controller" $controller "node" $node -}}
 {{- toYaml $out -}}
@@ -119,17 +192,13 @@ high-level `instances` map, mapping backend-native fields to the plugin's schema
 instances:
 {{- range $id, $inst := .instances }}
   {{ $id }}:
-    monitors: {{ toJson $inst.monitors }}
     {{- if eq $type "ceph-rbd" }}
+    monitors: {{ toJson $inst.monitors }}
     pool: {{ $inst.pool }}
-    {{- else if eq $type "cephfs" }}
-    fsName: {{ $inst.fsName }}
-    {{- end }}
     userID: {{ $inst.user }}
     {{- with $inst.mounter }}
     mounter: {{ . }}
     {{- end }}
-    {{- if eq $type "ceph-rbd" }}
     {{- with $inst.radosNamespace }}
     radosNamespace: {{ . }}
     {{- end }}
@@ -139,8 +208,13 @@ instances:
     {{- with $inst.clusterName }}
     clusterName: {{ . }}
     {{- end }}
+    {{- else if eq $type "cephfs" }}
+    monitors: {{ toJson $inst.monitors }}
+    fsName: {{ $inst.fsName }}
+    userID: {{ $inst.user }}
+    {{- with $inst.mounter }}
+    mounter: {{ . }}
     {{- end }}
-    {{- if eq $type "cephfs" }}
     {{- with $inst.subvolumeGroup }}
     subvolumeGroup: {{ . }}
     {{- end }}
@@ -149,6 +223,21 @@ instances:
     {{- end }}
     {{- with $inst.nfsServer }}
     nfsServer: {{ . }}
+    {{- end }}
+    {{- else if eq $type "iscsi" }}
+    vg: {{ $inst.vg }}
+    portal: {{ $inst.portal }}
+    {{- with $inst.portals }}
+    portals: {{ toJson . }}
+    {{- end }}
+    {{- with $inst.iqnBase }}
+    iqnBase: {{ . }}
+    {{- end }}
+    {{- with $inst.thinPool }}
+    thinPool: {{ . }}
+    {{- end }}
+    {{- if $inst.chapAuth }}
+    chapAuth: true
     {{- end }}
     {{- end }}
 {{- end }}
