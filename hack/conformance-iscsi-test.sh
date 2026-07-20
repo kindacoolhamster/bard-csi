@@ -13,6 +13,15 @@
 # the initiator IQN derived from it, while the ACL from controller/publish is
 # for the node id the TOOL sends -- mismatched values are a (correct)
 # authorization failure at login.
+# NOTE this stays pointed at a LOCAL (targetcli-managed) instance, not a
+# targetd one, on purpose: the conformance tool hard-gates its snapshot/clone
+# tests on the plugin's DECLARED capabilities (/info), which are plugin-global,
+# not per-instance -- a targetd instance rejects snapshot/clone per-request
+# (CodeUnsupported) while /info still advertises snapshots=true because a
+# local instance in the same process supports it. Snapshot/clone conformance
+# against a targetd instance would need per-instance capability plumbing this
+# plugin doesn't have; targetd's own contract (including its clean Unsupported
+# rejection) is instead covered end to end by hack/targetd-plugin-test.sh.
 set -uo pipefail
 BIN=${1:-/tmp/bard-plugin-iscsi}
 TOOL=${TOOL:-/tmp/bard-plugin-conformance}
