@@ -24,6 +24,29 @@ func targetdInst() map[string]InstanceConfig {
 	}
 }
 
+// A targetd instance with chapAuth: true must be rejected at config load
+// (inst()), not silently accepted: targetd's export_create hardcodes the
+// shared target's TPG authentication attribute to "0" on every export, with
+// no API to override it, so CHAP credentials set via initiator_set_auth are
+// never actually enforced (live-verified against targetd 0.10.4: the login
+// response still advertises AuthMethod=CHAP, but the kernel initiator aborts
+// before the actual challenge, for both a correct and a missing password). A
+// StorageClass carrying chapAuth: true must never silently protect nothing.
+func TestTargetdInstanceRejectsCHAPAuth(t *testing.T) {
+	inst := targetdInst()
+	ic := inst["remote"]
+	ic.CHAPAuth = true
+	inst["remote"] = ic
+	b := New(inst, "", "", "", "", "", &fakeRunner{})
+	_, err := b.inst("remote")
+	if err == nil {
+		t.Fatal("targetd instance with chapAuth: true must be rejected at config load")
+	}
+	if !strings.Contains(err.Error(), "chapAuth") {
+		t.Fatalf("error should explain the chapAuth rejection, got: %v", err)
+	}
+}
+
 // A targetd instance rejects CreateSnapshot outright: targetd's vol_copy is a
 // synchronous full copy, unsafe under provisioner retries. The rejection must
 // carry CodeUnsupported (a terminal, non-retried CSI failure) and the message

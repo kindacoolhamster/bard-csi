@@ -251,6 +251,27 @@ func (b *Backend) inst(instance string) (InstanceConfig, error) {
 			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
 				"iscsi: instance %q management=targetd not configured (need targetdEndpoint + targetdPool + targetIqn + portal)", instance)
 		}
+		// targetd's own export_create hardcodes the shared target's TPG
+		// `authentication` attribute to "0" on EVERY export -- unconditionally,
+		// with no API to override it -- even though initiator_set_auth happily
+		// stores CHAP credentials on the per-initiator ACL. Live-verified
+		// (targetd 0.10.4, upstream git main, 2026-07-20): the resulting LIO
+		// config is internally inconsistent -- the login response still
+		// advertises AuthMethod=CHAP, but the kernel initiator aborts the
+		// connection immediately after receiving it (never reaches the actual
+		// CHAP challenge/response), for BOTH a correct password and no
+		// credentials at all. So chapAuth: true on a targetd instance would
+		// silently protect nothing while claiming to -- reject at config load
+		// (the "Honest MVP" precedent CreateVolume already applies to
+		// snapshots/clones on targetd) rather than ship a StorageClass flag
+		// that lies about the data path's security.
+		if ic.CHAPAuth {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q management=targetd cannot set chapAuth: true -- targetd's export_create "+
+					"unconditionally disables TPG-level authentication on every export (upstream limitation, no API "+
+					"to override), so CHAP credentials set via initiator_set_auth are never actually enforced; "+
+					"access control on a targetd instance is IQN-based ACLs only", instance)
+		}
 	default:
 		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
 			"iscsi: instance %q has unknown management %q (want \"local\" or \"targetd\")", instance, ic.Management)
