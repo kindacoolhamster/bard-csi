@@ -66,7 +66,10 @@ when the target host is a cluster node**: pin the controller there
 every other node attaches over the network — proven end to end on a 2-node k3s
 cluster (provision → cross-node CHAP attach → snapshot → restore, clean reap).
 A control plane on a node that *isn't* the target needs remote LIO management
-(e.g. `targetd`) — a documented follow-up.
+instead: see `management: targetd` in the chart README (an instance drives a
+remote LIO host over targetd's JSON-RPC API, so the controller no longer needs
+`nodeSelector`-pinning to that host — the coupling above is specific to local,
+`vg`-based instances).
 
 In-cluster **node prerequisites** (same class as every host-module gotcha):
 `iscsid` running on every node (any distro's iscsi-initiator package), and on the
@@ -162,7 +165,9 @@ needed. Proven end to end by `hack/iscsi-multipath-test.sh` (including a
 traffic-cut failover under live I/O) and in-cluster (portal-IP loss under a
 running pod, online expand through the mapper, restart-then-delete leak check).
 
-## Not yet (follow-ups)
+## Remote LIO management (`management: targetd`)
 
-Remote LIO management (`targetd`) for a fully in-cluster control plane on a
-node that isn't the target host.
+DONE: see `management: targetd` in the chart README (`charts/bard-csi/README.md`)
+for the instance shape, the CHAP/snapshot limitations, and the controller-only
+credentials Secret; `hack/targetd-plugin-test.sh` is the live proof against a
+real targetd host.
