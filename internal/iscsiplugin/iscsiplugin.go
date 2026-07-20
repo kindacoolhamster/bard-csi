@@ -162,6 +162,18 @@ type Backend struct {
 	// the plugin's stable public entry point (used by cmd/bard-plugin-iscsi).
 	sysfsRoot string
 	devRoot   string
+	// tdAccessMu serializes every targetd grantAccess/revokeAccess call across
+	// ALL targetd instances. tdManager is built fresh per RPC call (see
+	// newTdManager in targetd.go), so a mutex FIELD ON tdManager would guard
+	// nothing across calls -- this one is owned by the long-lived Backend and
+	// handed to each tdManager by pointer. Needed because core's inflight
+	// guard keys per VOLUME, not per initiator: ControllerPublish for two
+	// DIFFERENT volumes to the SAME initiator can run fully concurrently, and
+	// without this lock both could read the same "used LUNs" snapshot,
+	// compute the same lowest-unused LUN, and create two exports with a
+	// colliding LUN. One global lock rather than per-instance: contention is
+	// negligible at CSI scale, and it keeps the fix trivially correct.
+	tdAccessMu sync.Mutex
 }
 
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
@@ -565,6 +577,9 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 			"iscsi: creating a volume from a snapshot or another volume is not supported on targetd-managed instance %q "+
 				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots and clones", req.Instance)
 	}
+	if ic.isTargetd() {
+		return b.createVolumeTargetd(ctx, req.Instance, ic, req)
+	}
 	vg, lv := ic.VG, lvName(req.Name)
 
 	// 1. The backing LV (idempotent via size check, like the LVM plugin).
@@ -735,8 +750,31 @@ func splitPortal(portal string) (ip, port string, err error) {
 // is idempotent and a non-not-found error is surfaced (never reports success while
 // the volume's data could still exist -- no silent orphan).
 func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolumeRequest) error {
+	ic, ok := b.instances[req.Volume.Instance]
+	if !ok {
+		if isTdLocation(req.Volume.Location) {
+			// The volume's own recorded Location marks it as targetd-managed
+			// (see tdLocationPrefix) -- reaching it needs the instance's
+			// endpoint+creds, which only live in CURRENT config, so there is
+			// nothing to derive. CodeInternal is retriable (unlike NotFound,
+			// which core/CSI treats as terminal success -- that would silently
+			// orphan the remote volume/export) and not terminal (unlike
+			// InvalidArgument, which would kill an
+			// operator-restores-the-instance-then-retries recovery path).
+			return bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: instance %q not configured, cannot reach remote targetd volume %s -- restore the instance or clean up manually",
+				req.Volume.Instance, req.Volume.Location)
+		}
+		// Unmarked (local, or a pre-targetd handle): ic stays the zero value,
+		// so IQNBase falls back to defaultIQNBase below exactly as it always
+		// has -- this is the PRE-EXISTING, deliberate derived-cleanup design
+		// (the handle's own Location IS the VG, so lvremove genuinely deletes
+		// it with no instance config at all; mirrors NodeUnstage's documented
+		// derived-logout fallback). Falls through to the shared teardown below.
+	} else if ic.isTargetd() {
+		return b.deleteVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name)
+	}
 	vg, lv := req.Volume.Location, req.Volume.Name
-	ic := b.instances[req.Volume.Instance]
 	base := ic.IQNBase
 	if base == "" {
 		base = defaultIQNBase
@@ -756,6 +794,9 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 }
 
 func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolumeRequest) (*bardplugin.ExpandVolumeResponse, error) {
+	if ic := b.instances[req.Volume.Instance]; ic.isTargetd() {
+		return b.expandVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name, req.NewSizeBytes)
+	}
 	vg, lv := req.Volume.Location, req.Volume.Name
 	if err := b.extendTo(ctx, vg, lv, req.NewSizeBytes); err != nil {
 		return nil, err
@@ -860,6 +901,9 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 	if err != nil {
 		return nil, err
 	}
+	if ic.isTargetd() {
+		return b.controllerPublishTargetd(ctx, req.Volume.Instance, ic, req)
+	}
 	chap, err := b.chapFor(req.Volume.Instance)
 	if err != nil {
 		return nil, err
@@ -899,7 +943,23 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 // node id, and reporting success while leaving the ACL in place would let the
 // node keep reaching the LUN whenever the config entry is missing or broken.
 func (b *Backend) ControllerUnpublish(ctx context.Context, req *bardplugin.ControllerUnpublishRequest) error {
-	base := b.instances[req.Volume.Instance].IQNBase
+	ic, ok := b.instances[req.Volume.Instance]
+	if !ok {
+		if isTdLocation(req.Volume.Location) {
+			// Same reasoning as DeleteVolume's identical guard: a MARKED
+			// Location means reaching this volume needs the instance's
+			// endpoint+creds, which only live in current config.
+			return bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: instance %q not configured, cannot reach remote targetd volume %s -- restore the instance or clean up manually",
+				req.Volume.Instance, req.Volume.Location)
+		}
+		// Unmarked: same derived-ACL-cleanup fallback as DeleteVolume's
+		// identical case -- falls through to the shared teardown below with
+		// ic at its zero value (IQNBase defaults to defaultIQNBase, as always).
+	} else if ic.isTargetd() {
+		return b.controllerUnpublishTargetd(ctx, req.Volume.Instance, ic, req)
+	}
+	base := ic.IQNBase
 	if base == "" {
 		base = defaultIQNBase
 	}
@@ -1612,6 +1672,9 @@ func (b *Backend) GetCapacity(ctx context.Context, req *bardplugin.GetCapacityRe
 	if err != nil {
 		return nil, err
 	}
+	if ic.isTargetd() {
+		return b.getCapacityTargetd(ctx, req.Instance, ic)
+	}
 	out, err := b.run.Run(ctx, "vgs", "--noheadings", "--units", "b", "--nosuffix", "-o", "vg_free", ic.VG)
 	if err != nil {
 		return nil, fmt.Errorf("iscsi: vgs %s: %w", ic.VG, err)
@@ -1709,6 +1772,14 @@ func isThinPool(attr string) bool { return len(attr) > 0 && attr[0] == 't' }
 func (b *Backend) ListVolumes(ctx context.Context, _ *bardplugin.ListVolumesRequest) (*bardplugin.ListVolumesResponse, error) {
 	var entries []bardplugin.VolumeListEntry
 	for instance, ic := range b.instances {
+		if ic.isTargetd() {
+			tdEntries, err := b.listVolumesTargetd(ctx, instance, ic)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, tdEntries...)
+			continue
+		}
 		if ic.VG == "" {
 			continue
 		}

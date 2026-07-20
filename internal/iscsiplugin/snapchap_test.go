@@ -589,7 +589,11 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 // Unpublish must actually revoke the ACL even when the instance is no longer
 // configured -- both IQNs derive from the volume name + node id (like
 // DeleteVolume), and success-without-revocation would leave the node with
-// standing access to the LUN.
+// standing access to the LUN. (An UNMARKED Location -- see tdLocation --
+// means this volume was never targetd-managed, so the derived local cleanup
+// below is safe; a MARKED Location instead refuses to guess, see
+// TestControllerUnpublishMarkedTargetdLocationMissingInstanceRejected in
+// targetd_client_test.go.)
 func TestControllerUnpublishUnknownInstanceStillRevokes(t *testing.T) {
 	fr := &fakeRunner{}
 	b := New(map[string]InstanceConfig{}, "", "", "", "", "", fr) // nothing configured
