@@ -137,9 +137,14 @@ spec:
             - "--pod=$(POD_NAME)"
             - "--pod-uid=$(POD_UID)"
             - "--leader-election-namespace=$(POD_NAMESPACE)"
-            # The sidecar serves its CSIAddonsNode controller endpoint on this port;
-            # it is required (the sidecar exits "invalid controller port" without it).
-            - "--controller-port=9070"
+            # Required: the sidecar exits "invalid controller port" without it.
+            # 9071, not 9070: deploy/40-node.yaml's csi-addons sidecar binds 9070 in
+            # the HOST netns (node plane is hostNetwork), and the iscsi sidecar patch
+            # (deploy/examples/iscsi/sidecar-controller.patch.yaml) puts this
+            # controller pod on hostNetwork too -- on a host running both pods,
+            # sharing the port makes this sidecar crashloop (found live: "listen tcp
+            # :9070: bind: address already in use").
+            - "--controller-port=9071"
             - "--v=2"
           env:
             - name: CSIADDONS_ENDPOINT

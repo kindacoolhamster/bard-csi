@@ -1,3 +1,21 @@
+{{- include "bard-csi.validate" . -}}
+{{- /*
+Pod-level host flags are OR-ed across all enabled controller plugins (hostNetwork/hostPID
+are pod-wide, not per-container). needsDev decides whether to define the /dev volume.
+*/ -}}
+{{- $hostNetwork := false -}}
+{{- $hostPID := false -}}
+{{- $needsDev := false -}}
+{{- range $name, $plugin := .Values.plugins -}}
+{{-   if $plugin.enabled -}}
+{{-     $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) -}}
+{{-     if and $p.controller $p.controller.enabled -}}
+{{-       if $p.controller.hostNetwork }}{{ $hostNetwork = true }}{{ end -}}
+{{-       if $p.controller.hostPID }}{{ $hostPID = true }}{{ end -}}
+{{-       if $p.controller.hostDev }}{{ $needsDev = true }}{{ end -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +26,15 @@ metadata:
     app: {{ include "bard-csi.fullname" . }}-controller
 spec:
   replicas: {{ .Values.controller.replicas }}
+{{- if $hostNetwork }}
+  # hostNetwork + a nodeSelector pin (the attach/iscsi shape) deadlocks a
+  # RollingUpdate: the surge pod cannot schedule while the old pod holds the
+  # host ports on the pinned node, and the old pod is not removed until the
+  # new one is Ready (found live). Recreate trades a short control-plane gap
+  # for a rollout that always completes.
+  strategy:
+    type: Recreate
+{{- end }}
   selector:
     matchLabels:
       app: {{ include "bard-csi.fullname" . }}-controller
@@ -17,6 +44,13 @@ spec:
         app: {{ include "bard-csi.fullname" . }}-controller
     spec:
       serviceAccountName: {{ include "bard-csi.fullname" . }}-controller
+      {{- if $hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      {{- if $hostPID }}
+      hostPID: true
+      {{- end }}
       {{- with .Values.podSecurityContext }}
       # Shared fsGroup so the per-pod `plugins` emptyDir (and the plugin sockets in
       # it, mode 0660) is group-owned, letting a non-root core (e.g. a hardened
@@ -169,7 +203,12 @@ spec:
             - "--pod-uid=$(POD_UID)"
             - "--leader-election-namespace=$(POD_NAMESPACE)"
             # Required: the sidecar exits "invalid controller port" without it.
-            - "--controller-port=9070"
+            # 9071, not 9070: the node pod's csi-addons sidecar binds 9070 in the
+            # HOST netns (node plane is hostNetwork), and an attach-style profile
+            # (iscsi) puts the controller pod on hostNetwork too -- on a host
+            # running both pods, sharing the port makes this sidecar crashloop
+            # (found live: "listen tcp :9070: bind: address already in use").
+            - "--controller-port=9071"
             - "--v=2"
           env:
             - name: CSIADDONS_ENDPOINT
@@ -234,6 +273,12 @@ spec:
           emptyDir: {}
         - name: plugins
           emptyDir: {}
+        {{- if $needsDev }}
+        - name: dev-dir
+          hostPath:
+            path: /dev
+            type: Directory
+        {{- end }}
         {{- range $name, $plugin := .Values.plugins }}
         {{- $p := fromYaml (include "bard-csi.normalize" (dict "name" $name "plugin" $plugin "root" $)) }}
         {{- if and $plugin.enabled $p.controller $p.controller.enabled }}
