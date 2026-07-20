@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
@@ -16,14 +17,21 @@ var (
 )
 
 // fakeRunner returns canned results keyed by the command name, recording every
-// invocation (mirrors the LVM plugin's test harness).
+// invocation (mirrors the LVM plugin's test harness). mu guards calls: every
+// existing test is single-goroutine and never contends on it, but the
+// shared-target refcount concurrency test drives Run from two goroutines at
+// once (the whole point of that test is to prove withTargetLock -- not this
+// recorder -- serializes the interesting part).
 type fakeRunner struct {
+	mu      sync.Mutex
 	calls   [][]string
 	results map[string]func(args []string) (string, error)
 }
 
 func (f *fakeRunner) Run(_ context.Context, name string, args ...string) (string, error) {
+	f.mu.Lock()
 	f.calls = append(f.calls, append([]string{name}, args...))
+	f.mu.Unlock()
 	if fn := f.results[name]; fn != nil {
 		return fn(args)
 	}

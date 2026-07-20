@@ -46,6 +46,7 @@ package iscsiplugin
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -55,6 +56,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
@@ -1028,6 +1031,105 @@ func (b *Backend) clearState(stagingPath string) {
 	}
 }
 
+// withTargetLock serializes, per target IQN, NodeStage's login-or-rescan
+// decision and NodeUnstage's refcount-scan-then-act -- both read "do any
+// OTHER staged volumes share this target?" and then act on the answer, and
+// without a lock two concurrent unstages of the last two volumes sharing a
+// target can both observe "another record exists" before either clears its
+// own, and both skip the final logout (a leaked session). The lock is a flock
+// on a per-IQN file under stateDir, held for the whole read-then-act; when
+// stateDir is empty (no persistent state configured -- shouldn't happen on
+// the node plane in practice) fn runs unlocked, mirroring recordState/
+// loadState's no-op-when-empty convention.
+func (b *Backend) withTargetLock(iqn string, fn func() error) error {
+	if b.stateDir == "" {
+		return fn()
+	}
+	if err := os.MkdirAll(b.stateDir, 0o750); err != nil {
+		return fmt.Errorf("iscsi: state dir: %w", err)
+	}
+	sum := sha1.Sum([]byte(iqn))
+	lockPath := filepath.Join(b.stateDir, "lock-"+hex.EncodeToString(sum[:]))
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("iscsi: open target lock: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("iscsi: lock target %s: %w", iqn, err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// otherRecordsForIQN counts staged-state records -- other than the one at
+// excludeStagingPath, if any -- that share iqn. This is the target-IQN
+// refcount NodeStage/NodeUnstage use to decide, for a shared target (targetd
+// management: every volume is a LUN under ONE fixed target IQN), whether a
+// session is already up (skip discovery/login, rescan instead) and whether
+// this is the last volume on that target (only then log out). For a
+// per-volume target (local management: each volume's target IQN is unique to
+// it) this always comes out to zero -- so local-mode behavior is unchanged BY
+// CONSTRUCTION. A missing state dir counts as zero, not an error; a lock file
+// (skipped by its "lock-" prefix) or a corrupt/mid-write state file (skipped
+// on read/parse error) is tolerated exactly like loadState.
+func (b *Backend) otherRecordsForIQN(iqn, excludeStagingPath string) (int, error) {
+	if b.stateDir == "" {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(b.stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("iscsi: scan state dir: %w", err)
+	}
+	var exclude string
+	if excludeStagingPath != "" {
+		exclude = b.statePath(excludeStagingPath)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "lock-") {
+			continue
+		}
+		full := filepath.Join(b.stateDir, entry.Name())
+		if exclude != "" && full == exclude {
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		var st stagedState
+		if json.Unmarshal(data, &st) != nil {
+			continue
+		}
+		if st.IQN == iqn {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// sessionActiveForIQN reports whether `iscsiadm -m session` still lists a
+// session for iqn. Used to verify the final logout on a shared target
+// (targetd management) with no state record and so no known device/LUN to
+// check a blockdev size against -- the check NodeUnstage's state-based/
+// locally-derived branches use instead. iscsiadm errors (classified
+// isNotFound, e.g. "No active sessions") when there are no sessions at all,
+// which itself means "not active", not a failure to check.
+func (b *Backend) sessionActiveForIQN(ctx context.Context, iqn string) (bool, error) {
+	out, err := b.iscsiadm(ctx, "-m", "session")
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.Contains(out, iqn), nil
+}
+
 // byPath is the stable device symlink the kernel creates for a logged-in LUN,
 // under devRoot (defaults to /dev; tests point it at a fake tree).
 func (b *Backend) byPath(portal, iqn, lun string) string {
@@ -1165,28 +1267,48 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	if err := b.ensureIface(ctx, initIQN); err != nil {
 		return err
 	}
-	// Discover the target on the portal, then log in under our iface. Both are
-	// idempotent on a stage retry. When the instance enforces CHAP, the
-	// credentials go on the discovered node record before the login (LIO's
-	// discovery itself stays unauthenticated; only the login is gated).
-	if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
-		return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
-	}
-	chap, err := b.chapFor(req.Volume.Instance)
-	if err != nil {
-		return err
-	}
-	if chap != nil {
-		if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+	// The login-or-rescan decision and the wait for OUR device are made under
+	// the per-target flock, together with the refcount read that decides
+	// between them -- see withTargetLock.
+	dev := b.byPath(portal, iqn, lun)
+	if err := b.withTargetLock(iqn, func() error {
+		shared, err := b.otherRecordsForIQN(iqn, "")
+		if err != nil {
 			return err
 		}
-	}
-	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
-		return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
-	}
-
-	dev := b.byPath(portal, iqn, lun)
-	if err := b.waitForDevice(ctx, dev); err != nil {
+		if shared > 0 {
+			// Another staged volume already has a live session for this target
+			// (a shared-target instance, e.g. targetd) -- logging in again is
+			// wrong (or at best redundant); rescan so the kernel picks up THIS
+			// volume's own LUN instead, the same idiom NodeExpand already uses
+			// for a resize.
+			if _, err := b.iscsiadm(ctx, "-m", "session", "--rescan"); err != nil && !isNotFound(err) {
+				return fmt.Errorf("iscsi: session rescan: %w", err)
+			}
+		} else {
+			// Discover the target on the portal, then log in under our iface. Both
+			// are idempotent on a stage retry. When the instance enforces CHAP,
+			// the credentials go on the discovered node record before the login
+			// (LIO's discovery itself stays unauthenticated; only the login is
+			// gated).
+			if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
+				return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
+			}
+			chap, err := b.chapFor(req.Volume.Instance)
+			if err != nil {
+				return err
+			}
+			if chap != nil {
+				if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+					return err
+				}
+			}
+			if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
+				return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
+			}
+		}
+		return b.waitForDevice(ctx, dev)
+	}); err != nil {
 		return err
 	}
 	if err := b.recordState(req.StagingPath, stagedState{Device: dev, IQN: iqn, Portal: portal}); err != nil {
@@ -1341,9 +1463,11 @@ func (b *Backend) setChapOnNode(ctx context.Context, iqn, portal string, chap *c
 	return nil
 }
 
-// NodeUnstage unmounts, logs out the session, and verifies the device is gone --
-// returning an error if it is still present so kubelet retries (never reports
-// success while the LUN is still attached, mirroring the rbd-nbd unmap rule).
+// NodeUnstage unmounts, then hands off to unstageSingleTarget (or, for a
+// 2+-portal instance, the multipath teardown) to log out and verify
+// detachment -- returning an error if a session/device that must be gone
+// isn't, so kubelet retries (never reports success while the LUN is still
+// attached, mirroring the rbd-nbd unmap rule).
 func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRequest) error {
 	if _, err := b.run.Run(ctx, "umount", req.StagingPath); err != nil && !isNotMounted(err) {
 		return fmt.Errorf("iscsi: umount %s: %w", req.StagingPath, err)
@@ -1354,10 +1478,11 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 		// lost whenever the plugin container restarts with an unpersisted state
 		// dir (found live in-cluster -- a mid-lifetime pod restart turned every
 		// later unstage into a silent no-op, leaking the session past volume
-		// deletion). Everything needed is derivable -- the target IQN from the
-		// volume name, the portal from the instance, LUN is always 0 -- so
-		// reconstruct and log out anyway; on a node that truly never staged the
-		// volume the logout is a clean isNotFound no-op.
+		// deletion). Everything needed is derivable for a per-volume target
+		// (local management): the target IQN from the volume name, the portal
+		// from the instance, LUN is always 0 -- so reconstruct and log out
+		// anyway; on a node that truly never staged the volume the logout is a
+		// clean isNotFound no-op.
 		ic := b.instances[req.Volume.Instance]
 		base := ic.IQNBase
 		if base == "" {
@@ -1368,26 +1493,102 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 			return nil // instance unknown: nothing derivable, nothing to log out of
 		}
 		iqn := targetIQN(base, req.Volume.Name)
+		if ic.isTargetd() {
+			// A shared-target instance (targetd) exposes EVERY volume as a LUN
+			// under ONE fixed target IQN -- the per-volume derived IQN above is
+			// the wrong target here.
+			iqn = ic.TargetIQN
+		}
 		if len(pl) >= 2 {
 			return b.nodeUnstageDerivedMultipath(ctx, req, iqn, pl)
 		}
 		portal := pl[0]
+		if ic.isTargetd() {
+			// With no state record, this volume's LUN on the shared target isn't
+			// known (targetd allocates it per-initiator at ControllerPublish
+			// time) -- unlike local mode there is no LUN 0 to guess, so hand off
+			// with an empty device: unstageSingleTarget skips the sysfs
+			// device-delete step and verifies the final logout via the session
+			// list instead of a device size.
+			return b.unstageSingleTarget(ctx, req, iqn, portal, "")
+		}
 		st = stagedState{IQN: iqn, Portal: portal, Device: b.byPath(portal, iqn, "0")}
 	}
 	if len(st.Portals) >= 2 {
 		return b.nodeUnstageMultipath(ctx, req, st)
 	}
-	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
-		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)
-	}
-	// Confirm the device is actually gone before declaring success.
-	if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", st.Device); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
-		return fmt.Errorf("iscsi: device %s still present after logout", st.Device)
-	}
-	// Best-effort cleanup of the node record, then drop our state.
-	_, _ = b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--op", "delete")
-	b.clearState(req.StagingPath)
-	return nil
+	return b.unstageSingleTarget(ctx, req, st.IQN, st.Portal, st.Device)
+}
+
+// unstageSingleTarget is the single-portal NodeUnstage teardown core, shared
+// by the state-found branch and the locally-derived (non-targetd) fallback --
+// both know a device (the recorded one, or LUN 0 for a derived per-volume
+// target), so refcounting them here provably behaves as "always last" for a
+// per-volume target (its IQN is unique, so no other record can ever share
+// it), leaving pre-this-task local-mode behavior unchanged BY CONSTRUCTION --
+// and by the targetd-derived fallback with no known device (dev == ""),
+// which cannot sysfs-delete a specific LUN and instead verifies the final
+// logout via the session list rather than a device size.
+//
+// The refcount read and the resulting not-last/last decision run under the
+// per-target flock (withTargetLock), closing the TOCTOU where two concurrent
+// unstages of the last two volumes sharing a target both see "another record
+// exists" and both skip the final logout.
+func (b *Backend) unstageSingleTarget(ctx context.Context, req *bardplugin.NodeUnstageRequest, iqn, portal, dev string) error {
+	return b.withTargetLock(iqn, func() error {
+		shared, err := b.otherRecordsForIQN(iqn, req.StagingPath)
+		if err != nil {
+			return err
+		}
+		if shared > 0 {
+			// Not last: another staged volume still needs this target's shared
+			// session -- do NOT log out. Detach only OUR LUN mapping (when it is
+			// known) via a raw sysfs delete, which drops the one SCSI device
+			// without touching the session other volumes still use.
+			if dev != "" {
+				sdPath, err := filepath.EvalSymlinks(dev)
+				if err != nil {
+					return fmt.Errorf("iscsi: resolve device %s: %w", dev, err)
+				}
+				deletePath := filepath.Join(b.sysfsRoot, "class", "block", filepath.Base(sdPath), "device", "delete")
+				// Mode only matters if this path doesn't already exist (a real
+				// sysfs attribute file always does, so the kernel's own
+				// permissions win there); 0o600 just lets a test fixture read
+				// back what was written.
+				if err := os.WriteFile(deletePath, []byte("1"), 0o600); err != nil {
+					return fmt.Errorf("iscsi: detach %s: %w", deletePath, err)
+				}
+			}
+			b.clearState(req.StagingPath)
+			return nil
+		}
+		// Last (or a per-volume target, which is always "last"): today's full
+		// teardown -- logout, tolerate no-session, verify detachment, best-effort
+		// drop the node record, then clear state.
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout"); err != nil && !isNotFound(err) {
+			return fmt.Errorf("iscsi: logout %s: %w", iqn, err)
+		}
+		if dev != "" {
+			// Confirm the device is actually gone before declaring success.
+			if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+				return fmt.Errorf("iscsi: device %s still present after logout", dev)
+			}
+		} else {
+			// No known LUN/device to check a size for (targetd, record lost) --
+			// verify via the session list instead.
+			active, err := b.sessionActiveForIQN(ctx, iqn)
+			if err != nil {
+				return fmt.Errorf("iscsi: verify session for %s: %w", iqn, err)
+			}
+			if active {
+				return fmt.Errorf("iscsi: session for %s still present after logout", iqn)
+			}
+		}
+		// Best-effort cleanup of the node record, then drop our state.
+		_, _ = b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--op", "delete")
+		b.clearState(req.StagingPath)
+		return nil
+	})
 }
 
 // flushMultipath removes a dm-multipath map so its underlying paths can be
