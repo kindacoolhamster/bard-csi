@@ -39,12 +39,14 @@
 // StorageClass, the volume context, or the PublishContext (which lands in the
 // API-visible VolumeAttachment).
 //
-// Multipath and remote LIO management (targetd) are deliberately out of scope;
-// like the other plugins this depends only on the public bardplugin SDK.
+// dm-multipath (instance portals list) and remote LIO management (per-instance
+// management: targetd) are supported; like the other plugins this depends only
+// on the public bardplugin SDK.
 package iscsiplugin
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -54,6 +56,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
@@ -65,6 +69,10 @@ const (
 	// iscsiIface is the dedicated iscsiadm iface the node logs in under, so the
 	// per-node initiator IQN is set without touching the host initiatorname.
 	iscsiIface = "bard"
+	// mgmtLocal/mgmtTargetd are the recognized InstanceConfig.Management values;
+	// mgmtLocal is also the effective default when Management is "".
+	mgmtLocal   = "local"
+	mgmtTargetd = "targetd"
 )
 
 // supportedFsTypes mirrors the other plugins' allowlist so an unknown type fails
@@ -78,9 +86,15 @@ var supportedFsTypes = map[string]bool{
 // IQN prefix for derived target/initiator names. Access is controlled by per-node
 // ACLs, plus CHAP when enabled.
 type InstanceConfig struct {
-	VG      string `json:"vg"`                // VG to carve LUN backstores from
-	Portal  string `json:"portal"`            // iSCSI portal "ip:port" nodes connect to
-	IQNBase string `json:"iqnBase,omitempty"` // IQN prefix (default iqn.2025-01.io.bard)
+	VG     string `json:"vg"`     // VG to carve LUN backstores from
+	Portal string `json:"portal"` // iSCSI portal "ip:port" nodes connect to
+	// Portals is an optional list of "ip:port" portals for dm-multipath (one LIO
+	// network portal per address, so a node logs in over every path). When set it
+	// WINS over the single Portal (even if both are present); Portal alone still
+	// works unchanged for every existing single-path instance. Use portalList() to
+	// read either field, never Portal/Portals directly.
+	Portals []string `json:"portals,omitempty"`
+	IQNBase string   `json:"iqnBase,omitempty"` // IQN prefix (default iqn.2025-01.io.bard)
 	// ThinPool is the instance default thin pool: when set (and not overridden by
 	// the StorageClass thinPool parameter), volumes are thin copy-on-write LVs from
 	// that pre-created pool -- what enables snapshots/clone -- instead of thick ones.
@@ -89,6 +103,44 @@ type InstanceConfig struct {
 	// in this config (it ships in a ConfigMap): they are read from the mounted
 	// Secret file <chap-dir>/<instance> -- see chapFor for the format.
 	CHAPAuth bool `json:"chapAuth,omitempty"`
+
+	// Management selects how this instance's LIO export(s) are administered.
+	// "" or "local" (the default) drives targetcli directly against the
+	// plugin's own host/configfs, as documented above -- unchanged. "targetd"
+	// instead manages a REMOTE LIO host over targetd's JSON-RPC API, for a
+	// control plane that does not run on the target node itself. inst()
+	// rejects any other value.
+	Management string `json:"management,omitempty"`
+	// TargetdEndpoint is the targetd JSON-RPC endpoint (e.g.
+	// "http://host:18700/targetrpc"). Required when Management is "targetd".
+	TargetdEndpoint string `json:"targetdEndpoint,omitempty"`
+	// TargetdPool is the targetd-side storage pool volumes are carved from
+	// (targetd owns this pool remotely -- a targetd instance has no local VG).
+	// Required when Management is "targetd".
+	TargetdPool string `json:"targetdPool,omitempty"`
+	// TargetIQN is the IQN of the single target targetd manages: unlike the
+	// local one-target-per-volume model, targetd exposes every volume as a
+	// LUN under ONE fixed target, matching targetd's API shape. Required when
+	// Management is "targetd".
+	TargetIQN string `json:"targetIqn,omitempty"`
+}
+
+// isTargetd reports whether this instance's LIO export is administered
+// remotely via targetd rather than local targetcli.
+func (ic InstanceConfig) isTargetd() bool { return ic.Management == mgmtTargetd }
+
+// portalList is the single read path for an instance's portal(s): Portals if
+// non-empty, else the single Portal wrapped in a one-element list, else nil.
+// Every direct Portal/Portals read in this file goes through this so the
+// single-vs-multi-portal decision lives in exactly one place.
+func (ic InstanceConfig) portalList() []string {
+	if len(ic.Portals) > 0 {
+		return ic.Portals
+	}
+	if ic.Portal != "" {
+		return []string{ic.Portal}
+	}
+	return nil
 }
 
 // Backend implements bardplugin.Backend (+ ControllerPublisher) for iSCSI.
@@ -97,24 +149,50 @@ type Backend struct {
 	nodeID    string // CSI node id (node plane only); source of this node's initiator IQN
 	stateDir  string // node-plane: records per-staging-path session state for unstage
 	chapDir   string // dir of per-instance CHAP credential files (mounted Secret)
+	// targetdDir is the dir of per-instance targetd JSON-RPC credential files
+	// (mounted Secret), read only for instances with management: targetd --
+	// see targetdCredsFor for the format. Mirrors chapDir.
+	targetdDir string
 	// iscsiadmChroot, when set (node plane, in-cluster), runs every iscsiadm
 	// through `chroot <dir>` so the HOST's own initiator stack is used -- see
 	// the iscsiadm method for why that is required.
 	iscsiadmChroot string
 	run            Runner
+	// sysfsRoot/devRoot let dm-multipath resolution (WWID reads, by-path/by-id
+	// device paths) be pointed at a fake tree in tests -- those are direct file
+	// reads/symlinks the fakeRunner cannot intercept. Production defaults (set in
+	// New) are the real /sys and /dev; kept unexported since New's signature is
+	// the plugin's stable public entry point (used by cmd/bard-plugin-iscsi).
+	sysfsRoot string
+	devRoot   string
+	// tdAccessMu serializes every targetd grantAccess/revokeAccess call across
+	// ALL targetd instances. tdManager is built fresh per RPC call (see
+	// newTdManager in targetd.go), so a mutex FIELD ON tdManager would guard
+	// nothing across calls -- this one is owned by the long-lived Backend and
+	// handed to each tdManager by pointer. Needed because core's inflight
+	// guard keys per VOLUME, not per initiator: ControllerPublish for two
+	// DIFFERENT volumes to the SAME initiator can run fully concurrently, and
+	// without this lock both could read the same "used LUNs" snapshot,
+	// compute the same lowest-unused LUN, and create two exports with a
+	// colliding LUN. One global lock rather than per-instance: contention is
+	// negligible at CSI scale, and it keeps the fix trivially correct.
+	tdAccessMu sync.Mutex
 }
 
 // New builds the iSCSI plugin backend. nodeID + stateDir are only meaningful on
 // the node plane (the controller plane passes ""); chapDir is where per-instance
 // CHAP credential files are mounted (both planes need it when chapAuth is on);
-// iscsiadmChroot optionally chroots iscsiadm into the host root (node plane,
-// in-cluster -- empty runs it directly, e.g. on a host or in the test harness).
-func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, iscsiadmChroot string, run Runner) *Backend {
+// targetdDir is where per-instance targetd JSON-RPC credential files are mounted
+// (both planes need it for a management: targetd instance -- see
+// targetdCredsFor); iscsiadmChroot optionally chroots iscsiadm into the host
+// root (node plane, in-cluster -- empty runs it directly, e.g. on a host or in
+// the test harness).
+func New(instances map[string]InstanceConfig, nodeID, stateDir, chapDir, targetdDir, iscsiadmChroot string, run Runner) *Backend {
 	if run == nil {
 		run = ExecRunner{}
 	}
 	return &Backend{instances: instances, nodeID: nodeID, stateDir: stateDir, chapDir: chapDir,
-		iscsiadmChroot: iscsiadmChroot, run: run}
+		targetdDir: targetdDir, iscsiadmChroot: iscsiadmChroot, run: run, sysfsRoot: "/sys", devRoot: "/dev"}
 }
 
 // iscsiadm runs iscsiadm, chrooted into the host root when configured.
@@ -158,8 +236,54 @@ func lvName(csiName string) string {
 
 func (b *Backend) inst(instance string) (InstanceConfig, error) {
 	ic, ok := b.instances[instance]
-	if !ok || ic.VG == "" || ic.Portal == "" {
-		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: instance %q not configured (need vg + portal)", instance)
+	portals := ic.portalList()
+	switch ic.Management {
+	case "", mgmtLocal:
+		// Local (targetcli-driven) instance -- unchanged validation, byte-for-byte:
+		// an unconfigured instance and a configured-but-underspecified one share
+		// this one error.
+		if !ok || ic.VG == "" || len(portals) == 0 {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: instance %q not configured (need vg + portal)", instance)
+		}
+	case mgmtTargetd:
+		// targetd manages its own remote storage pool -- no local VG here.
+		if !ok || ic.TargetdEndpoint == "" || ic.TargetdPool == "" || ic.TargetIQN == "" || len(portals) == 0 {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q management=targetd not configured (need targetdEndpoint + targetdPool + targetIqn + portal)", instance)
+		}
+		// targetd's own export_create hardcodes the shared target's TPG
+		// `authentication` attribute to "0" on EVERY export -- unconditionally,
+		// with no API to override it -- even though initiator_set_auth happily
+		// stores CHAP credentials on the per-initiator ACL. Live-verified
+		// (targetd 0.10.4, upstream git main, 2026-07-20): the resulting LIO
+		// config is internally inconsistent -- the login response still
+		// advertises AuthMethod=CHAP, but the kernel initiator aborts the
+		// connection immediately after receiving it (never reaches the actual
+		// CHAP challenge/response), for BOTH a correct password and no
+		// credentials at all. So chapAuth: true on a targetd instance would
+		// silently protect nothing while claiming to -- reject at config load
+		// (the "Honest MVP" precedent CreateVolume already applies to
+		// snapshots/clones on targetd) rather than ship a StorageClass flag
+		// that lies about the data path's security.
+		if ic.CHAPAuth {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q management=targetd cannot set chapAuth: true -- targetd's export_create "+
+					"unconditionally disables TPG-level authentication on every export (upstream limitation, no API "+
+					"to override), so CHAP credentials set via initiator_set_auth are never actually enforced; "+
+					"access control on a targetd instance is IQN-based ACLs only", instance)
+		}
+	default:
+		return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+			"iscsi: instance %q has unknown management %q (want \"local\" or \"targetd\")", instance, ic.Management)
+	}
+	for _, p := range portals {
+		// Bracketed IPv6 portals ("[::1]:3260") are out of scope this round: the
+		// explicit multi-portal split (splitPortal) is only proven against plain
+		// "ip:port". Reject clearly here rather than risk a silent mis-split later.
+		if strings.Contains(p, "[") {
+			return InstanceConfig{}, bardplugin.Errorf(bardplugin.CodeInvalidArg,
+				"iscsi: instance %q portal %q: bracketed IPv6 portals are not supported", instance, p)
+		}
 	}
 	if ic.IQNBase == "" {
 		ic.IQNBase = defaultIQNBase
@@ -193,6 +317,24 @@ func sanitizeIQN(s string) string {
 func devPath(vg, lv string) string { return "/dev/" + vg + "/" + lv }
 func backstore(lv string) string   { return "/backstores/block/" + lv }
 func tpgPath(iqn string) string    { return "/iscsi/" + iqn + "/tpg1" }
+
+// mpathID derives the dm-uuid "by-id" suffix from a SCSI WWID, matching the
+// scsi_id/multipath convention used to build /dev/disk/by-id/dm-uuid-mpath-<id>:
+// a "naa." WWID becomes "3<hex>", "eui." becomes "2<hex>", "t10." becomes
+// "1<string>" (kept as-is -- t10 vendor IDs are not hex). An unrecognized prefix
+// is an error: guessing would risk polling a mapper link that will never appear.
+func mpathID(wwid string) (string, error) {
+	switch {
+	case strings.HasPrefix(wwid, "naa."):
+		return "3" + strings.TrimPrefix(wwid, "naa."), nil
+	case strings.HasPrefix(wwid, "eui."):
+		return "2" + strings.TrimPrefix(wwid, "eui."), nil
+	case strings.HasPrefix(wwid, "t10."):
+		return "1" + strings.TrimPrefix(wwid, "t10."), nil
+	default:
+		return "", fmt.Errorf("iscsi: unrecognized wwid %q (want a naa./eui./t10. prefix)", wwid)
+	}
+}
 
 // lvSizeBytes returns the LV size and whether it exists.
 func (b *Backend) lvSizeBytes(ctx context.Context, vg, lv string) (int64, bool, error) {
@@ -350,6 +492,61 @@ func (b *Backend) chapFor(instance string) (*chapCreds, error) {
 	}
 }
 
+// targetdCreds is the HTTP Basic Auth identity a targetd-managed instance's
+// JSON-RPC client authenticates with (see the targetd JSON-RPC client, added
+// in a follow-up task).
+type targetdCreds struct {
+	User, Password string
+}
+
+// targetdCredsFor loads the targetd JSON-RPC credentials for a
+// management: targetd instance, or nil when the instance is not
+// targetd-managed. The credential file is <targetdDir>/<instance> (a mounted
+// Secret key), containing exactly 2 non-empty lines:
+//
+//	username
+//	password
+//
+// Reuses chapFor's parsing/whitespace discipline line-for-line (trim blank
+// lines, reject embedded whitespace/quotes): a targetd instance is just as
+// unforgiving about credential hygiene as a CHAP one, and there is no reason
+// to invent a second convention. A targetd instance with unreadable or
+// malformed credentials is an error, not a silent fallback -- and the error
+// names only the file PATH, never its contents.
+func (b *Backend) targetdCredsFor(instance string) (*targetdCreds, error) {
+	ic, ok := b.instances[instance]
+	if !ok || !ic.isTargetd() {
+		return nil, nil
+	}
+	path := filepath.Join(b.targetdDir, instance)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: instance %q is management=targetd but credentials at %s are unreadable: %v", instance, path, err)
+	}
+	var lines []string
+	for _, l := range strings.Split(string(data), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	for _, l := range lines {
+		// The credentials become an HTTP Basic Auth header; whitespace/quotes
+		// would at best be silently mangled and at worst inject stray header
+		// content -- reject at load instead, matching chapFor's argv-safety
+		// rationale for the same class of mistake.
+		if strings.ContainsAny(l, " \t'\"") {
+			return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: targetd credentials at %s must not contain whitespace or quotes", path)
+		}
+	}
+	if len(lines) != 2 {
+		return nil, bardplugin.Errorf(bardplugin.CodeInternal,
+			"iscsi: targetd credentials at %s must be 2 lines (username, password), got %d", path, len(lines))
+	}
+	return &targetdCreds{User: lines[0], Password: lines[1]}, nil
+}
+
 // lvmUdevConfig makes lvm create and remove /dev nodes itself instead of
 // deferring to udev. In a container there is no udev to serve an activation
 // (the host udevd's completion handshake lives in the host IPC namespace), so
@@ -394,6 +591,19 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if err != nil {
 		return nil, err
 	}
+	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
+	if ic.isTargetd() && isClone {
+		// targetd's vol_copy is a synchronous full copy: unsafe to drive under
+		// CSI provisioner retries (a retried CreateVolume could pile up
+		// concurrent full copies, or double-bill the copy time on every retry).
+		// Reject fail-fast rather than silently hang a PVC restore/clone.
+		return nil, bardplugin.Errorf(bardplugin.CodeUnsupported,
+			"iscsi: creating a volume from a snapshot or another volume is not supported on targetd-managed instance %q "+
+				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots and clones", req.Instance)
+	}
+	if ic.isTargetd() {
+		return b.createVolumeTargetd(ctx, req.Instance, ic, req)
+	}
 	vg, lv := ic.VG, lvName(req.Name)
 
 	// 1. The backing LV (idempotent via size check, like the LVM plugin).
@@ -401,7 +611,6 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if err != nil {
 		return nil, err
 	}
-	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
 	switch {
 	case found:
 		// Idempotent retry: an LV at least as large as requested satisfies the
@@ -485,6 +694,13 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	if _, err := b.run.Run(ctx, "targetcli", "/iscsi", "create", iqn); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: create target %s: %w", iqn, err)
 	}
+	// dm-multipath: a 2+-portal instance gets one explicit LIO network portal per
+	// configured address, replacing targetcli's auto-created default.
+	if portals := ic.portalList(); len(portals) >= 2 {
+		if err := b.setExplicitPortals(ctx, tpgPath(iqn), portals); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := b.run.Run(ctx, "targetcli", tpgPath(iqn)+"/luns", "create", backstore(lv)); err != nil && !isExists(err) {
 		return nil, fmt.Errorf("iscsi: map lun for %s: %w", iqn, err)
 	}
@@ -514,13 +730,75 @@ func lvBytes(b int64) string {
 	return strconv.FormatInt(b, 10) + "b"
 }
 
+// setExplicitPortals replaces a tpg's auto-created default network portal with
+// one explicit portal per configured address -- what makes dm-multipath login
+// possible (a node needs a distinct path per portal to build multiple sessions
+// to the same LUN). Substrate-verified 2026-07-19: modern targetcli auto-creates
+// the default as dual-stack "::0:3260" (IPv6-any, which also holds port 3260 for
+// v4), NOT "0.0.0.0:3260" as older targetcli/kernels did -- so both forms are
+// attempted for delete, in that order, each tolerating not-found (observed live
+// phrasing: "No such NetworkPortal in configfs: ..."). Each create tolerates
+// already-exists so a retried CreateVolume converges.
+func (b *Backend) setExplicitPortals(ctx context.Context, tpg string, portals []string) error {
+	if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "delete", "0.0.0.0", "3260"); err != nil && !isNotFound(err) {
+		return fmt.Errorf("iscsi: delete default portal 0.0.0.0:3260 on %s: %w", tpg, err)
+	}
+	if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "delete", "::0", "3260"); err != nil && !isNotFound(err) {
+		return fmt.Errorf("iscsi: delete default portal ::0:3260 on %s: %w", tpg, err)
+	}
+	for _, p := range portals {
+		ip, port, err := splitPortal(p)
+		if err != nil {
+			return err
+		}
+		if _, err := b.run.Run(ctx, "targetcli", tpg+"/portals", "create", ip, port); err != nil && !isExists(err) {
+			return fmt.Errorf("iscsi: create portal %s on %s: %w", p, tpg, err)
+		}
+	}
+	return nil
+}
+
+// splitPortal splits an "ip:port" portal string on the LAST colon. Bracketed
+// IPv6 portals are rejected earlier at inst() validation, so any colon here is
+// the ip:port separator, not part of an IPv6 address.
+func splitPortal(portal string) (ip, port string, err error) {
+	i := strings.LastIndex(portal, ":")
+	if i < 0 {
+		return "", "", bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: malformed portal %q (want ip:port)", portal)
+	}
+	return portal[:i], portal[i+1:], nil
+}
+
 // DeleteVolume tears the export down then removes the LV, in dependency order
 // (target -> backstore -> LV) so nothing references a removed object. Every step
 // is idempotent and a non-not-found error is surfaced (never reports success while
 // the volume's data could still exist -- no silent orphan).
 func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolumeRequest) error {
+	ic, ok := b.instances[req.Volume.Instance]
+	if !ok {
+		if isTdLocation(req.Volume.Location) {
+			// The volume's own recorded Location marks it as targetd-managed
+			// (see tdLocationPrefix) -- reaching it needs the instance's
+			// endpoint+creds, which only live in CURRENT config, so there is
+			// nothing to derive. CodeInternal is retriable (unlike NotFound,
+			// which core/CSI treats as terminal success -- that would silently
+			// orphan the remote volume/export) and not terminal (unlike
+			// InvalidArgument, which would kill an
+			// operator-restores-the-instance-then-retries recovery path).
+			return bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: instance %q not configured, cannot reach remote targetd volume %s -- restore the instance or clean up manually",
+				req.Volume.Instance, req.Volume.Location)
+		}
+		// Unmarked (local, or a pre-targetd handle): ic stays the zero value,
+		// so IQNBase falls back to defaultIQNBase below exactly as it always
+		// has -- this is the PRE-EXISTING, deliberate derived-cleanup design
+		// (the handle's own Location IS the VG, so lvremove genuinely deletes
+		// it with no instance config at all; mirrors NodeUnstage's documented
+		// derived-logout fallback). Falls through to the shared teardown below.
+	} else if ic.isTargetd() {
+		return b.deleteVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name)
+	}
 	vg, lv := req.Volume.Location, req.Volume.Name
-	ic := b.instances[req.Volume.Instance]
 	base := ic.IQNBase
 	if base == "" {
 		base = defaultIQNBase
@@ -540,6 +818,9 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 }
 
 func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolumeRequest) (*bardplugin.ExpandVolumeResponse, error) {
+	if ic := b.instances[req.Volume.Instance]; ic.isTargetd() {
+		return b.expandVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name, req.NewSizeBytes)
+	}
 	vg, lv := req.Volume.Location, req.Volume.Name
 	if err := b.extendTo(ctx, vg, lv, req.NewSizeBytes); err != nil {
 		return nil, err
@@ -558,6 +839,19 @@ func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolume
 // so it is rejected. The snapshot is a control-plane object -- it gets NO LIO
 // export; a restore clones it into a new volume with its own target.
 func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
+	// Unlike the rest of this method (historically instance-agnostic: it works
+	// purely off src.Location/src.Name), this needs the INSTANCE to know
+	// whether it's targetd-managed -- targetd's vol_copy is a synchronous full
+	// copy, unsafe under provisioner retries.
+	ic, err := b.inst(req.SourceVolume.Instance)
+	if err != nil {
+		return nil, err
+	}
+	if ic.isTargetd() {
+		return nil, bardplugin.Errorf(bardplugin.CodeUnsupported,
+			"iscsi: snapshots are not supported on targetd-managed instance %q "+
+				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots", req.SourceVolume.Instance)
+	}
 	src := req.SourceVolume // Location=vg, Name=lv
 	thin, exists, err := b.isThinLV(ctx, src.Location, src.Name)
 	if err != nil {
@@ -610,10 +904,14 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnap
 // ---- control-plane attach (ControllerPublisher) --------------------------
 
 // ctxPortal/ctxIQN/ctxLUN are the PublishContext keys carried to NodeStage.
+// ctxPortals is additive: only present for a 2+-portal instance (dm-multipath),
+// so a single-portal PublishContext is byte-identical to before this field
+// existed.
 const (
-	ctxPortal = "portal"
-	ctxIQN    = "targetIqn"
-	ctxLUN    = "lun"
+	ctxPortal  = "portal"
+	ctxIQN     = "targetIqn"
+	ctxLUN     = "lun"
+	ctxPortals = "portals"
 )
 
 // ControllerPublish masks this volume's LUN to the node by adding an ACL for the
@@ -626,6 +924,9 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 	ic, err := b.inst(req.Volume.Instance)
 	if err != nil {
 		return nil, err
+	}
+	if ic.isTargetd() {
+		return b.controllerPublishTargetd(ctx, req.Volume.Instance, ic, req)
 	}
 	chap, err := b.chapFor(req.Volume.Instance)
 	if err != nil {
@@ -648,11 +949,16 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 				redactSecrets(err, chap.Password, chap.MutualPassword))
 		}
 	}
-	return &bardplugin.ControllerPublishResponse{PublishContext: map[string]string{
-		ctxPortal: ic.Portal,
+	portals := ic.portalList()
+	pc := map[string]string{
+		ctxPortal: portals[0],
 		ctxIQN:    iqn,
 		ctxLUN:    "0",
-	}}, nil
+	}
+	if len(portals) >= 2 {
+		pc[ctxPortals] = strings.Join(portals, ",")
+	}
+	return &bardplugin.ControllerPublishResponse{PublishContext: pc}, nil
 }
 
 // ControllerUnpublish removes the node's ACL, revoking its access. Idempotent: a
@@ -661,7 +967,23 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 // node id, and reporting success while leaving the ACL in place would let the
 // node keep reaching the LUN whenever the config entry is missing or broken.
 func (b *Backend) ControllerUnpublish(ctx context.Context, req *bardplugin.ControllerUnpublishRequest) error {
-	base := b.instances[req.Volume.Instance].IQNBase
+	ic, ok := b.instances[req.Volume.Instance]
+	if !ok {
+		if isTdLocation(req.Volume.Location) {
+			// Same reasoning as DeleteVolume's identical guard: a MARKED
+			// Location means reaching this volume needs the instance's
+			// endpoint+creds, which only live in current config.
+			return bardplugin.Errorf(bardplugin.CodeInternal,
+				"iscsi: instance %q not configured, cannot reach remote targetd volume %s -- restore the instance or clean up manually",
+				req.Volume.Instance, req.Volume.Location)
+		}
+		// Unmarked: same derived-ACL-cleanup fallback as DeleteVolume's
+		// identical case -- falls through to the shared teardown below with
+		// ic at its zero value (IQNBase defaults to defaultIQNBase, as always).
+	} else if ic.isTargetd() {
+		return b.controllerUnpublishTargetd(ctx, req.Volume.Instance, ic, req)
+	}
+	base := ic.IQNBase
 	if base == "" {
 		base = defaultIQNBase
 	}
@@ -681,6 +1003,13 @@ type stagedState struct {
 	Device string `json:"device"`
 	IQN    string `json:"iqn"`
 	Portal string `json:"portal"`
+	// Portals/Devices/Mapper are additive: set only for a dm-multipath (2+
+	// portal) stage. An old single-path record (or a fresh single-path stage)
+	// loads with them empty, which keeps NodeUnstage/NodePublish on the
+	// single-path branch.
+	Portals []string `json:"portals,omitempty"`
+	Devices []string `json:"devices,omitempty"`
+	Mapper  string   `json:"mapper,omitempty"`
 }
 
 func (b *Backend) statePath(stagingPath string) string {
@@ -723,9 +1052,122 @@ func (b *Backend) clearState(stagingPath string) {
 	}
 }
 
-// byPath is the stable device symlink the kernel creates for a logged-in LUN.
-func byPath(portal, iqn, lun string) string {
-	return "/dev/disk/by-path/ip-" + portal + "-iscsi-" + iqn + "-lun-" + lun
+// withTargetLock serializes, per target IQN, NodeStage's login-or-rescan
+// decision and NodeUnstage's refcount-scan-then-act -- both read "do any
+// OTHER staged volumes share this target?" and then act on the answer, and
+// without a lock two concurrent unstages of the last two volumes sharing a
+// target can both observe "another record exists" before either clears its
+// own, and both skip the final logout (a leaked session). The lock is a flock
+// on a per-IQN file under stateDir, held for the whole read-then-act; when
+// stateDir is empty (no persistent state configured -- shouldn't happen on
+// the node plane in practice) fn runs unlocked, mirroring recordState/
+// loadState's no-op-when-empty convention.
+func (b *Backend) withTargetLock(iqn string, fn func() error) error {
+	if b.stateDir == "" {
+		return fn()
+	}
+	if err := os.MkdirAll(b.stateDir, 0o750); err != nil {
+		return fmt.Errorf("iscsi: state dir: %w", err)
+	}
+	sum := sha1.Sum([]byte(iqn))
+	lockPath := filepath.Join(b.stateDir, "lock-"+hex.EncodeToString(sum[:]))
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return fmt.Errorf("iscsi: open target lock: %w", err)
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("iscsi: lock target %s: %w", iqn, err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// otherRecordsForIQN counts staged-state records -- other than the one at
+// excludeStagingPath, if any -- that share iqn. This is the target-IQN
+// refcount NodeStage/NodeUnstage use to decide, for a shared target (targetd
+// management: every volume is a LUN under ONE fixed target IQN), whether a
+// session is already up (skip discovery/login, rescan instead) and whether
+// this is the last volume on that target (only then log out). For a
+// per-volume target (local management: each volume's target IQN is unique to
+// it) this always comes out to zero -- so local-mode behavior is unchanged BY
+// CONSTRUCTION. A missing state dir counts as zero, not an error; a lock file
+// (skipped by its "lock-" prefix) or a corrupt/mid-write state file (skipped
+// on read/parse error) is tolerated exactly like loadState.
+func (b *Backend) otherRecordsForIQN(iqn, excludeStagingPath string) (int, error) {
+	if b.stateDir == "" {
+		return 0, nil
+	}
+	entries, err := os.ReadDir(b.stateDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("iscsi: scan state dir: %w", err)
+	}
+	var exclude string
+	if excludeStagingPath != "" {
+		exclude = b.statePath(excludeStagingPath)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "lock-") {
+			continue
+		}
+		full := filepath.Join(b.stateDir, entry.Name())
+		if exclude != "" && full == exclude {
+			continue
+		}
+		data, err := os.ReadFile(full)
+		if err != nil {
+			continue
+		}
+		var st stagedState
+		if json.Unmarshal(data, &st) != nil {
+			continue
+		}
+		if st.IQN == iqn {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// sessionActiveForIQN reports whether `iscsiadm -m session` still lists a
+// session for iqn. Used to verify the final logout on a shared target
+// (targetd management) with no state record and so no known device/LUN to
+// check a blockdev size against -- the check NodeUnstage's state-based/
+// locally-derived branches use instead. iscsiadm errors (classified
+// isNotFound, e.g. "No active sessions") when there are no sessions at all,
+// which itself means "not active", not a failure to check.
+func (b *Backend) sessionActiveForIQN(ctx context.Context, iqn string) (bool, error) {
+	out, err := b.iscsiadm(ctx, "-m", "session")
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return strings.Contains(out, iqn), nil
+}
+
+// byPath is the stable device symlink the kernel creates for a logged-in LUN,
+// under devRoot (defaults to /dev; tests point it at a fake tree).
+func (b *Backend) byPath(portal, iqn, lun string) string {
+	return filepath.Join(b.devRoot, "disk", "by-path", "ip-"+portal+"-iscsi-"+iqn+"-lun-"+lun)
+}
+
+// multipathPortals resolves the portal list for a NodeStage request: the
+// PublishContext's explicit "portals" key (set by ControllerPublish for a
+// 2+-portal instance) takes precedence over the instance config, mirroring how
+// portal/targetIqn/lun already fall back to instance config when the context
+// doesn't carry them. NodeUnstage has no PublishContext at all (CSI doesn't
+// carry one on unstage), so its callers go straight to ic.portalList().
+func multipathPortals(pc map[string]string, ic InstanceConfig) []string {
+	if v := pc[ctxPortals]; v != "" {
+		return strings.Split(v, ",")
+	}
+	return ic.portalList()
 }
 
 // ensureIface makes the dedicated iscsiadm iface carry this node's derived
@@ -777,10 +1219,55 @@ func (b *Backend) waitForDevice(ctx context.Context, dev string) error {
 	}
 }
 
+// waitForMapper resolves the assembled dm-multipath device from ONE already-
+// logged-in path device: EvalSymlinks the by-path link to the kernel's sd node,
+// read its WWID from sysfs, and poll the dm-uuid "by-id" link that
+// multipathd/udev assemble once every path is up (observed live: ~4s after the
+// 2nd login; same poll cadence as waitForDevice). This NEVER returns a
+// /dev/mapper/<name> path -- host multipath.conf may set user_friendly_names,
+// so only the dm-uuid link (stable, naming-independent) is safe to reference.
+func (b *Backend) waitForMapper(ctx context.Context, pathDev string) (string, error) {
+	sdPath, err := filepath.EvalSymlinks(pathDev)
+	if err != nil {
+		return "", fmt.Errorf("iscsi: resolve path device %s: %w", pathDev, err)
+	}
+	sd := filepath.Base(sdPath)
+	wwidPath := filepath.Join(b.sysfsRoot, "class", "block", sd, "device", "wwid")
+	wwidRaw, err := os.ReadFile(wwidPath)
+	if err != nil {
+		return "", fmt.Errorf("iscsi: read wwid %s: %w", wwidPath, err)
+	}
+	id, err := mpathID(strings.TrimSpace(string(wwidRaw)))
+	if err != nil {
+		return "", err
+	}
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		if _, err := os.Lstat(mapper); err == nil {
+			return mapper, nil
+		}
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("iscsi: wait for mapper %s: %w", mapper, ctx.Err())
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("iscsi: mapper %s not ready after timeout", mapper)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageRequest) error {
 	ic, err := b.inst(req.Volume.Instance)
 	if err != nil {
 		return err
+	}
+	// dm-multipath: PublishContext's explicit portals list takes precedence over
+	// instance config (mirrors how portal/targetIqn/lun already fall back to
+	// instance config below); 2+ portals hands the ENTIRE stage to the multipath
+	// branch below, which never touches the single-portal code beneath it.
+	if portals := multipathPortals(req.PublishContext, ic); len(portals) >= 2 {
+		return b.nodeStageMultipath(ctx, req, ic, portals)
 	}
 	// Connection details come from ControllerPublish via PublishContext; fall back
 	// to deriving them (so a manual/no-attach run still works).
@@ -788,7 +1275,7 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	iqn := req.PublishContext[ctxIQN]
 	lun := req.PublishContext[ctxLUN]
 	if portal == "" {
-		portal = ic.Portal
+		portal = ic.portalList()[0]
 	}
 	if iqn == "" {
 		iqn = targetIQN(ic.IQNBase, req.Volume.Name)
@@ -801,28 +1288,48 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	if err := b.ensureIface(ctx, initIQN); err != nil {
 		return err
 	}
-	// Discover the target on the portal, then log in under our iface. Both are
-	// idempotent on a stage retry. When the instance enforces CHAP, the
-	// credentials go on the discovered node record before the login (LIO's
-	// discovery itself stays unauthenticated; only the login is gated).
-	if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
-		return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
-	}
-	chap, err := b.chapFor(req.Volume.Instance)
-	if err != nil {
-		return err
-	}
-	if chap != nil {
-		if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+	// The login-or-rescan decision and the wait for OUR device are made under
+	// the per-target flock, together with the refcount read that decides
+	// between them -- see withTargetLock.
+	dev := b.byPath(portal, iqn, lun)
+	if err := b.withTargetLock(iqn, func() error {
+		shared, err := b.otherRecordsForIQN(iqn, "")
+		if err != nil {
 			return err
 		}
-	}
-	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
-		return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
-	}
-
-	dev := byPath(portal, iqn, lun)
-	if err := b.waitForDevice(ctx, dev); err != nil {
+		if shared > 0 {
+			// Another staged volume already has a live session for this target
+			// (a shared-target instance, e.g. targetd) -- logging in again is
+			// wrong (or at best redundant); rescan so the kernel picks up THIS
+			// volume's own LUN instead, the same idiom NodeExpand already uses
+			// for a resize.
+			if _, err := b.iscsiadm(ctx, "-m", "session", "--rescan"); err != nil && !isNotFound(err) {
+				return fmt.Errorf("iscsi: session rescan: %w", err)
+			}
+		} else {
+			// Discover the target on the portal, then log in under our iface. Both
+			// are idempotent on a stage retry. When the instance enforces CHAP,
+			// the credentials go on the discovered node record before the login
+			// (LIO's discovery itself stays unauthenticated; only the login is
+			// gated).
+			if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
+				return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
+			}
+			chap, err := b.chapFor(req.Volume.Instance)
+			if err != nil {
+				return err
+			}
+			if chap != nil {
+				if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+					return err
+				}
+			}
+			if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
+				return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
+			}
+		}
+		return b.waitForDevice(ctx, dev)
+	}); err != nil {
 		return err
 	}
 	if err := b.recordState(req.StagingPath, stagedState{Device: dev, IQN: iqn, Portal: portal}); err != nil {
@@ -865,6 +1372,94 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 	return b.growFilesystem(ctx, fsType, dev, req.StagingPath)
 }
 
+// nodeStageMultipath is NodeStage's dm-multipath branch (2+ portals): it logs in
+// under EVERY portal (ensureIface once, then per portal: discovery, CHAP, login
+// -- the SAME per-portal order the single-path code above already uses),
+// resolves the kernel-assembled multipath device from one path's WWID, and
+// formats/mounts/grows against the MAPPER, never a single leg -- so
+// multipathd, not the filesystem, owns path failover.
+func (b *Backend) nodeStageMultipath(ctx context.Context, req *bardplugin.NodeStageRequest, ic InstanceConfig, portals []string) error {
+	iqn := req.PublishContext[ctxIQN]
+	if iqn == "" {
+		iqn = targetIQN(ic.IQNBase, req.Volume.Name)
+	}
+	lun := req.PublishContext[ctxLUN]
+	if lun == "" {
+		lun = "0"
+	}
+	initIQN := initiatorIQN(ic.IQNBase, b.nodeID)
+
+	if err := b.ensureIface(ctx, initIQN); err != nil {
+		return err
+	}
+	chap, err := b.chapFor(req.Volume.Instance)
+	if err != nil {
+		return err
+	}
+
+	devs := make([]string, 0, len(portals))
+	for _, portal := range portals {
+		if _, err := b.iscsiadm(ctx, "-m", "discovery", "-t", "sendtargets", "-p", portal, "-I", iscsiIface); err != nil && !isExists(err) {
+			return fmt.Errorf("iscsi: discovery on %s: %w", portal, err)
+		}
+		if chap != nil {
+			if err := b.setChapOnNode(ctx, iqn, portal, chap); err != nil {
+				return err
+			}
+		}
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "-I", iscsiIface, "--login"); err != nil && !isAlreadyLoggedIn(err) {
+			return fmt.Errorf("iscsi: login to %s: %w", iqn, err)
+		}
+		dev := b.byPath(portal, iqn, lun)
+		if err := b.waitForDevice(ctx, dev); err != nil {
+			return err
+		}
+		devs = append(devs, dev)
+	}
+
+	// Every path shares the same WWID (same LUN); resolve the assembled mapper
+	// from whichever one -- the first, since all are now logged in.
+	mapper, err := b.waitForMapper(ctx, devs[0])
+	if err != nil {
+		return err
+	}
+	if err := b.recordState(req.StagingPath, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		return err
+	}
+
+	if req.Block {
+		return nil // raw block: device published directly, nothing to format/mount
+	}
+	fsType := req.FsType
+	if fsType == "" {
+		fsType = defaultFsType
+	}
+	if !supportedFsTypes[fsType] {
+		return bardplugin.Errorf(bardplugin.CodeInvalidArg,
+			"iscsi: unsupported fsType %q (supported: ext4, ext3, ext2, xfs, btrfs)", fsType)
+	}
+	if err := b.ensureFormatted(ctx, mapper, fsType); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(req.StagingPath, 0o750); err != nil {
+		return fmt.Errorf("iscsi: mkdir staging: %w", err)
+	}
+	if out, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "SOURCE", "--mountpoint", req.StagingPath); strings.TrimSpace(out) == "" {
+		mountArgs := []string{"-t", fsType}
+		if len(req.MountFlags) > 0 {
+			mountArgs = append(mountArgs, "-o", strings.Join(req.MountFlags, ","))
+		}
+		mountArgs = append(mountArgs, mapper, req.StagingPath)
+		if _, err := b.run.Run(ctx, "mount", mountArgs...); err != nil {
+			return fmt.Errorf("iscsi: mount %s -> %s: %w", mapper, req.StagingPath, err)
+		}
+	}
+	return b.growFilesystem(ctx, fsType, mapper, req.StagingPath)
+}
+
 // setChapOnNode writes the CHAP credentials onto the node record for (iqn,
 // portal) under our iface, so the subsequent login authenticates. iscsiadm takes
 // one name/value per --op update, so this is a short series of updates.
@@ -889,9 +1484,11 @@ func (b *Backend) setChapOnNode(ctx context.Context, iqn, portal string, chap *c
 	return nil
 }
 
-// NodeUnstage unmounts, logs out the session, and verifies the device is gone --
-// returning an error if it is still present so kubelet retries (never reports
-// success while the LUN is still attached, mirroring the rbd-nbd unmap rule).
+// NodeUnstage unmounts, then hands off to unstageSingleTarget (or, for a
+// 2+-portal instance, the multipath teardown) to log out and verify
+// detachment -- returning an error if a session/device that must be gone
+// isn't, so kubelet retries (never reports success while the LUN is still
+// attached, mirroring the rbd-nbd unmap rule).
 func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRequest) error {
 	if _, err := b.run.Run(ctx, "umount", req.StagingPath); err != nil && !isNotMounted(err) {
 		return fmt.Errorf("iscsi: umount %s: %w", req.StagingPath, err)
@@ -902,30 +1499,229 @@ func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRe
 		// lost whenever the plugin container restarts with an unpersisted state
 		// dir (found live in-cluster -- a mid-lifetime pod restart turned every
 		// later unstage into a silent no-op, leaking the session past volume
-		// deletion). Everything needed is derivable -- the target IQN from the
-		// volume name, the portal from the instance, LUN is always 0 -- so
-		// reconstruct and log out anyway; on a node that truly never staged the
-		// volume the logout is a clean isNotFound no-op.
+		// deletion). Everything needed is derivable for a per-volume target
+		// (local management): the target IQN from the volume name, the portal
+		// from the instance, LUN is always 0 -- so reconstruct and log out
+		// anyway; on a node that truly never staged the volume the logout is a
+		// clean isNotFound no-op.
 		ic := b.instances[req.Volume.Instance]
 		base := ic.IQNBase
 		if base == "" {
 			base = defaultIQNBase
 		}
-		if ic.Portal == "" {
+		pl := ic.portalList()
+		if len(pl) == 0 {
 			return nil // instance unknown: nothing derivable, nothing to log out of
 		}
 		iqn := targetIQN(base, req.Volume.Name)
-		st = stagedState{IQN: iqn, Portal: ic.Portal, Device: byPath(ic.Portal, iqn, "0")}
+		if ic.isTargetd() {
+			// A shared-target instance (targetd) exposes EVERY volume as a LUN
+			// under ONE fixed target IQN -- the per-volume derived IQN above is
+			// the wrong target here.
+			iqn = ic.TargetIQN
+		}
+		if len(pl) >= 2 {
+			return b.nodeUnstageDerivedMultipath(ctx, req, iqn, pl)
+		}
+		portal := pl[0]
+		if ic.isTargetd() {
+			// With no state record, this volume's LUN on the shared target isn't
+			// known (targetd allocates it per-initiator at ControllerPublish
+			// time) -- unlike local mode there is no LUN 0 to guess, so hand off
+			// with an empty device: unstageSingleTarget skips the sysfs
+			// device-delete step and verifies the final logout via the session
+			// list instead of a device size.
+			return b.unstageSingleTarget(ctx, req, iqn, portal, "")
+		}
+		st = stagedState{IQN: iqn, Portal: portal, Device: b.byPath(portal, iqn, "0")}
 	}
-	if _, err := b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--logout"); err != nil && !isNotFound(err) {
-		return fmt.Errorf("iscsi: logout %s: %w", st.IQN, err)
+	if len(st.Portals) >= 2 {
+		return b.nodeUnstageMultipath(ctx, req, st)
 	}
-	// Confirm the device is actually gone before declaring success.
-	if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", st.Device); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
-		return fmt.Errorf("iscsi: device %s still present after logout", st.Device)
+	return b.unstageSingleTarget(ctx, req, st.IQN, st.Portal, st.Device)
+}
+
+// unstageSingleTarget is the single-portal NodeUnstage teardown core, shared
+// by the state-found branch and the locally-derived (non-targetd) fallback --
+// both know a device (the recorded one, or LUN 0 for a derived per-volume
+// target), so refcounting them here provably behaves as "always last" for a
+// per-volume target (its IQN is unique, so no other record can ever share
+// it), leaving pre-this-task local-mode behavior unchanged BY CONSTRUCTION --
+// and by the targetd-derived fallback with no known device (dev == ""),
+// which cannot sysfs-delete a specific LUN and instead verifies the final
+// logout via the session list rather than a device size.
+//
+// The refcount read and the resulting not-last/last decision run under the
+// per-target flock (withTargetLock), closing the TOCTOU where two concurrent
+// unstages of the last two volumes sharing a target both see "another record
+// exists" and both skip the final logout.
+func (b *Backend) unstageSingleTarget(ctx context.Context, req *bardplugin.NodeUnstageRequest, iqn, portal, dev string) error {
+	return b.withTargetLock(iqn, func() error {
+		shared, err := b.otherRecordsForIQN(iqn, req.StagingPath)
+		if err != nil {
+			return err
+		}
+		if shared > 0 {
+			// Not last: another staged volume still needs this target's shared
+			// session -- do NOT log out. Detach only OUR LUN mapping (when it is
+			// known) via a raw sysfs delete, which drops the one SCSI device
+			// without touching the session other volumes still use.
+			if dev != "" {
+				sdPath, err := filepath.EvalSymlinks(dev)
+				if err != nil {
+					return fmt.Errorf("iscsi: resolve device %s: %w", dev, err)
+				}
+				deletePath := filepath.Join(b.sysfsRoot, "class", "block", filepath.Base(sdPath), "device", "delete")
+				// Mode only matters if this path doesn't already exist (a real
+				// sysfs attribute file always does, so the kernel's own
+				// permissions win there); 0o600 just lets a test fixture read
+				// back what was written.
+				if err := os.WriteFile(deletePath, []byte("1"), 0o600); err != nil {
+					return fmt.Errorf("iscsi: detach %s: %w", deletePath, err)
+				}
+			}
+			b.clearState(req.StagingPath)
+			return nil
+		}
+		// Last (or a per-volume target, which is always "last"): today's full
+		// teardown -- logout, tolerate no-session, verify detachment, best-effort
+		// drop the node record, then clear state.
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout"); err != nil && !isNotFound(err) {
+			return fmt.Errorf("iscsi: logout %s: %w", iqn, err)
+		}
+		if dev != "" {
+			// Confirm the device is actually gone before declaring success.
+			if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+				return fmt.Errorf("iscsi: device %s still present after logout", dev)
+			}
+		} else {
+			// No known LUN/device to check a size for (targetd, record lost) --
+			// verify via the session list instead.
+			active, err := b.sessionActiveForIQN(ctx, iqn)
+			if err != nil {
+				return fmt.Errorf("iscsi: verify session for %s: %w", iqn, err)
+			}
+			if active {
+				return fmt.Errorf("iscsi: session for %s still present after logout", iqn)
+			}
+		}
+		// Best-effort cleanup of the node record, then drop our state.
+		_, _ = b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--op", "delete")
+		b.clearState(req.StagingPath)
+		return nil
+	})
+}
+
+// flushMultipath removes a dm-multipath map so its underlying paths can be
+// logged out cleanly. Retries once (multipathd can be mid-reconfigure right
+// after a path drops), then confirms the map is actually gone via `dmsetup
+// info` (which errors once the device node no longer exists) rather than
+// trusting `multipath -f`'s exit code alone. A no-op when there is no known
+// mapper (nothing was ever assembled).
+func (b *Backend) flushMultipath(ctx context.Context, mapper string) error {
+	if mapper == "" {
+		return nil
 	}
-	// Best-effort cleanup of the node record, then drop our state.
-	_, _ = b.iscsiadm(ctx, "-m", "node", "-T", st.IQN, "-p", st.Portal, "--op", "delete")
+	// multipath -f does NOT resolve the dm-uuid by-id symlink we track ("device
+	// not found", live-verified); it needs the real dm node. dmsetup below DOES
+	// accept the symlink, so only the flush argument is resolved.
+	if resolved, rerr := filepath.EvalSymlinks(mapper); rerr == nil {
+		mapper = resolved
+	}
+	_, err := b.run.Run(ctx, "multipath", "-f", mapper)
+	if err != nil {
+		_, err = b.run.Run(ctx, "multipath", "-f", mapper) // one retry
+	}
+	if _, derr := b.run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "name", mapper); derr == nil {
+		// dmsetup still resolves the map: the flush did not actually take.
+		if err != nil {
+			return fmt.Errorf("iscsi: flush multipath map %s: %w", mapper, err)
+		}
+		return fmt.Errorf("iscsi: multipath map %s still present after flush", mapper)
+	}
+	return nil
+}
+
+// unstageMultipath is the shared multipath teardown core for both the
+// state-based and derived NodeUnstage branches: flush the map (if known)
+// BEFORE logging any path out -- logging out from under a live map leaves it
+// stuck holding a dead path -- then log out every portal (tolerating
+// no-session), verify every known path device is actually gone (never report
+// success while a leg is still attached), then best-effort drop each portal's
+// node record.
+func (b *Backend) unstageMultipath(ctx context.Context, iqn, mapper string, portals, devices []string) error {
+	// Pre-logout flush is BEST-EFFORT only: while the sessions (and so the sd
+	// paths) are still alive, multipathd can re-assemble the map the moment
+	// `multipath -f` removes it (find_multipaths + a known wwid). Live-found
+	// in-cluster: the flush "succeeded" but the map was back before the check,
+	// wedging unstage forever. The authoritative map-gone check moves to AFTER
+	// the logouts destroy the paths (multipathd reaps a pathless map).
+	_ = b.flushMultipath(ctx, mapper)
+	for _, portal := range portals {
+		if _, err := b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--logout"); err != nil && !isNotFound(err) {
+			return fmt.Errorf("iscsi: logout %s (%s): %w", iqn, portal, err)
+		}
+	}
+	for _, dev := range devices {
+		if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+			return fmt.Errorf("iscsi: device %s still present after logout", dev)
+		}
+	}
+	// Ground truth, post-logout: with every path gone the map must not survive.
+	// One more flush covers a multipathd that keeps pathless maps (queueing).
+	if err := b.flushMultipath(ctx, mapper); err != nil {
+		return err
+	}
+	for _, portal := range portals {
+		_, _ = b.iscsiadm(ctx, "-m", "node", "-T", iqn, "-p", portal, "--op", "delete")
+	}
+	return nil
+}
+
+// nodeUnstageMultipath is NodeUnstage's dm-multipath branch when a state record
+// is present (st.Portals has 2+ entries): tear down using the RECORDED mapper
+// and device list, then clear the state.
+func (b *Backend) nodeUnstageMultipath(ctx context.Context, req *bardplugin.NodeUnstageRequest, st stagedState) error {
+	if err := b.unstageMultipath(ctx, st.IQN, st.Mapper, st.Portals, st.Devices); err != nil {
+		return err
+	}
+	b.clearState(req.StagingPath)
+	return nil
+}
+
+// derivedMapper resolves a 2+-portal instance's assembled multipath device from
+// whichever configured portal still has a live path device -- used by both
+// NodeUnstage's and NodePublish's fallbacks when the state record is lost.
+// Returns ("", nil) when no configured portal has a live device (nothing to
+// resolve, nothing to flush); a live device whose wwid/mapper cannot be
+// resolved is a real error, not a silent skip.
+func (b *Backend) derivedMapper(ctx context.Context, iqn string, portals []string) (string, error) {
+	for _, portal := range portals {
+		dev := b.byPath(portal, iqn, "0")
+		if out, _ := b.run.Run(ctx, "blockdev", "--getsize64", dev); strings.TrimSpace(out) != "" && strings.TrimSpace(out) != "0" {
+			return b.waitForMapper(ctx, dev)
+		}
+	}
+	return "", nil
+}
+
+// nodeUnstageDerivedMultipath is NodeUnstage's derived-identity fallback for a
+// LOST state record on a 2+-portal instance: resolve whichever path device (if
+// any) is still live to its mapper -- so a live map is flushed before any
+// logout, exactly the state-based order, just without a recorded device list to
+// rely on -- then run the same teardown core.
+func (b *Backend) nodeUnstageDerivedMultipath(ctx context.Context, req *bardplugin.NodeUnstageRequest, iqn string, portals []string) error {
+	devices := make([]string, len(portals))
+	for i, portal := range portals {
+		devices[i] = b.byPath(portal, iqn, "0")
+	}
+	mapper, err := b.derivedMapper(ctx, iqn, portals)
+	if err != nil {
+		return err
+	}
+	if err := b.unstageMultipath(ctx, iqn, mapper, portals, devices); err != nil {
+		return err
+	}
 	b.clearState(req.StagingPath)
 	return nil
 }
@@ -939,16 +1735,35 @@ func (b *Backend) NodePublish(ctx context.Context, req *bardplugin.NodePublishRe
 		// wedge on a missing record while the LUN is attached.
 		st, ok := b.loadState(req.StagingPath)
 		dev := st.Device
+		if ok && st.Mapper != "" {
+			// A recorded multipath stage must bind-mount the MAPPER, never one leg
+			// -- that would defeat the entire point of multipath.
+			dev = st.Mapper
+		}
 		if !ok || dev == "" {
 			ic := b.instances[req.Volume.Instance]
-			if ic.Portal == "" {
+			pl := ic.portalList()
+			if len(pl) == 0 {
 				return bardplugin.Errorf(bardplugin.CodeInvalidArg, "iscsi: no staged device for %s", req.StagingPath)
 			}
 			base := ic.IQNBase
 			if base == "" {
 				base = defaultIQNBase
 			}
-			dev = byPath(ic.Portal, targetIQN(base, req.Volume.Name), "0")
+			iqn := targetIQN(base, req.Volume.Name)
+			if len(pl) >= 2 {
+				mapper, err := b.derivedMapper(ctx, iqn, pl)
+				if err != nil {
+					return err
+				}
+				if mapper == "" {
+					return bardplugin.Errorf(bardplugin.CodeInternal,
+						"iscsi: no live path device found to derive the multipath device for %s; refusing to bind-mount a single leg", req.StagingPath)
+				}
+				dev = mapper
+			} else {
+				dev = b.byPath(pl[0], iqn, "0")
+			}
 		}
 		if err := os.MkdirAll(filepath.Dir(req.TargetPath), 0o750); err != nil {
 			return fmt.Errorf("iscsi: mkdir target parent: %w", err)
@@ -1000,11 +1815,42 @@ func (b *Backend) NodeExpand(ctx context.Context, req *bardplugin.NodeExpandRequ
 		return nil, fmt.Errorf("iscsi: resolve device for %s: %w", req.VolumePath, err)
 	}
 	dev = strings.TrimSpace(dev)
+	if isMultipathDevice(dev) {
+		if err := b.resizeMultipath(ctx, dev); err != nil {
+			return nil, err
+		}
+	}
 	fsType, _ := b.run.Run(ctx, "findmnt", "-n", "-o", "FSTYPE", "--target", req.VolumePath)
 	if err := b.growFilesystem(ctx, strings.TrimSpace(fsType), dev, req.VolumePath); err != nil {
 		return nil, err
 	}
 	return &bardplugin.NodeExpandResponse{}, nil
+}
+
+// isMultipathDevice reports whether a mount SOURCE is a dm-multipath device --
+// either the raw /dev/dm-N node or a /dev/mapper/<name> path (host
+// multipath.conf may set user_friendly_names, which resolve through
+// /dev/mapper, not /dev/dm-N -- findmnt reports whichever path the mount table
+// actually recorded). Mount sources come from findmnt output, not devRoot, so
+// this checks the literal /dev prefixes regardless of devRoot.
+func isMultipathDevice(src string) bool {
+	return strings.HasPrefix(src, "/dev/dm-") || strings.HasPrefix(src, "/dev/mapper/")
+}
+
+// resizeMultipath makes multipathd pick up a grown map's new size: resolve the
+// map NAME from the mount source (dmsetup accepts a device path directly), then
+// `multipathd resize map <name>` -- growFilesystem then runs against the SAME
+// mount source, so the fs grow sees the resized map.
+func (b *Backend) resizeMultipath(ctx context.Context, dev string) error {
+	name, err := b.run.Run(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "name", dev)
+	if err != nil {
+		return fmt.Errorf("iscsi: resolve multipath map name for %s: %w", dev, err)
+	}
+	name = strings.TrimSpace(name)
+	if _, err := b.run.Run(ctx, "multipathd", "resize", "map", name); err != nil {
+		return fmt.Errorf("iscsi: multipathd resize map %s: %w", name, err)
+	}
+	return nil
 }
 
 // growFilesystem grows a mounted filesystem to its backing device's size --
@@ -1047,6 +1893,9 @@ func (b *Backend) GetCapacity(ctx context.Context, req *bardplugin.GetCapacityRe
 	ic, err := b.inst(req.Instance)
 	if err != nil {
 		return nil, err
+	}
+	if ic.isTargetd() {
+		return b.getCapacityTargetd(ctx, req.Instance, ic)
 	}
 	out, err := b.run.Run(ctx, "vgs", "--noheadings", "--units", "b", "--nosuffix", "-o", "vg_free", ic.VG)
 	if err != nil {
@@ -1145,6 +1994,14 @@ func isThinPool(attr string) bool { return len(attr) > 0 && attr[0] == 't' }
 func (b *Backend) ListVolumes(ctx context.Context, _ *bardplugin.ListVolumesRequest) (*bardplugin.ListVolumesResponse, error) {
 	var entries []bardplugin.VolumeListEntry
 	for instance, ic := range b.instances {
+		if ic.isTargetd() {
+			tdEntries, err := b.listVolumesTargetd(ctx, instance, ic)
+			if err != nil {
+				return nil, err
+			}
+			entries = append(entries, tdEntries...)
+			continue
+		}
 		if ic.VG == "" {
 			continue
 		}

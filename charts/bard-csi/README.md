@@ -123,9 +123,9 @@ controller:
   nodeSelector: { kubernetes.io/hostname: <target-node> }   # see "Controller placement" below
 ```
 
-Per-instance fields: `vg, portal, zone, default, [iqnBase], [thinPool], [chapAuth]`
-— no `keysSecret`/`encryption`/`kms` (the plugin has no `--key-dir`; it takes no
-KMS-backed encryption).
+Per-instance fields (local management, the default): `vg, portal, zone, default,
+[iqnBase], [thinPool], [chapAuth]` — no `keysSecret`/`encryption`/`kms` (the plugin
+has no `--key-dir`; it takes no KMS-backed encryption).
 
 **Requires `attach.enabled: true`.** iSCSI is the one backend that attaches as a
 control-plane operation; the chart `fail`s the render if `plugins.iscsi` has any
@@ -140,15 +140,37 @@ password) or 4 (+ a mutual userid/password pair) — mounted `optional: true` on
 **both** planes at `/etc/bard-iscsi-chap`; never in the ConfigMap, StorageClass,
 or PublishContext.
 
-**Controller placement.** LIO (the target daemon) lives in the host kernel's
-configfs, so the controller pod must run *on* the target host: pin it with
-`controller.nodeSelector` (`kubernetes.io/hostname: <target-node>`) as shown
-above. Because the iscsi profile's controller is `hostNetwork` and pinned to that
-one host, `controller.replicas` must stay at its default of `1` -- the chart fails
-the render otherwise (`templates/_validate.tpl`). See the
+**Controller placement (local management).** LIO (the target daemon) lives in
+the host kernel's configfs, so a **local** instance's controller pod must run
+*on* the target host: pin it with `controller.nodeSelector`
+(`kubernetes.io/hostname: <target-node>`) as shown above. Because the iscsi
+profile's controller is `hostNetwork` and pinned to that one host,
+`controller.replicas` must stay at its default of `1` -- the chart fails the
+render otherwise (`templates/_validate.tpl`). See the
 [Locality section of deploy/examples/iscsi/README.md](../../deploy/examples/iscsi/README.md#locality-read-this--same-host-coupling-as-lvm)
-for the full constraint (a control plane on a non-target node needs remote LIO
-management via `targetd` — a follow-up).
+for the full constraint. **`management: targetd` instances lift it** — see below.
+
+**Remote LIO management (`management: targetd`).** An instance can instead
+name `management: targetd` + `targetdEndpoint`/`targetdPool`/`targetIqn`
+(no `vg`): the controller drives a **remote** LIO host over
+[targetd](https://github.com/open-iscsi/targetd)'s JSON-RPC API (`:18700`)
+instead of local `targetcli`/configfs, so the controller does **not** need to
+run on the target host — the placement constraint above is specific to local
+instances. targetd exposes every volume as a LUN under **one fixed target**
+(`targetIqn`), so a node staging a second volume from the same instance
+shares that target's iSCSI session rather than opening a new one. Two things
+targetd instances do **not** support, both rejected cleanly
+(`InvalidArgument`/`Unsupported`, never silently): **CHAP** (`chapAuth: true`)
+— targetd's `export_create` unconditionally disables TPG-level authentication
+on every export with no API to override it, so credentials set via its
+`initiator_set_auth` are never actually enforced; access control is IQN-based
+ACLs only — and **snapshots/clones** — targetd's `vol_copy` is a synchronous
+full copy, unsafe under provisioner retries. Credentials: the
+`bard-iscsi-targetd` Secret, one key **per instance id**, value 2 lines
+(username, password), mounted **controller-only** at `/etc/bard-iscsi-targetd`
+(the node plane never talks to targetd directly). Mixed local + targetd
+instances in one release are supported; `controller.nodeSelector` still pins
+the controller to a local instance's target host if one is configured.
 
 ### (B) Low-level override — custom plugins / full control
 

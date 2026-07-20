@@ -165,7 +165,9 @@ attach:
 # Per-instance fields by backend:
 #   ceph-rbd: monitors[], pool, user, zone, default, [mounter: krbd|rbd-nbd], [readAffinity], [radosNamespace], [clusterName]
 #   cephfs:   monitors[], fsName, user, zone, default, [mounter: kernel|fuse|nfs], [subvolumeGroup], [nfsCluster], [nfsServer]
-#   iscsi:    vg, portal, zone, default, [portals[]], [iqnBase], [thinPool], [chapAuth]
+#   iscsi (local, the default): vg, portal, zone, default, [portals[]], [iqnBase], [thinPool], [chapAuth]
+#   iscsi (management: targetd): targetdEndpoint, targetdPool, targetIqn, portal, zone, default
+#     (NO vg -- targetd owns its pool remotely; NO chapAuth -- see below)
 plugins:
   ceph-rbd:
     enabled: false
@@ -206,20 +208,38 @@ plugins:
   iscsi:
     enabled: false
     instances: {}
-    #   galileo:
-    #     vg: bard-vg
-    #     portal: 192.0.2.1:3260
+    #   galileo:                            # LOCAL management (the default): controller
+    #     vg: bard-vg                       # must run on the LIO target host itself
+    #     portal: 192.0.2.1:3260            # (controller.nodeSelector pins it there).
     #     zone: galileo
     #     default: true
     #     # iqnBase: iqn.2025-01.io.bard    # default; target/initiator names derive from it
     #     # thinPool: bard-thin             # provision thin LVs from this pool -> snapshots/clone
     #     # chapAuth: true                  # require CHAP; credentials from the bard-iscsi-chap Secret
+    #   remote:                             # management: targetd: the controller instead
+    #     management: targetd               # talks to a REMOTE LIO host over targetd's
+    #     targetdEndpoint: http://192.0.2.5:18700/targetrpc  # JSON-RPC API (:18700) --
+    #     targetdPool: vg-targetd           # it does NOT need to run on the target node.
+    #     targetIqn: iqn.2003-01.org.linux-iscsi.remotehost:targetd  # targetd's one
+    #     portal: 192.0.2.5:3260            # fixed target (every volume is a LUN on it).
+    #     zone: site2
+    #     # NO vg (targetd owns its pool remotely) and NO chapAuth: targetd's
+    #     # export_create unconditionally disables TPG-level authentication on every
+    #     # export (upstream limitation, no API to override), so CHAP creds set via
+    #     # its initiator_set_auth are never enforced -- the chart -- like the plugin's
+    #     # own config validation -- refuses chapAuth: true on a targetd instance.
+    #     # Snapshots/clones are also refused per-request (targetd's vol_copy is a
+    #     # synchronous full copy, unsafe under provisioner retries); access control
+    #     # is IQN-based ACLs only. Credentials: a 2-line (username, password) file
+    #     # per instance in the bard-iscsi-targetd Secret, mounted CONTROLLER-only.
     # image: { repository: ghcr.io/kindacoolhamster/bard-plugin-iscsi, tag: "", pullPolicy: IfNotPresent }
     # ATTACH-style backend: ControllerPublish masks the LUN to the staging node's
-    # initiator via a targetcli ACL, so this ALSO REQUIRES attach.enabled=true
+    # initiator via a targetcli/targetd ACL, so this ALSO REQUIRES attach.enabled=true
     # (above) -- the chart fails the render otherwise (templates/_validate.tpl).
     # CSIDriver.attachRequired is cluster-global + IMMUTABLE: on an existing
     # install, delete the CSIDriver before upgrading with attach flipped on.
+    # Mixed local+targetd instances in one release are supported; controller.nodeSelector
+    # still pins the controller to a LOCAL instance's target host if one is configured.
 
   # nfs / lvm have no high-level profile yet — configure them via the low-level
   # override (B): set socket + controller/node {args, volumes, host flags}.

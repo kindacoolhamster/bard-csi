@@ -28,6 +28,7 @@ RUN apt-get update \
         thin-provisioning-tools \
         targetcli-fb \
         open-iscsi \
+        multipath-tools \
         e2fsprogs \
         xfsprogs \
         btrfs-progs \

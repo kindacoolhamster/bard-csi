@@ -153,8 +153,9 @@ idempotency; `No matching sessions found` broke repeated unstage via the
 derived-logout fallback) and a hollow NodeReclaimSpace (the backstore never
 advertised UNMAP; now `emulate_tpu=1` best-effort at create, and an
 un-discardable stack is a clean no-op instead of a forever-failing job). A
-control plane on a non-target node still needs remote LIO management
-(`targetd`) -- a follow-up.
+control plane on a non-target node uses remote LIO management
+(`management: targetd`) -- see the "Known follow-ups" section (DONE,
+live-proven in-cluster 2026-07-20).
 
 ## Local end-to-end (rootful kind + real Ceph)
 
@@ -675,9 +676,75 @@ Record your cluster's actual addresses in `CLAUDE.local.md`.
   `feat/iscsi-snapshots-chap`): thin-LV snapshots/restore/clone mirroring the LVM
   plugin (instance/SC `thinPool`; clone exported through its own target, fs grown
   at stage) + per-instance CHAP (`chapAuth: true`, creds Secret mounted on both
-  planes) -- all live-proven by the extended `hack/iscsi-plugin-test.sh`. The
-  iSCSI remaining follow-ups: multipath, and remote LIO management (`targetd`)
-  for a fully in-cluster control plane on a non-target node.
+  planes) -- all live-proven by the extended `hack/iscsi-plugin-test.sh`.
+  **iSCSI dm-multipath: DONE** (2026-07-19, branch feat/iscsi-multipath):
+  instance `portals` list (2+ entries) -> explicit per-address LIO portals
+  (must delete BOTH default-portal forms first -- current targetcli auto-creates
+  `::0:3260` dual-stack, not `0.0.0.0:3260`; deleting a portal only removes the
+  LISTENER, live sessions survive), node logs in through every portal and mounts
+  the multipathd-assembled mapper via its `dm-uuid-mpath-<wwid>` by-id link
+  (name-independent; wwid from sysfs, `naa.<hex>` -> mpath id `3<hex>`; `multipath
+  -f` REJECTS the by-id symlink -- resolve to the dm node first). NodeUnstage
+  flushes best-effort BEFORE logout but takes its authoritative map-gone check
+  AFTER -- a flushed map re-assembles while paths live (wedged in-cluster unstage
+  forever until reordered). PublishContext gains `portals` (additive; `portal`
+  stays = first). Host prereq: multipathd on nodes. Proven: unit suite,
+  `hack/iscsi-multipath-test.sh` (traffic-cut failover under live I/O -- LIO
+  portal delete does NOT fail a path), single-portal harness + conformance
+  regressions, and fully in-cluster (2-node k3s: cross-node 2-path mapper mount,
+  portal-IP loss under live I/O, recovery, online expand through the mapper via
+  in-container `multipathd resize map`, snapshot/restore each with own map,
+  plugin-restart + delete-all -> zero leaked sessions/maps/LVs).
+  **iSCSI remote LIO management (`management: targetd`): DONE** (2026-07-20,
+  branch `feat/iscsi-targetd`): an instance can name `management: targetd` +
+  `targetdEndpoint`/`targetdPool`/`targetIqn` (no `vg`) to have the controller
+  drive a REMOTE LIO host over [targetd](https://github.com/open-iscsi/targetd)'s
+  JSON-RPC API (`:18700`) instead of local targetcli/configfs -- the controller
+  no longer needs to run on the target host, closing the one remaining
+  same-host coupling the attach-style backend had. targetd exposes every
+  volume as a LUN under ONE FIXED target IQN (unlike local mode's
+  one-target-per-volume), so `internal/iscsiplugin`'s node plane gained
+  generic shared-target session refcounting (`otherRecordsForIQN` scans
+  recorded state for other volumes sharing a target IQN; `withTargetLock`, a
+  per-target flock, closes the TOCTOU where two concurrent unstages of the
+  last two volumes on a target both see the other's record and both skip the
+  final logout): NodeStage rescans instead of re-logging in when a session is
+  already up, NodeUnstage detaches only the one SCSI device (a raw
+  `<sysfs>/class/block/<sd>/device/delete` write) and leaves the session up
+  unless it is the last volume. Local mode hits the identical code path but,
+  since its target IQN is unique per volume, always resolves to "last" --
+  proven unchanged by construction, not a mode check. Two things a targetd
+  instance rejects cleanly (`Unsupported`/`InvalidArgument`, never silently):
+  **snapshots/clones** (targetd's `vol_copy` is a synchronous full copy,
+  unsafe under provisioner retries) and **CHAP** (`chapAuth: true` --
+  live-verified against targetd 0.10.4 that `export_create` unconditionally
+  hardcodes the shared target's TPG `authentication` attribute to `"0"` on
+  every export with no API to override it, so credentials set via its
+  `initiator_set_auth` are never actually enforced: a packet capture showed
+  the login response still advertising `AuthMethod=CHAP`, but the kernel
+  initiator aborting before the actual challenge, for both a correct password
+  and none at all -- access control on a targetd instance is IQN-based ACLs
+  only). Credentials: `bard-iscsi-targetd` Secret, 2-line (username,
+  password) per instance, mounted **controller-only** (`--targetd-dir`) --
+  the node plane never builds a targetd RPC client. Chart passthrough gates
+  the same way chap does but into the controller volumes/args only.
+  Host-level proof: `hack/targetd-plugin-test.sh` against a real targetd (the
+  fixture firewalls the admin API to loopback by default -- `EXPOSURE` note in
+  `hack/setup-targetd-fixture.sh` -- a real deployment must open `:18700`
+  deliberately to exactly the controller's subnet). **Fully in-cluster
+  live-proven 2026-07-20** on the site2 dev2/dev3 k3s tier: targetd installed
+  on dev2 (the existing LIO target host, separate loop-backed
+  `bard-targetd-vg`), controller pinned to **dev3 -- the NON-target node, the
+  actual proof** -- provisioned two volumes, cross-node attach (ACL for
+  `init-dev3` created via the remote RPC), a 2nd volume on the SAME node
+  sharing ONE iscsiadm session (distinct LUN devices, live-verified via the
+  node's `iscsiadm -m session`), unstage ordering both ways (not-last: session
+  stays up, only that volume's `/dev/sdX` disappears; last: full logout),
+  online expand 1Gi->2Gi with no pod restart (targetd `vol_resize` + node fs
+  grow, data intact), and a full teardown back to targetd `vol_list`/
+  `export_list` empty with zero orphaned k8s objects. Cluster restored to its
+  local-only standing config afterward (targetd stays installed on dev2,
+  unused, port back to loopback-only).
 - **ListVolumes / ListSnapshots: DONE (all first-party Go plugins).** Optional CSI
   RPCs, aggregated + paginated (offset token) in core across backends, snapshots
   filterable by source/snapshot id; advertised only when a registered backend

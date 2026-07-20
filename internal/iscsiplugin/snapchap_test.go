@@ -3,9 +3,12 @@ package iscsiplugin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
@@ -58,7 +61,7 @@ func provisionRunner() *fakeRunner {
 // A thin instance provisions from the pool with -T/-V, never -L.
 func TestThinProvisioning(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -81,7 +84,7 @@ func TestThinProvisioning(t *testing.T) {
 // instance, overriding the instance default.
 func TestThinPoolStorageClassParam(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", "", fr) // no instance default
+	b := New(eastInst(), "", "", "", "", "", fr) // no instance default
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 		Parameters: map[string]string{paramThinPool: "sc-pool"},
@@ -107,7 +110,7 @@ func TestThinSnapshot(t *testing.T) {
 			return "1073741824\n", nil
 		},
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	resp, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name:         "snap1",
 		SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
@@ -149,7 +152,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 			return "", errors.New("Failed to find logical volume")
 		},
 	}}
-	b := New(eastInst(), "", "", "", "", thick)
+	b := New(eastInst(), "", "", "", "", "", thick)
 	if _, err := b.CreateSnapshot(context.Background(), &bardplugin.CreateSnapshotRequest{
 		Name: "s", SourceVolume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 	}); err == nil {
@@ -168,7 +171,7 @@ func TestThinRequiredForSnapshotAndClone(t *testing.T) {
 // the LVM plugin doesn't have.
 func TestThinCloneRestoreExports(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "restored", Instance: "east", CapacityBytes: 1 << 30,
 		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "snap-abc"},
@@ -197,7 +200,7 @@ func TestISCSIListSnapshots(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +235,7 @@ func chapSetup(t *testing.T, lines string) (map[string]InstanceConfig, string) {
 func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\n")
 	fr := provisionRunner()
-	b := New(inst, "", "", dir, "", fr)
+	b := New(inst, "", "", dir, "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -248,7 +251,7 @@ func TestCreateVolumeChapRequiresAuthentication(t *testing.T) {
 func TestControllerPublishSetsChapOnACL(t *testing.T) {
 	inst, dir := chapSetup(t, "bard\nsecretpass\nmutualuser\nmutualpass\n")
 	fr := &fakeRunner{}
-	b := New(inst, "", "", dir, "", fr)
+	b := New(inst, "", "", dir, "", "", fr)
 	lv := lvName("pvc-1")
 	resp, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv}, NodeID: "n1",
@@ -278,7 +281,7 @@ func TestNodeStageSetsChapBeforeLogin(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
 	}}
-	b := New(inst, "n1", t.TempDir(), dir, "", fr)
+	b := New(inst, "n1", t.TempDir(), dir, "", "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 		StagingPath: t.TempDir() + "/stage",
@@ -311,7 +314,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 		"east": {VG: "bard-vg", Portal: "10.0.0.9:3260", CHAPAuth: true},
 	}
 	fr := &fakeRunner{}
-	b := New(inst, "", "", t.TempDir(), "", fr) // no credentials file
+	b := New(inst, "", "", t.TempDir(), "", "", fr) // no credentials file
 	if _, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err == nil {
@@ -322,7 +325,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	}
 
 	instBad, dir := chapSetup(t, "only-a-user\nsecret\ndangling-mutual-user\n") // 3 lines
-	b2 := New(instBad, "", "", dir, "", &fakeRunner{})
+	b2 := New(instBad, "", "", dir, "", "", &fakeRunner{})
 	if _, err := b2.chapFor("east"); err == nil {
 		t.Fatal("3-line credentials file must be rejected (mutual needs both lines)")
 	}
@@ -331,7 +334,7 @@ func TestChapMissingOrMalformedCreds(t *testing.T) {
 	// in a credential would split the `set auth` command at publish time --
 	// reject at load instead.
 	instWS, dirWS := chapSetup(t, "bard\npass word\n")
-	b3 := New(instWS, "", "", dirWS, "", &fakeRunner{})
+	b3 := New(instWS, "", "", dirWS, "", "", &fakeRunner{})
 	if _, err := b3.chapFor("east"); err == nil {
 		t.Fatal("credentials containing whitespace must be rejected")
 	}
@@ -345,7 +348,7 @@ func TestSnapshotAndCloneMissingSourceNotFound(t *testing.T) {
 			return "", errors.New("Failed to find logical volume \"bard-vg/bard-x\"")
 		},
 	}}
-	b := New(thinInst(), "", "", "", "", gone)
+	b := New(thinInst(), "", "", "", "", "", gone)
 	wantNotFound := func(err error, op string) {
 		t.Helper()
 		var se *bardplugin.StatusError
@@ -370,7 +373,7 @@ func TestCloneSourceWrongVGRejected(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	_, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "c", Instance: "east",
 		SourceSnapshot: &bardplugin.VolumeRef{Instance: "east", Location: "other-vg", Name: "snap-abc"},
@@ -391,7 +394,7 @@ func TestListSnapshotsSurvivesSourceDeletion(t *testing.T) {
 	fr := &fakeRunner{results: map[string]func([]string) (string, error){
 		"lvs": func([]string) (string, error) { return lvsOut, nil },
 	}}
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	snaps, err := b.ListSnapshots(context.Background(), &bardplugin.ListSnapshotsRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -405,7 +408,7 @@ func TestListSnapshotsSurvivesSourceDeletion(t *testing.T) {
 // record: the device is derived exactly as NodeUnstage derives it.
 func TestNodePublishBlockDerivedDevice(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")
 	target := t.TempDir() + "/block-target"
 	if err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
@@ -416,7 +419,7 @@ func TestNodePublishBlockDerivedDevice(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("block publish with a lost record must derive the device: %v", err)
 	}
-	dev := byPath("10.0.0.9:3260", targetIQN(defaultIQNBase, lv), "0")
+	dev := b.byPath("10.0.0.9:3260", targetIQN(defaultIQNBase, lv), "0")
 	if !fr.ran("mount", "--bind", dev, target) {
 		t.Fatalf("expected bind mount of the derived by-path device; calls %v", fr.calls)
 	}
@@ -443,7 +446,7 @@ func TestSecondStageLeavesBusyIfaceAlone(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-2")},
 		StagingPath: t.TempDir() + "/stage",
@@ -469,7 +472,7 @@ func TestDeleteVolumeAbsentBackstorePhrasing(t *testing.T) {
 		},
 		"lvremove": func([]string) (string, error) { return "", errors.New("Failed to find logical volume") },
 	}}
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	if err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 	}); err != nil {
@@ -493,7 +496,7 @@ func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "", fr) // fresh stateDir: no records
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
 	lv := lvName("pvc-1")
 	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
@@ -512,7 +515,7 @@ func TestNodeUnstageWithoutStateStillLogsOut(t *testing.T) {
 // Reads (lvs) stay plain.
 func TestLvmSelfManagedDevNodes(t *testing.T) {
 	fr := provisionRunner()
-	b := New(thinInst(), "", "", "", "", fr)
+	b := New(thinInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -549,7 +552,7 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b := New(inst, "", "", dir, "", frPub)
+	b := New(inst, "", "", dir, "", "", frPub)
 	_, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	})
@@ -572,7 +575,7 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 			return "", nil
 		},
 	}}
-	b2 := New(inst, "n1", t.TempDir(), dir, "", frStage)
+	b2 := New(inst, "n1", t.TempDir(), dir, "", "", frStage)
 	err = b2.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"},
 		StagingPath: t.TempDir() + "/stage",
@@ -588,10 +591,14 @@ func TestChapErrorsNeverLeakSecrets(t *testing.T) {
 // Unpublish must actually revoke the ACL even when the instance is no longer
 // configured -- both IQNs derive from the volume name + node id (like
 // DeleteVolume), and success-without-revocation would leave the node with
-// standing access to the LUN.
+// standing access to the LUN. (An UNMARKED Location -- see tdLocation --
+// means this volume was never targetd-managed, so the derived local cleanup
+// below is safe; a MARKED Location instead refuses to guess, see
+// TestControllerUnpublishMarkedTargetdLocationMissingInstanceRejected in
+// targetd_client_test.go.)
 func TestControllerUnpublishUnknownInstanceStillRevokes(t *testing.T) {
 	fr := &fakeRunner{}
-	b := New(map[string]InstanceConfig{}, "", "", "", "", fr) // nothing configured
+	b := New(map[string]InstanceConfig{}, "", "", "", "", "", fr) // nothing configured
 	if err := b.ControllerUnpublish(context.Background(), &bardplugin.ControllerUnpublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "gone", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err != nil {
@@ -611,7 +618,7 @@ func TestIscsiadmChroot(t *testing.T) {
 		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
 		"blkid":    func([]string) (string, error) { return "ext4\n", nil },
 	}}
-	b := New(eastInst(), "n1", t.TempDir(), "", "/host", fr)
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "/host", fr)
 	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
 		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
 		StagingPath: t.TempDir() + "/stage",
@@ -632,7 +639,7 @@ func TestIscsiadmChroot(t *testing.T) {
 // Without chapAuth nothing changes: no auth on the ACL, authentication=0.
 func TestNoChapByDefault(t *testing.T) {
 	fr := provisionRunner()
-	b := New(eastInst(), "", "", "", "", fr)
+	b := New(eastInst(), "", "", "", "", "", fr)
 	if _, err := b.CreateVolume(context.Background(), &bardplugin.CreateVolumeRequest{
 		Name: "v", Instance: "east", CapacityBytes: 1 << 30,
 	}); err != nil {
@@ -642,7 +649,7 @@ func TestNoChapByDefault(t *testing.T) {
 		t.Fatalf("non-CHAP instance must keep authentication=0; calls %v", fr.calls)
 	}
 	fr2 := &fakeRunner{}
-	b2 := New(eastInst(), "", "", "", "", fr2)
+	b2 := New(eastInst(), "", "", "", "", "", fr2)
 	if _, err := b2.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{
 		Volume: bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: "bard-x"}, NodeID: "n1",
 	}); err != nil {
@@ -650,5 +657,781 @@ func TestNoChapByDefault(t *testing.T) {
 	}
 	if fr2.ran("targetcli", "set", "auth") {
 		t.Fatalf("no auth must be set without chapAuth; calls %v", fr2.calls)
+	}
+}
+
+// ---- dm-multipath (Task 2.2) -----------------------------------------------
+
+// mpathID: the three recognized WWID prefixes plus an unrecognized one.
+func TestMpathID(t *testing.T) {
+	cases := []struct {
+		in, want string
+		wantErr  bool
+	}{
+		{"naa.6001405abc123def", "36001405abc123def", false},
+		{"eui.0011223344556677", "20011223344556677", false},
+		{"t10.ATA     SomeDisk_1234", "1ATA     SomeDisk_1234", false},
+		{"garbage-no-prefix", "", true},
+	}
+	for _, c := range cases {
+		got, err := mpathID(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Fatalf("mpathID(%q): expected an error, got %q", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("mpathID(%q): unexpected error %v", c.in, err)
+		}
+		if got != c.want {
+			t.Fatalf("mpathID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// multipathFixture builds a fake sysfs+dev tree under t.TempDir() for a
+// dm-multipath resolution test: one fake "sdX" leg device (with REAL symlinks,
+// so filepath.EvalSymlinks works) per portal in legPortals, all sharing the
+// same wwid (a real multipath LUN presents an identical wwid on every path),
+// plus the assembled dm-uuid by-id link. legPortals may be a SUBSET of a
+// larger portal list, to model "only some paths are still live".
+func multipathFixture(t *testing.T, iqn string, legPortals []string, wwid, id string) (sysfsRoot, devRoot string) {
+	t.Helper()
+	sysfsRoot = t.TempDir()
+	devRoot = t.TempDir()
+	byPathDir := filepath.Join(devRoot, "disk", "by-path")
+	byIDDir := filepath.Join(devRoot, "disk", "by-id")
+	if err := os.MkdirAll(byPathDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(byIDDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i, portal := range legPortals {
+		sd := fmt.Sprintf("sd%c", 'a'+i)
+		sdDir := filepath.Join(sysfsRoot, "class", "block", sd, "device")
+		if err := os.MkdirAll(sdDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sdDir, "wwid"), []byte(wwid+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sdNode := filepath.Join(devRoot, sd)
+		if err := os.WriteFile(sdNode, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(byPathDir, "ip-"+portal+"-iscsi-"+iqn+"-lun-0")
+		if err := os.Symlink(sdNode, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dmNode := filepath.Join(devRoot, "dm-0")
+	if err := os.WriteFile(dmNode, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(dmNode, filepath.Join(byIDDir, "dm-uuid-mpath-"+id)); err != nil {
+		t.Fatal(err)
+	}
+	return sysfsRoot, devRoot
+}
+
+// NodeStage with 2 portals: discovery+CHAP+login PER portal (same order the
+// single-path code already uses), the assembled mapper is resolved from the
+// fake sysfs wwid, the mount source is the dm-uuid by-id link (never
+// /dev/mapper/<name>), and the recorded state carries the full multipath
+// fields.
+func TestNodeStageMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst, dir := chapSetup(t, "bard\nsecretpass\n")
+	ic := inst["east"]
+	ic.Portal = ""
+	ic.Portals = portals
+	inst["east"] = ic
+
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	wwid := "naa.6001405deadbeef00"
+	wantID, err := mpathID(wwid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
+	}}
+	b := New(inst, "n1", t.TempDir(), dir, "", "", fr)
+	b.sysfsRoot, b.devRoot = multipathFixture(t, iqn, portals, wwid, wantID)
+
+	staging := t.TempDir() + "/stage"
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, p := range portals {
+		discAt, credsAt, loginAt := -1, -1, -1
+		for i, c := range fr.calls {
+			if c[0] != "iscsiadm" || !contains(c, "-p") || !contains(c, p) {
+				continue
+			}
+			joined := strings.Join(c, " ")
+			switch {
+			case strings.Contains(joined, "discovery") && discAt < 0:
+				discAt = i
+			case strings.Contains(joined, "node.session.auth.password") && credsAt < 0:
+				credsAt = i
+			case strings.Contains(joined, "--login") && loginAt < 0:
+				loginAt = i
+			}
+		}
+		if discAt < 0 || credsAt < 0 || loginAt < 0 || !(discAt < credsAt && credsAt < loginAt) {
+			t.Fatalf("expected discovery->chap->login order for portal %s (disc@%d creds@%d login@%d); calls %v",
+				p, discAt, credsAt, loginAt, fr.calls)
+		}
+	}
+
+	wantMapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+wantID)
+	if !fr.ran("mount", wantMapper, staging) {
+		t.Fatalf("expected mount of the assembled mapper %s; calls %v", wantMapper, fr.calls)
+	}
+
+	st, ok := b.loadState(staging)
+	if !ok {
+		t.Fatal("expected recorded state")
+	}
+	if len(st.Portals) != 2 || len(st.Devices) != 2 || st.Mapper != wantMapper {
+		t.Fatalf("expected full multipath state (2 portals, 2 devices, mapper set), got %+v", st)
+	}
+}
+
+// TestNodeStageSinglePortalUnchanged pins the EXACT call sequence for a
+// single-portal instance -- the multipath branch must never fire, and not one
+// argument may change versus the pre-multipath behavior.
+func TestNodeStageSinglePortalUnchanged(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
+	}}
+	b := New(eastInst(), "k3s-agent", t.TempDir(), "", "", "", fr)
+	staging := t.TempDir() + "/stage"
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	initIQN := initiatorIQN(defaultIQNBase, "k3s-agent")
+	dev := b.byPath("10.0.0.9:3260", iqn, "0")
+	want := [][]string{
+		{"iscsiadm", "-m", "iface", "-I", "bard"},
+		{"iscsiadm", "-m", "iface", "-I", "bard", "--op", "update", "-n", "iface.initiatorname", "-v", initIQN},
+		{"iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", "10.0.0.9:3260", "-I", "bard"},
+		{"iscsiadm", "-m", "node", "-T", iqn, "-p", "10.0.0.9:3260", "-I", "bard", "--login"},
+		{"blockdev", "--getsize64", dev},
+		{"blkid", "-o", "value", "-s", "TYPE", dev},
+		{"mkfs.ext4", dev},
+		{"findmnt", "-n", "-o", "SOURCE", "--mountpoint", staging},
+		{"mount", "-t", "ext4", dev, staging},
+		{"resize2fs", dev},
+	}
+	if len(fr.calls) != len(want) {
+		t.Fatalf("call sequence length mismatch: got %d want %d\ngot:  %v\nwant: %v", len(fr.calls), len(want), fr.calls, want)
+	}
+	for i := range want {
+		if !equalStrings(fr.calls[i], want[i]) {
+			t.Fatalf("call[%d] = %v, want %v\nfull got: %v", i, fr.calls[i], want[i], fr.calls)
+		}
+	}
+}
+
+// NodeUnstage with a recorded multipath state: umount, THEN flush the map,
+// THEN log out every portal, verify every path device gone, then per-portal
+// --op delete.
+// The pre-logout flush is best-effort: while sessions are up, multipathd can
+// re-assemble the map right after `multipath -f` (find_multipaths + known
+// wwid) -- the exact wedge found live in-cluster. Unstage must still succeed
+// when the POST-logout ground truth finds the map gone.
+func TestNodeUnstageMultipathSurvivesPreLogoutReassembly(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	loggedOut := false
+	fr := &fakeRunner{}
+	fr.results = map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil },
+		"multipath": func([]string) (string, error) {
+			if !loggedOut {
+				return "", errors.New("exit status 1") // flush refused / map re-added
+			}
+			return "", nil
+		},
+		"dmsetup": func([]string) (string, error) {
+			if !loggedOut {
+				return "mpatha", nil // map still resolves pre-logout: flush did not take
+			}
+			return "", errors.New("Device does not exist") // gone once paths died
+		},
+		"iscsiadm": func(args []string) (string, error) {
+			if contains(args, "--logout") {
+				loggedOut = true
+			}
+			return "", nil
+		},
+	}
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", "", fr)
+	staging := t.TempDir() + "/stage"
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
+	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
+	if err := b.recordState(staging, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatalf("unstage must survive a pre-logout flush failure when the map clears after logout: %v", err)
+	}
+}
+
+func TestNodeUnstageMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
+		"dmsetup":  func([]string) (string, error) { return "", errors.New("Device does not exist") },
+	}}
+	b := New(map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}, "n1", t.TempDir(), "", "", "", fr)
+	staging := t.TempDir() + "/stage"
+	mapper := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-3deadbeef")
+	devs := []string{b.byPath(portals[0], iqn, "0"), b.byPath(portals[1], iqn, "0")}
+	if err := b.recordState(staging, stagedState{
+		Device: devs[0], IQN: iqn, Portal: portals[0],
+		Portals: portals, Devices: devs, Mapper: mapper,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	flushAt := -1
+	for i, c := range fr.calls {
+		if c[0] == "multipath" && contains(c, "-f") {
+			flushAt = i
+			break
+		}
+	}
+	if flushAt < 0 {
+		t.Fatalf("expected multipath -f flush; calls %v", fr.calls)
+	}
+	for _, p := range portals {
+		logoutAt := -1
+		for i, c := range fr.calls {
+			if c[0] == "iscsiadm" && contains(c, "--logout") && contains(c, p) {
+				logoutAt = i
+				break
+			}
+		}
+		if logoutAt < 0 {
+			t.Fatalf("expected a logout on portal %s; calls %v", p, fr.calls)
+		}
+		if logoutAt < flushAt {
+			t.Fatalf("logout on %s (call %d) happened BEFORE the flush (call %d); calls %v", p, logoutAt, flushAt, fr.calls)
+		}
+		if !fr.ran("iscsiadm", "-T", iqn, "-p", p, "--op", "delete") {
+			t.Fatalf("expected a per-portal node record delete for %s; calls %v", p, fr.calls)
+		}
+	}
+	if _, ok := b.loadState(staging); ok {
+		t.Fatal("state must be cleared after a successful multipath unstage")
+	}
+}
+
+// NodeUnstage with NO state record on a 2-portal instance: both sub-cases --
+// a still-live path device resolves its mapper and flushes BEFORE logout; with
+// no live device, it's plain tolerate-no-session logouts and no flush attempt.
+func TestNodeUnstageDerivedMultipath(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst := map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}
+	iqn := targetIQN(defaultIQNBase, lvName("pvc-1"))
+
+	t.Run("device-present-flush-first", func(t *testing.T) {
+		wwid := "naa.6001405abc123def0"
+		id, err := mpathID(wwid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flushed := false
+		fr := &fakeRunner{}
+		b := New(inst, "n1", t.TempDir(), "", "", "", fr)
+		sysfsRoot, devRoot := multipathFixture(t, iqn, portals[:1], wwid, id) // only portal[0] has a live leg
+		b.sysfsRoot, b.devRoot = sysfsRoot, devRoot
+		liveDev := b.byPath(portals[0], iqn, "0")
+		fr.results = map[string]func([]string) (string, error){
+			"multipath": func([]string) (string, error) { flushed = true; return "", nil },
+			"dmsetup":   func([]string) (string, error) { return "", errors.New("Device does not exist") },
+			"blockdev": func(args []string) (string, error) {
+				dev := args[len(args)-1]
+				if dev == liveDev && !flushed {
+					return "1073741824\n", nil
+				}
+				return "0\n", nil
+			},
+		}
+		staging := t.TempDir() + "/stage"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+			StagingPath: staging,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		wantLink := filepath.Join(b.devRoot, "disk", "by-id", "dm-uuid-mpath-"+id)
+		// flushMultipath resolves the by-id symlink before calling multipath -f
+		// (multipath rejects the symlink form with "device not found" -- live-verified).
+		wantMapper, rerr := filepath.EvalSymlinks(wantLink)
+		if rerr != nil {
+			t.Fatalf("resolving fake mapper link: %v", rerr)
+		}
+		if !fr.ran("multipath", "-f", wantMapper) {
+			t.Fatalf("expected the resolved mapper %s to be flushed; calls %v", wantMapper, fr.calls)
+		}
+	})
+
+	t.Run("devices-absent-plain-logout", func(t *testing.T) {
+		fr := &fakeRunner{results: map[string]func([]string) (string, error){
+			"blockdev": func([]string) (string, error) { return "0\n", nil }, // nothing live anywhere
+			"iscsiadm": func(args []string) (string, error) {
+				if contains(args, "--logout") {
+					return "", errors.New("iscsiadm: No matching sessions found")
+				}
+				return "", nil
+			},
+		}}
+		b := New(inst, "n1", t.TempDir(), "", "", "", fr)
+		staging := t.TempDir() + "/stage"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lvName("pvc-1")},
+			StagingPath: staging,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if fr.ran("multipath", "-f") {
+			t.Fatalf("nothing to flush when no path device is live; calls %v", fr.calls)
+		}
+		for _, p := range portals {
+			if !fr.ran("iscsiadm", "-T", iqn, "-p", p, "--logout") {
+				t.Fatalf("expected a plain (tolerate-no-session) logout on %s; calls %v", p, fr.calls)
+			}
+		}
+	})
+}
+
+// NodePublish (block mode) with no state record on a 2-portal instance and NO
+// resolvable mapper anywhere must ERROR -- never silently bind-mount a single
+// leg (that would defeat the entire point of multipath).
+func TestNodePublishBlockDerivedMultipathRefusesLeg(t *testing.T) {
+	portals := []string{"10.0.0.9:3260", "10.0.0.10:3260"}
+	inst := map[string]InstanceConfig{"east": {VG: "bard-vg", Portals: portals}}
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // nothing live anywhere
+	}}
+	b := New(inst, "n1", t.TempDir(), "", "", "", fr) // fresh stateDir: no records
+	lv := lvName("pvc-1")
+	target := t.TempDir() + "/block-target"
+	err := b.NodePublish(context.Background(), &bardplugin.NodePublishRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "east", Location: "bard-vg", Name: lv},
+		StagingPath: t.TempDir() + "/stage",
+		TargetPath:  target,
+		Block:       true,
+	})
+	if err == nil {
+		t.Fatal("block publish with no state and no resolvable mapper must error, not bind a single leg")
+	}
+	if fr.ran("mount") {
+		t.Fatalf("must never bind-mount a single leg for a multipath instance; calls %v", fr.calls)
+	}
+}
+
+// NodeExpand on a dm-multipath mount source: session rescan, resolve the map
+// NAME via dmsetup, multipathd resize map <name>, then resize2fs against the
+// mapper source (the SAME findmnt SOURCE, unchanged).
+func TestNodeExpandMultipath(t *testing.T) {
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"findmnt": func(args []string) (string, error) {
+			if contains(args, "SOURCE") {
+				return "/dev/dm-0\n", nil
+			}
+			return "ext4\n", nil // FSTYPE
+		},
+		"dmsetup": func([]string) (string, error) { return "bard-mpath-abc123\n", nil },
+	}}
+	b := New(eastInst(), "n1", t.TempDir(), "", "", "", fr)
+	if _, err := b.NodeExpand(context.Background(), &bardplugin.NodeExpandRequest{VolumePath: "/data"}); err != nil {
+		t.Fatal(err)
+	}
+	if !fr.ran("iscsiadm", "-m", "session", "--rescan") {
+		t.Fatal("expected a session rescan")
+	}
+	if !fr.ran("dmsetup", "info", "-c", "--noheadings", "-o", "name", "/dev/dm-0") {
+		t.Fatalf("expected the map name resolved via dmsetup against the mount source; calls %v", fr.calls)
+	}
+	if !fr.ran("multipathd", "resize", "map", "bard-mpath-abc123") {
+		t.Fatalf("expected multipathd resize map with the resolved name; calls %v", fr.calls)
+	}
+	if !fr.ran("resize2fs", "/dev/dm-0") {
+		t.Fatalf("expected resize2fs against the mapper mount source; calls %v", fr.calls)
+	}
+}
+
+// ---- shared-target (targetd) node-plane refcounting (Task 3.3) ------------
+
+// makeSdDevice adds one fake sd device under an existing sysfsRoot/devRoot for
+// a shared-target NodeUnstage test: a REAL symlink from the by-path device (so
+// filepath.EvalSymlinks resolves it, mirroring multipathFixture's shape) to a
+// backing file, plus the sysfs "device" dir a raw device-delete write can land
+// in. Returns the by-path device path (what a stagedState.Device records).
+func makeSdDevice(t *testing.T, sysfsRoot, devRoot, portal, iqn, lun, sd string) string {
+	t.Helper()
+	byPathDir := filepath.Join(devRoot, "disk", "by-path")
+	if err := os.MkdirAll(byPathDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sdDir := filepath.Join(sysfsRoot, "class", "block", sd, "device")
+	if err := os.MkdirAll(sdDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sdNode := filepath.Join(devRoot, sd)
+	if err := os.WriteFile(sdNode, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(byPathDir, "ip-"+portal+"-iscsi-"+iqn+"-lun-"+lun)
+	if err := os.Symlink(sdNode, link); err != nil {
+		t.Fatal(err)
+	}
+	return link
+}
+
+// A session is already up for the target IQN (another staged volume's state
+// record shares it -- the targetd shared-target model, where every volume is
+// a LUN under ONE fixed target). NodeStage must NOT discover/log in again;
+// instead it rescans (the same idiom NodeExpand already uses for a resize)
+// then waits on THIS volume's own by-path device.
+func TestNodeStageSecondVolumeSharedTargetRescans(t *testing.T) {
+	ic := targetdInst()["remote"]
+	iqn, portal := ic.TargetIQN, ic.Portal
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "1073741824\n", nil },
+		"findmnt":  func([]string) (string, error) { return "", errors.New("not found") },
+		"blkid":    func([]string) (string, error) { return "", errors.New("not a filesystem") },
+	}}
+	stateDir := t.TempDir()
+	b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+
+	// A first volume (LUN 0) is already staged on the shared target.
+	firstStaging := t.TempDir() + "/stage-1"
+	if err := b.recordState(firstStaging, stagedState{
+		Device: b.byPath(portal, iqn, "0"), IQN: iqn, Portal: portal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	secondStaging := t.TempDir() + "/stage-2"
+	if err := b.NodeStage(context.Background(), &bardplugin.NodeStageRequest{
+		Volume:         bardplugin.VolumeRef{Instance: "remote", Name: "vol2"},
+		StagingPath:    secondStaging,
+		PublishContext: map[string]string{ctxPortal: portal, ctxIQN: iqn, ctxLUN: "1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.ran("iscsiadm", "discovery") {
+		t.Fatalf("second stage on a shared target must NOT discover again; calls %v", fr.calls)
+	}
+	if fr.ran("iscsiadm", "--login") {
+		t.Fatalf("second stage on a shared target must NOT log in again; calls %v", fr.calls)
+	}
+	if !fr.ran("iscsiadm", "-m", "session", "--rescan") {
+		t.Fatalf("expected a session rescan instead of a fresh login; calls %v", fr.calls)
+	}
+	dev := b.byPath(portal, iqn, "1")
+	if !fr.ran("blockdev", "--getsize64", dev) {
+		t.Fatalf("expected waitForDevice on this volume's OWN LUN; calls %v", fr.calls)
+	}
+	if st, ok := b.loadState(secondStaging); !ok || st.Device != dev {
+		t.Fatalf("expected recorded state for the second volume, got %+v ok=%v", st, ok)
+	}
+	if _, ok := b.loadState(firstStaging); !ok {
+		t.Fatal("the OTHER volume's state must be left alone")
+	}
+}
+
+// Another state record shares this target IQN -- NodeUnstage must NOT log out
+// (another staged volume still needs the shared session); it detaches only
+// this volume's own LUN via a raw sysfs write, clears its own record, and
+// leaves the other one alone.
+func TestNodeUnstageSharedTargetNotLast(t *testing.T) {
+	ic := targetdInst()["remote"]
+	iqn, portal := ic.TargetIQN, ic.Portal
+	fr := &fakeRunner{}
+	stateDir := t.TempDir()
+	b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+
+	sysfsRoot, devRoot := t.TempDir(), t.TempDir()
+	b.sysfsRoot, b.devRoot = sysfsRoot, devRoot
+	devB := makeSdDevice(t, sysfsRoot, devRoot, portal, iqn, "1", "sdb")
+
+	// The other volume (LUN 0) stays staged and must survive.
+	firstStaging := t.TempDir() + "/stage-1"
+	if err := b.recordState(firstStaging, stagedState{
+		Device: b.byPath(portal, iqn, "0"), IQN: iqn, Portal: portal,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	secondStaging := t.TempDir() + "/stage-2"
+	if err := b.recordState(secondStaging, stagedState{Device: devB, IQN: iqn, Portal: portal}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "vol2"},
+		StagingPath: secondStaging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if fr.ran("iscsiadm", "--logout") {
+		t.Fatalf("must NOT log out while another volume shares the target; calls %v", fr.calls)
+	}
+	deletePath := filepath.Join(sysfsRoot, "class", "block", "sdb", "device", "delete")
+	got, err := os.ReadFile(deletePath)
+	if err != nil {
+		t.Fatalf("expected a raw sysfs device-delete write, got no file: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != "1" {
+		t.Fatalf("expected the delete write to be %q, got %q", "1", got)
+	}
+	if _, ok := b.loadState(secondStaging); ok {
+		t.Fatal("this volume's own state must be cleared")
+	}
+	if _, ok := b.loadState(firstStaging); !ok {
+		t.Fatal("the OTHER volume's state must be left alone")
+	}
+}
+
+// No other record shares this target IQN -- today's full teardown runs:
+// logout, verify the device is gone, best-effort node-record delete, clear
+// state. Pins that unstageSingleTarget's "last" branch is what runs now that
+// the refcount refactor exists.
+func TestNodeUnstageSharedTargetLast(t *testing.T) {
+	ic := targetdInst()["remote"]
+	iqn, portal := ic.TargetIQN, ic.Portal
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // gone after logout
+	}}
+	stateDir := t.TempDir()
+	b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+	dev := b.byPath(portal, iqn, "0")
+	staging := t.TempDir() + "/stage"
+	if err := b.recordState(staging, stagedState{Device: dev, IQN: iqn, Portal: portal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+		Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "vol1"},
+		StagingPath: staging,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !fr.ran("iscsiadm", "-T", iqn, "-p", portal, "--logout") {
+		t.Fatalf("expected the final logout; calls %v", fr.calls)
+	}
+	if !fr.ran("blockdev", "--getsize64", dev) {
+		t.Fatalf("expected the device-gone verification; calls %v", fr.calls)
+	}
+	if !fr.ran("iscsiadm", "-T", iqn, "-p", portal, "--op", "delete") {
+		t.Fatalf("expected a best-effort node record delete; calls %v", fr.calls)
+	}
+	if _, ok := b.loadState(staging); ok {
+		t.Fatal("state must be cleared after the final unstage")
+	}
+}
+
+// NO state record AND the instance is targetd -- the derived IQN must be
+// ic.TargetIQN (the shared target), NOT the per-volume targetIQN(base, name)
+// (the wrong target for a shared instance -- today's latent bug for this
+// case). Refcounting still applies: not-last clears only this volume's own
+// (nonexistent) record with no device/LUN to guess at, so no sysfs write is
+// even attempted; last logs out and verifies via the session list (there is
+// no known device to check a size for), in both directions (still up ->
+// error, gone -> success).
+func TestNodeUnstageTargetdDerivedFallback(t *testing.T) {
+	ic := targetdInst()["remote"]
+	iqn, portal := ic.TargetIQN, ic.Portal
+
+	t.Run("not-last-no-device-guessing", func(t *testing.T) {
+		fr := &fakeRunner{}
+		stateDir := t.TempDir()
+		b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+		// Point sysfsRoot at a path that doesn't exist: if the not-last path ever
+		// attempted a device-delete write here (it must not -- there is no known
+		// LUN/device to guess at without a state record) the write would fail
+		// loudly instead of silently doing nothing.
+		b.sysfsRoot = filepath.Join(t.TempDir(), "does-not-exist")
+
+		other := t.TempDir() + "/stage-other"
+		if err := b.recordState(other, stagedState{
+			Device: b.byPath(portal, iqn, "0"), IQN: iqn, Portal: portal,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		lost := t.TempDir() + "/stage-lost"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "lost-vol"},
+			StagingPath: lost,
+		}); err != nil {
+			t.Fatalf("not-last derived fallback must not error: %v", err)
+		}
+		if fr.ran("iscsiadm", "--logout") {
+			t.Fatalf("must not log out while another volume shares the target; calls %v", fr.calls)
+		}
+		if _, ok := b.loadState(other); !ok {
+			t.Fatal("the OTHER volume's record must be untouched")
+		}
+	})
+
+	t.Run("last-session-gone-succeeds", func(t *testing.T) {
+		fr := &fakeRunner{results: map[string]func([]string) (string, error){
+			"iscsiadm": func(args []string) (string, error) {
+				if contains(args, "session") && !contains(args, "--rescan") {
+					return "", errors.New("iscsiadm: No active sessions")
+				}
+				return "", nil
+			},
+		}}
+		stateDir := t.TempDir()
+		b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+		staging := t.TempDir() + "/stage-lost"
+		if err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "lost-vol"},
+			StagingPath: staging,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if !fr.ran("iscsiadm", "-T", iqn, "-p", portal, "--logout") {
+			t.Fatalf("expected the derived logout on the shared target IQN; calls %v", fr.calls)
+		}
+		if !fr.ran("iscsiadm", "-m", "session") {
+			t.Fatalf("expected a session-list verification (no known device to check a size for); calls %v", fr.calls)
+		}
+		if fr.ran("blockdev") {
+			t.Fatalf("must not guess a device/LUN to check a size for; calls %v", fr.calls)
+		}
+	})
+
+	t.Run("last-session-still-up-errors", func(t *testing.T) {
+		fr := &fakeRunner{results: map[string]func([]string) (string, error){
+			"iscsiadm": func(args []string) (string, error) {
+				if contains(args, "session") && !contains(args, "--rescan") {
+					// The logout did not actually take: the session list still
+					// mentions this target IQN.
+					return "tcp: [1] " + portal + ",1 " + iqn + " (non-flash)\n", nil
+				}
+				return "", nil // the logout call itself reports success
+			},
+		}}
+		stateDir := t.TempDir()
+		b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+		staging := t.TempDir() + "/stage-lost"
+		err := b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "lost-vol"},
+			StagingPath: staging,
+		})
+		if err == nil {
+			t.Fatal("NodeUnstage must error when the session list still shows the IQN after logout")
+		}
+	})
+}
+
+// Two goroutines each unstage one of the LAST TWO volumes sharing a target
+// IQN (exactly 2 records share it before either runs) -- the per-target flock
+// must force them to serialize so exactly ONE performs the final logout.
+// Without it, both goroutines could read "another record exists" before
+// either clears its own, and both skip the logout, leaking the session. Run
+// with -race: the point of this test is to prove withTargetLock -- not the
+// test's own bookkeeping -- serializes the interesting part.
+func TestNodeUnstageSharedTargetConcurrentLogoutOnce(t *testing.T) {
+	ic := targetdInst()["remote"]
+	iqn, portal := ic.TargetIQN, ic.Portal
+
+	var logouts int32
+	fr := &fakeRunner{results: map[string]func([]string) (string, error){
+		"blockdev": func([]string) (string, error) { return "0\n", nil }, // always gone
+		"iscsiadm": func(args []string) (string, error) {
+			if contains(args, "--logout") {
+				atomic.AddInt32(&logouts, 1)
+			}
+			return "", nil
+		},
+	}}
+	stateDir := t.TempDir()
+	b := New(targetdInst(), "n1", stateDir, "", "", "", fr)
+
+	sysfsRoot, devRoot := t.TempDir(), t.TempDir()
+	b.sysfsRoot, b.devRoot = sysfsRoot, devRoot
+	devA := makeSdDevice(t, sysfsRoot, devRoot, portal, iqn, "0", "sda")
+	devB := makeSdDevice(t, sysfsRoot, devRoot, portal, iqn, "1", "sdb")
+
+	stagingA := t.TempDir() + "/stage-a"
+	stagingB := t.TempDir() + "/stage-b"
+	if err := b.recordState(stagingA, stagedState{Device: devA, IQN: iqn, Portal: portal}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.recordState(stagingB, stagedState{Device: devB, IQN: iqn, Portal: portal}); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		errs[0] = b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "vol-a"},
+			StagingPath: stagingA,
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		errs[1] = b.NodeUnstage(context.Background(), &bardplugin.NodeUnstageRequest{
+			Volume:      bardplugin.VolumeRef{Instance: "remote", Name: "vol-b"},
+			StagingPath: stagingB,
+		})
+	}()
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("unstage[%d]: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&logouts); got != 1 {
+		t.Fatalf("exactly ONE of the two concurrent unstages sharing a target must log out, got %d; calls %v", got, fr.calls)
+	}
+	if _, ok := b.loadState(stagingA); ok {
+		t.Fatal("volume A's state must be cleared")
+	}
+	if _, ok := b.loadState(stagingB); ok {
+		t.Fatal("volume B's state must be cleared")
 	}
 }

@@ -48,6 +48,12 @@ configMap: bard-iscsi-config
 configMount: /etc/bard-iscsi
 chapMount: /etc/bard-iscsi-chap
 chapSecret: bard-iscsi-chap
+# targetd JSON-RPC credentials (management: targetd instances only) are read
+# ONLY by controller-plane RPCs (CreateVolume/.../ControllerPublish -- the
+# node plane never builds a tdManager), so unlike chapMount this is wired
+# controller-side only below, not into both planes.
+targetdMount: /etc/bard-iscsi-targetd
+targetdSecret: bard-iscsi-targetd
 controller: { privileged: true, hostDev: true, hostNetwork: true, hostPID: false, kubeletDir: false }
 node:
   privileged: true
@@ -154,11 +160,21 @@ Call: (dict "name" $type "plugin" $plugin "root" $).
 {{-   $chapArgs = list (printf "--chap-dir=%s" $prof.chapMount) -}}
 {{-   $chapVols = list (dict "name" "chap" "mountPath" $prof.chapMount "readOnly" true "secret" (dict "name" $prof.chapSecret "optional" true)) -}}
 {{- end -}}
-{{- /* controller plane: base (+ keys) (+ kms) (+ chap) (+ profile extras); host flags
-     come from $prof.controller (privileged/hostDev/hostNetwork/... -- merged below). */ -}}
+{{- /* targetd (gated on targetdMount+targetdSecret profile fields -- CONTROLLER PLANE
+     ONLY, unlike chap/kms above: only controller-side RPCs ever read these creds) */ -}}
+{{- $targetdArgs := list -}}
+{{- $targetdVols := list -}}
+{{- if and $prof.targetdMount $prof.targetdSecret -}}
+{{-   $targetdArgs = list (printf "--targetd-dir=%s" $prof.targetdMount) -}}
+{{-   $targetdVols = list (dict "name" "targetd" "mountPath" $prof.targetdMount "readOnly" true "secret" (dict "name" $prof.targetdSecret "optional" true)) -}}
+{{- end -}}
+{{- /* controller plane: base (+ keys) (+ kms) (+ chap) (+ targetd) (+ profile extras);
+     host flags come from $prof.controller (privileged/hostDev/... -- merged below). */ -}}
 {{- $cArgs := concat (concat $baseArgs $kmsArgs) $chapArgs -}}
+{{- $cArgs = concat $cArgs $targetdArgs -}}
 {{- $cArgs = concat $cArgs ($prof.controllerArgs | default list) -}}
 {{- $cVols := concat (concat $baseVols $kmsVols) $chapVols -}}
+{{- $cVols = concat $cVols $targetdVols -}}
 {{- $cVols = concat $cVols ($prof.controllerVolumes | default list) -}}
 {{- $controller := merge (dict "enabled" true "args" $cArgs "volumes" $cVols) $prof.controller -}}
 {{- /* node plane: base (+ encryption, always optional) (+ kms) (+ chap) (+ profile
@@ -225,7 +241,13 @@ instances:
     nfsServer: {{ . }}
     {{- end }}
     {{- else if eq $type "iscsi" }}
-    vg: {{ $inst.vg }}
+    {{- /* vg is required for a local (targetcli-managed) instance and absent
+         for a targetd one (its storage pool is targetdPool, remote) -- unlike
+         the unconditional local fields below, this MUST be gated or a
+         targetd instance's omitted vg renders the literal "<no value>". */}}
+    {{- with $inst.vg }}
+    vg: {{ . }}
+    {{- end }}
     portal: {{ $inst.portal }}
     {{- with $inst.portals }}
     portals: {{ toJson . }}
@@ -238,6 +260,18 @@ instances:
     {{- end }}
     {{- if $inst.chapAuth }}
     chapAuth: true
+    {{- end }}
+    {{- with $inst.management }}
+    management: {{ . }}
+    {{- end }}
+    {{- with $inst.targetdEndpoint }}
+    targetdEndpoint: {{ . }}
+    {{- end }}
+    {{- with $inst.targetdPool }}
+    targetdPool: {{ . }}
+    {{- end }}
+    {{- with $inst.targetIqn }}
+    targetIqn: {{ . }}
     {{- end }}
     {{- end }}
 {{- end }}

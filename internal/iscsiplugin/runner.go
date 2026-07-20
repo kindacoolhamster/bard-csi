@@ -49,7 +49,13 @@ func isNotFound(err error) bool {
 		strings.Contains(s, "no storage object named") ||
 		// iscsiadm logout with no live session (exit 21): the idempotent-unstage
 		// case, found by the conformance repeated-unstage check.
-		strings.Contains(s, "no matching sessions")
+		strings.Contains(s, "no matching sessions") ||
+		// iscsiadm "-m session" with no sessions at all (also exit 21): the
+		// shared-target (targetd) NodeUnstage derived fallback's final-logout
+		// verification has no known device/LUN to check a size for, so it lists
+		// sessions instead -- an empty list must classify the same as the other
+		// no-session phrasings above, not surface as a hard error.
+		strings.Contains(s, "no active sessions")
 }
 
 // isExists classifies a create of an object that already exists -- so CreateVolume
