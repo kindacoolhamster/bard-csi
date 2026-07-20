@@ -65,12 +65,18 @@ PORTAL=127.0.0.1:3260
 NODEID=tdtestnode
 BASE=iqn.2025-01.io.bard
 INITIQN="$BASE:init-$NODEID"
-SOCK=${SOCK:-/tmp/iscsi-td.sock}
-STATE=/tmp/iscsi-td-test-state
+# Every /tmp path below is mktemp'd (unpredictable name, atomically created,
+# never a pre-existing/symlinked target) rather than a fixed name -- a fixed
+# path in shared /tmp is plantable: a local attacker who pre-creates it (e.g.
+# as a symlink) before this root-run script does could redirect a mkdir,
+# mount, or log write. Mirrors conformance-iscsi-test.sh's existing pattern.
+SOCK=$(mktemp -u /tmp/iscsi-td.XXXXXX.sock)
+STATE=$(mktemp -d /tmp/iscsi-td-test-state.XXXXXX)
 CFG=$(mktemp /tmp/iscsi-td-test-cfg.XXXXXX.yaml)
 TDDIR=$(mktemp -d /tmp/iscsi-td-test-tddir.XXXXXX)
-STG=/tmp/iscsi-td-test-stg; PUB=/tmp/iscsi-td-test-pub
-STG2=/tmp/iscsi-td-test-stg2; PUB2=/tmp/iscsi-td-test-pub2
+STG=$(mktemp -d /tmp/iscsi-td-test-stg.XXXXXX); PUB=$(mktemp -d /tmp/iscsi-td-test-pub.XXXXXX)
+STG2=$(mktemp -d /tmp/iscsi-td-test-stg2.XXXXXX); PUB2=$(mktemp -d /tmp/iscsi-td-test-pub2.XXXXXX)
+LOG=$(mktemp /tmp/iscsi-td-plugin.XXXXXX.log)
 
 [ -x "$BIN" ] || { echo "plugin binary not found at $BIN (go build -o $BIN ./cmd/bard-plugin-iscsi)"; exit 1; }
 [ -f "$TD_PASSFILE" ] || { echo "targetd not set up -- run: bash hack/setup-targetd-fixture.sh"; exit 1; }
@@ -108,7 +114,7 @@ for e in json.load(sys.stdin)["result"]:
     done
     tdrpc vol_destroy '{"pool":"'"$TD_POOL"'","name":"'"$l"'"}' >/dev/null
   done
-  rm -f "$SOCK" "$CFG"; rm -rf "$STG" "$PUB" "$STG2" "$PUB2" "$STATE" "$TDDIR"
+  rm -f "$SOCK" "$CFG" "$LOG"; rm -rf "$STG" "$PUB" "$STG2" "$PUB2" "$STATE" "$TDDIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -137,7 +143,7 @@ chmod 600 "$TDDIR/remote" "$TDDIR/remote-badchap"
 
 pkill -f "bard-plugin-iscsi.*$SOCK" 2>/dev/null || true; rm -f "$SOCK"
 "$BIN" --socket="$SOCK" --config="$CFG" --node-id="$NODEID" --state-dir="$STATE" \
-  --targetd-dir="$TDDIR" >/tmp/iscsi-td-plugin.log 2>&1 &
+  --targetd-dir="$TDDIR" >"$LOG" 2>&1 &
 PLUGIN=$!
 
 post() { curl -fsS --unix-socket "$SOCK" -X POST "http://x$1" -d "$2"; }
