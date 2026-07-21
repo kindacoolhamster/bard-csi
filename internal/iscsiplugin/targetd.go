@@ -308,6 +308,22 @@ func (t *tdManager) listVolumes(ctx context.Context) ([]tdVolume, error) {
 	return vols, nil
 }
 
+// volumeSize returns the current size of one volume in this instance's pool,
+// and whether it exists at all. targetd has no per-volume get, so this filters
+// vol_list.
+func (t *tdManager) volumeSize(ctx context.Context, name string) (int64, bool, error) {
+	vols, err := t.listVolumes(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	for _, v := range vols {
+		if v.Name == name {
+			return v.Size, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // capacity returns this instance's pool's free bytes (pool_list, filtered to
 // t.pool).
 func (t *tdManager) capacity(ctx context.Context) (int64, error) {
@@ -464,10 +480,51 @@ func (b *Backend) expandVolumeTargetd(ctx context.Context, instance string, ic I
 		return nil, err
 	}
 	size := volSize(newSize)
+	// Expand MUST be idempotent -- the external-resizer retries, and kubelet
+	// re-drives NodeExpand -- but targetd's vol_resize hard-errors when the
+	// volume is already at (or above) the requested size ("need a larger than
+	// size in original volume"), so a plain retry after a SUCCESSFUL expand
+	// would fail forever and wedge the PVC. Treat already-big-enough as done.
+	// Caught by conformance against a live targetd instance.
+	cur, found, err := td.volumeSize(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("iscsi: targetd look up volume %s: %w", name, err)
+	}
+	if found && cur >= size {
+		return &bardplugin.ExpandVolumeResponse{CapacityBytes: cur, NodeExpansionRequired: true}, nil
+	}
 	if err := td.resizeVolume(ctx, name, size); err != nil {
 		return nil, fmt.Errorf("iscsi: targetd resize volume %s: %w", name, err)
 	}
 	return &bardplugin.ExpandVolumeResponse{CapacityBytes: size, NodeExpansionRequired: true}, nil
+}
+
+// getVolumeHealthTargetd is GetVolumeHealth's targetd branch: the volume lives
+// in a pool on a remote host, so existence is a vol_list lookup rather than a
+// local lvs (which would be handed the marked Location and reject it as an
+// invalid VG name).
+func (b *Backend) getVolumeHealthTargetd(ctx context.Context, instance, location, name string) (*bardplugin.GetVolumeHealthResponse, error) {
+	ic, err := b.inst(instance)
+	if err != nil {
+		return nil, err
+	}
+	// Trust the handle's own pool over the instance's current config: a volume
+	// created before the instance was re-pointed still lives in its old pool.
+	if pool := tdPoolFromLocation(location); pool != "" {
+		ic.TargetdPool = pool
+	}
+	td, err := b.newTdManager(instance, ic)
+	if err != nil {
+		return nil, err
+	}
+	_, found, err := td.volumeSize(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("iscsi: targetd look up volume %s: %w", name, err)
+	}
+	if !found {
+		return &bardplugin.GetVolumeHealthResponse{Abnormal: true, Message: "backing targetd volume not found"}, nil
+	}
+	return &bardplugin.GetVolumeHealthResponse{Abnormal: false, Message: "present"}, nil
 }
 
 // getCapacityTargetd is GetCapacity's targetd branch.

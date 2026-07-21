@@ -434,8 +434,24 @@ func (r *runner) run(ctx context.Context) error {
 		r.record("snapshot/create", Skip, "prerequisite volume/create failed")
 	} else {
 		snapReq := bardplugin.CreateSnapshotRequest{Name: s1name, SourceVolume: v1ref, Parameters: r.cfg.Parameters}
-		if err := r.call(ctx, bardplugin.PathCreateSnapshot, snapReq, &s1); err != nil {
+		err := r.call(ctx, bardplugin.PathCreateSnapshot, snapReq, &s1)
+		switch {
+		case errCode(err) == bardplugin.CodeUnsupported:
+			// Capabilities in /info are per-PLUGIN, but one plugin may serve
+			// INSTANCES of differing ability (the iSCSI plugin does snapshots on
+			// a locally-managed instance but not a targetd-managed one, whose
+			// vol_copy is unsafe under provisioner retries). A plugin cannot
+			// express that in a single capability flag, so a declared capability
+			// refused per-instance with Unsupported is a legitimate answer, not a
+			// violation -- CSI allows UNIMPLEMENTED for an RPC "disabled in the
+			// plugin's current mode of operation". Without this, a targetd
+			// instance could never pass conformance.
+			r.record("snapshot/create", Skip, "not supported on this instance (Unsupported): %v", err)
+		case err != nil:
 			r.record("snapshot/create", Fail, "%v", err)
+		}
+		if err != nil {
+			// fall through to the dependent checks, which key off haveS1
 		} else if err := r.identity(info.Type, s1.Location, s1.Name); err != nil {
 			r.record("snapshot/create", Fail, "returned identity unusable as a CSI id: %v", err)
 		} else {
