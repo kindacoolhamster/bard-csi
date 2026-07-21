@@ -27,7 +27,34 @@ works with Bard core unchanged. Core never grows a dependency on any one backend
 
 Each operation is an HTTP `POST` to a fixed path with a JSON request/response
 body. `200` is success; a non-`200` carries an `{"code","message"}` error, where
-`code` is one of `Internal`, `NotFound`, `AlreadyExists`, `InvalidArgument`.
+`code` is one of `Internal`, `NotFound`, `AlreadyExists`, `InvalidArgument`,
+`Unsupported`.
+
+Pick the code by what CSI mandates for that operation, not by what feels
+descriptive — Bard maps them straight to gRPC codes the CO acts on. Two rules
+worth committing to memory:
+
+- **`InvalidArgument` for a source you cannot use.** If `/volume/create`
+  carries a `sourceSnapshot`/`sourceVolume` you do not support, CSI *requires*
+  `INVALID_ARGUMENT`, telling the CO to retry with a different source or none.
+  `Unsupported` there means "this RPC does not exist", which is both wrong and
+  a conformance failure.
+- **`Unsupported` for an RPC disabled in your current mode.** CSI allows
+  `UNIMPLEMENTED` for an RPC "not implemented by the plugin *or disabled in the
+  plugin's current mode of operation*", and the CO must not retry it. This is
+  the code's reason for existing: `/info` capabilities are **per-plugin**, but
+  one plugin may serve **instances** with different abilities (the iSCSI plugin
+  supports snapshots on locally-managed instances but not targetd-managed
+  ones). A capability flag cannot express that; `Unsupported` can.
+
+Everything else that is simply not advertised in your `Capabilities` needs no
+error at all — Bard never calls an optional route you did not declare.
+
+The HTTP status mirrors the code (`NotFound`→404, `AlreadyExists`→409,
+`InvalidArgument`→400, `Unsupported`→501, everything else→500), but the JSON
+`code` is authoritative: Bard dispatches on it and treats the status as
+transport decoration. Set both consistently anyway — a mismatched pair misleads
+anyone reading your plugin over the wire.
 
 | Path | Request → Response | When |
 |---|---|---|
@@ -59,10 +86,18 @@ Message schemas are defined in
 ## Contract version & compatibility promise
 
 The wire contract is versioned `MAJOR.MINOR`, independently of Bard releases;
-the current version is **1.0** (`bardplugin.ContractVersion`). Report the
+the current version is **1.1** (`bardplugin.ContractVersion`). Report the
 version you implement in `/info` as `contractVersion` (the Go SDK fills it in
 for you; an absent field means `1.0`). Bard refuses at startup a plugin whose
-MAJOR it does not support.
+MAJOR it does not support, **or whose MINOR is newer than it understands**.
+
+That gate is asymmetric on purpose. An older plugin is always safe: everything
+it can say, a newer Bard already understands. The reverse does not hold — a
+MINOR may add vocabulary to an *existing* route (1.1 added the `Unsupported`
+error code), and an older Bard meeting an unknown value degrades it to a
+generic `Internal`, turning a terminal failure into one the CO reconciles
+indefinitely. Failing fast at startup beats mistranslating at runtime, so pair
+a newer plugin with a Bard that speaks its MINOR.
 
 Within a MAJOR version the contract only grows, and only compatibly — **a
 plugin built against contract 1.0 keeps working, unchanged, with every Bard

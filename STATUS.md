@@ -3,6 +3,38 @@
 Feature inventory for bard-csi and the backends it ships. See the root
 [README.md](README.md) for architecture and how to deploy.
 
+## Backend maturity
+
+Bard ships six backends, and they are **not equally proven**. The feature list
+below is the union across all of them; this table says how much weight each one
+will actually carry. Pre-1.0, no backend carries a compatibility guarantee —
+these tiers describe *evidence*, not warranty.
+
+| Backend | Tier | Chart support | Notes |
+|---|---|---|---|
+| **Ceph RBD** | Stable | native profile | The deepest surface by far: 7 KMS providers, LUKS + fscrypt, snapshots/clones, mirroring/DR, the csi-addons set. |
+| **iSCSI** | Stable | native profile | The reference attach-style backend (control-plane LUN masking). CHAP, thin snapshots, dm-multipath. A `management: targetd` instance drops snapshots, clone, and CHAP — see [Not yet](#not-yet). |
+| **CephFS** | Beta | native profile | RWX, subvolumes, shallow read-only volumes, MDS pinning. Encrypted volumes cannot be cloned or restored from a snapshot. |
+| **NFS** | Experimental | examples only | Provision/mount/snapshot against an existing export. Functional and unit-tested; comparatively little live proving. |
+| **LVM** | Experimental | examples only | Shared-VG only — the controller drives `lvcreate`, so the VG must be reachable from it. True node-local LVM is [not yet](#not-yet) built. |
+| **localpath** | Reference | examples only | A stdlib-only **Python** plugin proving the contract is language-agnostic. A teaching example — not intended for production. |
+
+What the tiers mean:
+
+- **Stable** — the full volume lifecycle has been proven live in-cluster, not
+  just under unit tests: provision, attach, mount, snapshot, restore, expand,
+  and delete-with-clean-reap.
+- **Beta** — proven live, with documented gaps that are enforced in code rather
+  than left to surprise you (the combination is rejected, not silently broken).
+- **Experimental** — implemented and tested, but with limited live proving.
+  Expect rough edges; read the code before depending on it.
+- **Reference** — exists to demonstrate the plugin contract. Correctness is
+  secondary to clarity.
+
+A backend's tier tracks how much of it has been *exercised against real
+storage*, which is why it correlates with chart support: the three backends with
+native Helm profiles are the three that have been driven hardest in-cluster.
+
 ## Implemented
 
 The **Ceph RBD** backend is the most complete and carries most of the depth below;

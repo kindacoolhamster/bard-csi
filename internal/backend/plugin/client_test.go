@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,11 +129,33 @@ func TestClientServerRoundtrip(t *testing.T) {
 	if !errors.Is(err, backend.ErrUnsupported) {
 		t.Fatalf("want ErrUnsupported, got %v", err)
 	}
+
+	// An UNKNOWN code (what an older Bard sees when a newer-minor plugin uses
+	// vocabulary it predates) must degrade to a generic error -- NOT to any
+	// sentinel, and above all not silently to ErrUnsupported. The driver maps a
+	// generic error to codes.Internal, which the CO reconciles with backoff,
+	// whereas ErrUnsupported becomes a terminal codes.Unimplemented. Conflating
+	// them would either retry a permanent failure forever or abandon a transient
+	// one. This is exactly the mistranslation ContractMinor's gate now prevents.
+	fb.createErr = bardplugin.Errorf(bardplugin.ErrorCode("SomeFutureCode"), "from a newer plugin")
+	_, err = cl.CreateVolume(ctx, &backend.CreateVolumeRequest{Name: "z", Instance: "east"})
+	switch {
+	case err == nil:
+		t.Fatal("an unknown error code must still be an error")
+	case errors.Is(err, backend.ErrUnsupported),
+		errors.Is(err, backend.ErrNotFound),
+		errors.Is(err, backend.ErrAlreadyExists),
+		errors.Is(err, backend.ErrInvalidArgument):
+		t.Fatalf("unknown code must not map to a sentinel, got %v", err)
+	case !strings.Contains(err.Error(), "from a newer plugin"):
+		t.Fatalf("unknown code must preserve the plugin's message, got %v", err)
+	}
 }
 
-// TestDialContractVersion verifies Dial's wire-contract gate: the SDK-filled
-// current version and an additive (newer-minor) version are accepted, a foreign
-// major or garbage is refused at startup.
+// TestDialContractVersion verifies Dial's wire-contract gate. The gate is
+// asymmetric within a major: an older or equal minor is accepted, a NEWER minor
+// is refused (it may use vocabulary on an existing route that this Bard would
+// mistranslate -- see ContractMinor), as is a foreign major or garbage.
 func TestDialContractVersion(t *testing.T) {
 	cases := []struct {
 		version string
@@ -140,8 +163,9 @@ func TestDialContractVersion(t *testing.T) {
 	}{
 		{"", false}, // SDK fills in the current version; raw plugins may omit it (= 1.0)
 		{bardplugin.ContractVersion, false},
-		{"1.99", false}, // newer minor is additive, fine
-		{"2.0", true},   // foreign major
+		{"1.0", false}, // older minor: we understand everything it can say
+		{"1.99", true}, // newer minor: refused, we cannot interpret its additions
+		{"2.0", true},  // foreign major
 		{"banana", true},
 	}
 	for _, c := range cases {

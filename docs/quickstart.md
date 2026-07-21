@@ -51,10 +51,12 @@ That's Bard's architecture in one install:
 
 ## Where next
 
-- **Real backends**: enable the Ceph RBD or CephFS profile in the chart
+- **Real backends**: enable the Ceph RBD, CephFS, or iSCSI profile in the chart
   (`plugins.ceph-rbd.instances` in
   [charts/bard-csi/values.yaml](../charts/bard-csi/values.yaml)), or wire
-  NFS/LVM/iSCSI via [deploy/examples/](../deploy/examples/).
+  NFS/LVM via [deploy/examples/](../deploy/examples/). Backends differ in how
+  proven they are — check
+  [Backend maturity](../STATUS.md#backend-maturity) before picking one.
 - **Migrating from ceph-csi**: in-place adoption without copying data — see
   the migration docs/examples.
 - **Write your own backend** in any language:

@@ -280,6 +280,9 @@ func (r *runner) run(ctx context.Context) error {
 		r.record("info", Fail, "contractVersion: %v", verr)
 	case major != bardplugin.ContractMajor:
 		r.record("info", Fail, "contract major %d not supported (core speaks v%d.x)", major, bardplugin.ContractMajor)
+	case minor > bardplugin.ContractMinor:
+		r.record("info", Fail, "contract %d.%d is newer than this core understands (v%d.%d) -- upgrade Bard to match the plugin",
+			major, minor, bardplugin.ContractMajor, bardplugin.ContractMinor)
 	default:
 		r.record("info", Pass, "type=%s contract=%d.%d", info.Type, major, minor)
 	}

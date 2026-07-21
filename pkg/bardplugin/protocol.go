@@ -71,9 +71,17 @@
 //     behavior. Both sides ignore JSON fields they do not know (the default
 //     for Go's and Python's decoders -- do not enable a strict mode).
 //
-// A MINOR bump marks that new optional surface exists. A MAJOR bump is a
-// breaking change: rare, announced in release notes ahead of time, and shipped
-// with a transition period during which Bard accepts both majors.
+// A MINOR bump marks that new optional surface exists. Compatibility within a
+// major is therefore ASYMMETRIC, and Bard enforces it at startup: it accepts a
+// plugin whose minor is at or below ContractMinor, and refuses one above it.
+// Everything an older plugin can say, a newer Bard already understands; the
+// reverse does not hold, because a minor may add vocabulary to an existing
+// route (1.1 added the Unsupported error code) that an older Bard would
+// silently mistranslate. Pair a newer plugin with a Bard that speaks its minor.
+//
+// A MAJOR bump is a breaking change: rare, announced in release notes ahead of
+// time, and shipped with a transition period during which Bard accepts both
+// majors.
 //
 // The bard-plugin-conformance tool (cmd/bard-plugin-conformance) drives a
 // plugin over its socket and verifies the required semantics plus every
@@ -90,11 +98,22 @@ import (
 // ContractVersion is the wire-contract version this package defines, as
 // "MAJOR.MINOR". The SDK reports it from /info when a Backend's Info does not
 // set ContractVersion explicitly.
-const ContractVersion = "1.0"
+const ContractVersion = "1.1"
 
 // ContractMajor is the contract MAJOR version this Bard supports. Core
 // refuses a plugin that reports a different major.
 const ContractMajor = 1
+
+// ContractMinor is the highest contract MINOR this Bard can interpret. Core
+// refuses a plugin reporting a HIGHER minor: compatibility is asymmetric.
+//
+// An older-minor plugin is safe -- everything it can say, this Bard already
+// understands. A newer-minor plugin is not: a minor may add vocabulary to an
+// EXISTING route (1.1 added the Unsupported error code), and an older Bard
+// that meets an unknown value degrades it to a generic Internal error, turning
+// a terminal failure into an indefinitely reconciled one. Failing fast at
+// startup with a clear message beats mistranslating at runtime.
+const ContractMinor = 1
 
 // ParseContractVersion parses an Info.ContractVersion of the form
 // "MAJOR.MINOR". The empty string is the pre-versioning contract and parses
@@ -444,8 +463,17 @@ type GetVolumeHealthResponse struct {
 //
 // A plugin runs in two contexts: the control-plane methods are invoked in
 // Bard's controller pod, the Node* methods in Bard's node DaemonSet. Implement
-// only what your Capabilities advertise; for unsupported operations return an
-// Error with CodeInvalidArg (or succeed as a no-op where the CSI spec allows).
+// only what your Capabilities advertise; Bard never calls an optional route you
+// did not declare.
+//
+// Where you must still refuse a call, the code follows what CSI mandates for
+// that operation (or succeed as a no-op where the spec allows): CodeInvalidArg
+// for a volume source you cannot use -- CSI requires INVALID_ARGUMENT there, so
+// the CO retries with a different source -- and CodeUnsupported for an RPC
+// disabled in this instance's mode of operation, which the CO must not retry.
+// The latter exists because Capabilities are per-plugin while one plugin may
+// serve instances of differing ability (iSCSI: snapshots locally, not on
+// targetd). See docs/writing-a-plugin.md.
 type Backend interface {
 	Info() Info
 

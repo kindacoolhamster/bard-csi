@@ -34,11 +34,17 @@ func TestParseContractVersion(t *testing.T) {
 
 // TestCurrentVersionParses pins the package's own constants together.
 func TestCurrentVersionParses(t *testing.T) {
-	major, _, err := ParseContractVersion(ContractVersion)
+	major, minor, err := ParseContractVersion(ContractVersion)
 	if err != nil {
 		t.Fatalf("ContractVersion %q does not parse: %v", ContractVersion, err)
 	}
 	if major != ContractMajor {
 		t.Fatalf("ContractVersion %q major = %d, but ContractMajor = %d", ContractVersion, major, ContractMajor)
+	}
+	// The version the SDK stamps on /info must be exactly the version core can
+	// interpret. If they drift, every SDK-built plugin advertises a minor its
+	// own core refuses (see ContractMinor's asymmetric gate) and nothing dials.
+	if minor != ContractMinor {
+		t.Fatalf("ContractVersion %q minor = %d, but ContractMinor = %d", ContractVersion, minor, ContractMinor)
 	}
 }

@@ -281,6 +281,8 @@ func writeErr(w http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case CodeInvalidArg:
 		status = http.StatusBadRequest
+	case CodeUnsupported:
+		status = http.StatusNotImplemented
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
