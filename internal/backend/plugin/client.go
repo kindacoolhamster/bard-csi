@@ -62,16 +62,23 @@ func Dial(ctx context.Context, backendType, socketPath string) (*Client, error) 
 		case <-time.After(time.Second):
 		}
 	}
-	// Enforce the wire-contract major (empty = pre-versioning 1.0). Minor is
-	// advisory: a newer-minor plugin only serves routes we won't call, an
-	// older-minor plugin's missing optionals are already gated by capabilities.
-	major, _, err := bardplugin.ParseContractVersion(info.ContractVersion)
+	// Enforce the wire-contract version (empty = pre-versioning 1.0). The gate is
+	// asymmetric: an older minor is safe (we understand everything it can say),
+	// a NEWER minor is refused -- a minor may add vocabulary to an existing route
+	// (1.1 added the Unsupported error code) that we would degrade to a generic
+	// Internal error, turning a terminal failure into an indefinitely retried one.
+	// An older-minor plugin's missing optionals stay gated by capabilities.
+	major, minor, err := bardplugin.ParseContractVersion(info.ContractVersion)
 	if err != nil {
 		return nil, fmt.Errorf("plugin %q: invalid contractVersion: %w", backendType, err)
 	}
 	if major != bardplugin.ContractMajor {
 		return nil, fmt.Errorf("plugin %q speaks wire-contract %q; this Bard supports v%d.x -- use a matching plugin or Bard release",
 			backendType, info.ContractVersion, bardplugin.ContractMajor)
+	}
+	if minor > bardplugin.ContractMinor {
+		return nil, fmt.Errorf("plugin %q speaks wire-contract %q, newer than this Bard understands (v%d.%d) -- upgrade Bard to match the plugin",
+			backendType, info.ContractVersion, bardplugin.ContractMajor, bardplugin.ContractMinor)
 	}
 	c.caps = backend.Capabilities(info.Capabilities)
 	return c, nil

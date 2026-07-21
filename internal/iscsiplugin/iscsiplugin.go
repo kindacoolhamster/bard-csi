@@ -597,7 +597,16 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 		// CSI provisioner retries (a retried CreateVolume could pile up
 		// concurrent full copies, or double-bill the copy time on every retry).
 		// Reject fail-fast rather than silently hang a PVC restore/clone.
-		return nil, bardplugin.Errorf(bardplugin.CodeUnsupported,
+		//
+		// InvalidArgument, NOT Unsupported: CSI mandates INVALID_ARGUMENT when a
+		// plugin cannot create a volume from the requested source ("Source
+		// incompatible or not supported", CreateVolume Errors) -- an RPC-specific
+		// MUST that overrides the general "disabled in the plugin's current mode
+		// of operation -> UNIMPLEMENTED" rule CreateSnapshot rides on. It also
+		// tells the CO the right recovery: use a different source or none, rather
+		// than "this RPC does not exist". Bard's own conformance runner enforces
+		// this (internal/conformance: an unsupported clone must be InvalidArgument).
+		return nil, bardplugin.Errorf(bardplugin.CodeInvalidArg,
 			"iscsi: creating a volume from a snapshot or another volume is not supported on targetd-managed instance %q "+
 				"(targetd's vol_copy is a synchronous full copy, unsafe under provisioner retries); local-management instances support snapshots and clones", req.Instance)
 	}

@@ -157,6 +157,21 @@ control plane on a non-target node uses remote LIO management
 (`management: targetd`) -- see the "Known follow-ups" section (DONE,
 live-proven in-cluster 2026-07-20).
 
+**Conformance runs against the LOCAL fixture only -- targetd instances have
+never been through it, and that gap shipped a real bug** (found 2026-07-20 in
+release review, fixed pre-rc.4): targetd rejected clone/restore with
+`CodeUnsupported`, but CSI *mandates* `INVALID_ARGUMENT` when a plugin cannot
+create a volume from the requested source, and `internal/conformance` enforces
+exactly that -- so `bard-plugin-conformance` pointed at a targetd instance
+would have FAILED `volume/clone` on day one. `hack/targetd-plugin-test.sh` is a
+bespoke harness, NOT the conformance runner, which is why nothing caught it.
+The lesson generalizes: **every management mode is its own conformance
+surface.** When a backend gains a mode that changes which operations it
+refuses, run the conformance tool against that mode, and pick the refusal code
+from the CSI spec's per-RPC error table (an RPC-specific MUST beats the general
+"disabled in the plugin's current mode -> UNIMPLEMENTED" rule that
+`CreateSnapshot` correctly rides on).
+
 ## Local end-to-end (rootful kind + real Ceph)
 
 ```sh

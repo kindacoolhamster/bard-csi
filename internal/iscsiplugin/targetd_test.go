@@ -70,8 +70,11 @@ func TestCreateSnapshotTargetdRejected(t *testing.T) {
 }
 
 // A targetd instance rejects creating a volume from a source (snapshot
-// restore OR volume clone) for the same reason as CreateSnapshot -- both
-// paths must reject with CodeUnsupported and the same kind of message.
+// restore OR volume clone) for the same underlying reason as CreateSnapshot,
+// but with a DIFFERENT code: CSI mandates INVALID_ARGUMENT when a plugin
+// cannot create a volume from the requested source, which overrides the
+// general mode-of-operation rule that lets CreateSnapshot return Unsupported.
+// Bard's conformance runner fails a clone rejected as anything else.
 func TestCreateVolumeFromSourceTargetdRejected(t *testing.T) {
 	b := New(targetdInst(), "", "", "", "", "", &fakeRunner{})
 
@@ -81,8 +84,8 @@ func TestCreateVolumeFromSourceTargetdRejected(t *testing.T) {
 			SourceSnapshot: &bardplugin.VolumeRef{Instance: "remote", Location: "vg-targetd", Name: "snap-abc"},
 		})
 		var se *bardplugin.StatusError
-		if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeUnsupported {
-			t.Fatalf("restore-from-snapshot on a targetd instance must fail with CodeUnsupported, got %v", err)
+		if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeInvalidArg {
+			t.Fatalf("restore-from-snapshot on a targetd instance must fail with CodeInvalidArg (CSI mandates INVALID_ARGUMENT for an unsupported source), got %v", err)
 		}
 		if !strings.Contains(se.Message, "targetd") || !strings.Contains(se.Message, "local") {
 			t.Fatalf("error must say why (targetd) and that local-management instances support it, got %q", se.Message)
@@ -95,8 +98,8 @@ func TestCreateVolumeFromSourceTargetdRejected(t *testing.T) {
 			SourceVolume: &bardplugin.VolumeRef{Instance: "remote", Location: "vg-targetd", Name: "bard-src"},
 		})
 		var se *bardplugin.StatusError
-		if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeUnsupported {
-			t.Fatalf("clone on a targetd instance must fail with CodeUnsupported, got %v", err)
+		if err == nil || !errors.As(err, &se) || se.Code != bardplugin.CodeInvalidArg {
+			t.Fatalf("clone on a targetd instance must fail with CodeInvalidArg (CSI mandates INVALID_ARGUMENT for an unsupported source), got %v", err)
 		}
 		if !strings.Contains(se.Message, "targetd") || !strings.Contains(se.Message, "local") {
 			t.Fatalf("error must say why (targetd) and that local-management instances support it, got %q", se.Message)

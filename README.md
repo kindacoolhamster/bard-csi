@@ -159,6 +159,13 @@ kubectl bard inspect
 
 The implemented-feature inventory and the roadmap live in [STATUS.md](STATUS.md).
 
+The six backends are **not equally proven**, and the feature list is the union
+across all of them. **Ceph RBD** and **iSCSI** are the two carrying real weight
+(Stable); **CephFS** is Beta; **NFS** and **LVM** are Experimental; **localpath**
+is a Python reference plugin, not for production. See
+[Backend maturity](STATUS.md#backend-maturity) for what each tier means and the
+per-backend caveats.
+
 ## Contributing & license
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md); backend
