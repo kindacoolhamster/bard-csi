@@ -626,6 +626,73 @@ func TestBackendExpandVolumeAndGetCapacityTargetd(t *testing.T) {
 	}
 }
 
+// A targetd instance can be re-pointed to a different pool after volumes were
+// created in the old one. Each volume's handle encodes the pool it was created
+// in (tdLocation), so EVERY volume-scoped op -- delete, expand, publish,
+// unpublish -- must act in the HANDLE's pool, not the instance's CURRENT pool.
+// Routing by the current pool after a re-point would target a same-named volume
+// in the wrong pool: a silent orphan on delete (the real volume never removed),
+// or a wrong/failed expand or attach. Connection identity (endpoint, creds,
+// target IQN) still comes from current config -- only the pool is handle-derived,
+// mirroring GetVolumeHealth's branch.
+func TestBackendTargetdVolumeOpsRouteByHandlePool(t *testing.T) {
+	const handlePool = "old-pool" // where the volume was actually created
+
+	seen := map[string]interface{}{}
+	record := func(method string) func(map[string]interface{}) (interface{}, *tdRPCError) {
+		return func(p map[string]interface{}) (interface{}, *tdRPCError) {
+			seen[method] = p["pool"]
+			switch method {
+			case "vol_list":
+				return []tdVolume{{Name: "bard-x", Size: 1 << 30}}, nil
+			case "export_list":
+				return []tdExport{}, nil
+			}
+			return nil, nil
+		}
+	}
+	srv := newTdFakeServer(t)
+	for _, m := range []string{"vol_destroy", "vol_list", "vol_resize", "export_list", "export_create", "export_destroy"} {
+		srv.on(m, record(m))
+	}
+	httpSrv := srv.start()
+	// wiredTargetdInst configures "remote" with TargetdPool "vg-targetd" -- the
+	// pool the instance points at NOW, DIFFERENT from the handle's "old-pool".
+	inst, dir := wiredTargetdInst(t, httpSrv.URL)
+	run := &fakeRunner{}
+	b := New(inst, "node-a", "", "", dir, "", run)
+
+	handle := bardplugin.VolumeRef{Instance: "remote", Location: tdLocation(handlePool), Name: "bard-x"}
+
+	if _, err := b.ExpandVolume(context.Background(), &bardplugin.ExpandVolumeRequest{Volume: handle, NewSizeBytes: 2 << 30}); err != nil {
+		t.Fatalf("ExpandVolume: %v", err)
+	}
+	if _, err := b.ControllerPublish(context.Background(), &bardplugin.ControllerPublishRequest{Volume: handle, NodeID: "node-a"}); err != nil {
+		t.Fatalf("ControllerPublish: %v", err)
+	}
+	if err := b.ControllerUnpublish(context.Background(), &bardplugin.ControllerUnpublishRequest{Volume: handle, NodeID: "node-a"}); err != nil {
+		t.Fatalf("ControllerUnpublish: %v", err)
+	}
+	if err := b.DeleteVolume(context.Background(), &bardplugin.DeleteVolumeRequest{Volume: handle}); err != nil {
+		t.Fatalf("DeleteVolume: %v", err)
+	}
+
+	// Every pool-scoped RPC must have been issued against the handle's pool.
+	for _, m := range []string{"vol_list", "vol_resize", "export_create", "export_destroy", "vol_destroy"} {
+		got, ok := seen[m]
+		if !ok {
+			t.Errorf("%s was never called -- op did not reach targetd", m)
+			continue
+		}
+		if got != handlePool {
+			t.Errorf("%s routed to pool %v, want the handle's pool %q (instance is re-pointed to vg-targetd)", m, got, handlePool)
+		}
+	}
+	if len(run.calls) != 0 {
+		t.Fatalf("targetd ops must never invoke the local Runner, got %v", run.calls)
+	}
+}
+
 // ListVolumes must aggregate targetd instances alongside local ones with no
 // changes to the local (VG-based) branch's behavior.
 func TestBackendListVolumesTargetd(t *testing.T) {

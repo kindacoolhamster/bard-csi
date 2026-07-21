@@ -35,6 +35,26 @@ func isTdLocation(loc string) bool { return strings.HasPrefix(loc, tdLocationPre
 // tdPoolFromLocation strips the marker, returning the bare pool name.
 func tdPoolFromLocation(loc string) string { return strings.TrimPrefix(loc, tdLocationPrefix) }
 
+// tdWithHandlePool returns ic with its TargetdPool taken from the volume
+// handle's marked Location when the handle carries one. A targetd volume is
+// created in the instance's pool AT THAT TIME, and that pool is encoded into
+// the handle (tdLocation); the instance may later be re-pointed to a different
+// pool. Every volume-scoped op (delete, expand, publish, unpublish, health)
+// must therefore act in the pool the volume actually lives in -- the handle's
+// -- not the instance's CURRENT pool, or it would target a same-named volume in
+// the wrong pool (a silent orphan on delete, a wrong/failed expand or attach).
+// Only the pool is handle-derived; connection identity (endpoint, credentials,
+// target IQN) still comes from the current instance config, which is why an
+// unmarked or empty pool leaves ic untouched.
+func tdWithHandlePool(ic InstanceConfig, location string) InstanceConfig {
+	if isTdLocation(location) {
+		if pool := tdPoolFromLocation(location); pool != "" {
+			ic.TargetdPool = pool
+		}
+	}
+	return ic
+}
+
 // tdRequestTimeout is the HTTP timeout for a targetd JSON-RPC call -- generous
 // because a remote host adds network latency the LOCAL (targetcli) path never
 // sees, and vol_create/vol_resize can take a few seconds on some backends.
@@ -508,12 +528,9 @@ func (b *Backend) getVolumeHealthTargetd(ctx context.Context, instance, location
 	if err != nil {
 		return nil, err
 	}
-	// Trust the handle's own pool over the instance's current config: a volume
-	// created before the instance was re-pointed still lives in its old pool.
-	if pool := tdPoolFromLocation(location); pool != "" {
-		ic.TargetdPool = pool
-	}
-	td, err := b.newTdManager(instance, ic)
+	// Trust the handle's own pool over the instance's current config -- shared
+	// with every other volume-scoped op via tdWithHandlePool.
+	td, err := b.newTdManager(instance, tdWithHandlePool(ic, location))
 	if err != nil {
 		return nil, err
 	}

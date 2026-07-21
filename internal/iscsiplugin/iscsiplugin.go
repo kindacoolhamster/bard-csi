@@ -805,7 +805,7 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 		// it with no instance config at all; mirrors NodeUnstage's documented
 		// derived-logout fallback). Falls through to the shared teardown below.
 	} else if ic.isTargetd() {
-		return b.deleteVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name)
+		return b.deleteVolumeTargetd(ctx, req.Volume.Instance, tdWithHandlePool(ic, req.Volume.Location), req.Volume.Name)
 	}
 	vg, lv := req.Volume.Location, req.Volume.Name
 	base := ic.IQNBase
@@ -828,7 +828,7 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 
 func (b *Backend) ExpandVolume(ctx context.Context, req *bardplugin.ExpandVolumeRequest) (*bardplugin.ExpandVolumeResponse, error) {
 	if ic := b.instances[req.Volume.Instance]; ic.isTargetd() {
-		return b.expandVolumeTargetd(ctx, req.Volume.Instance, ic, req.Volume.Name, req.NewSizeBytes)
+		return b.expandVolumeTargetd(ctx, req.Volume.Instance, tdWithHandlePool(ic, req.Volume.Location), req.Volume.Name, req.NewSizeBytes)
 	}
 	vg, lv := req.Volume.Location, req.Volume.Name
 	if err := b.extendTo(ctx, vg, lv, req.NewSizeBytes); err != nil {
@@ -935,7 +935,7 @@ func (b *Backend) ControllerPublish(ctx context.Context, req *bardplugin.Control
 		return nil, err
 	}
 	if ic.isTargetd() {
-		return b.controllerPublishTargetd(ctx, req.Volume.Instance, ic, req)
+		return b.controllerPublishTargetd(ctx, req.Volume.Instance, tdWithHandlePool(ic, req.Volume.Location), req)
 	}
 	chap, err := b.chapFor(req.Volume.Instance)
 	if err != nil {
@@ -990,7 +990,7 @@ func (b *Backend) ControllerUnpublish(ctx context.Context, req *bardplugin.Contr
 		// identical case -- falls through to the shared teardown below with
 		// ic at its zero value (IQNBase defaults to defaultIQNBase, as always).
 	} else if ic.isTargetd() {
-		return b.controllerUnpublishTargetd(ctx, req.Volume.Instance, ic, req)
+		return b.controllerUnpublishTargetd(ctx, req.Volume.Instance, tdWithHandlePool(ic, req.Volume.Location), req)
 	}
 	base := ic.IQNBase
 	if base == "" {
