@@ -92,6 +92,21 @@ inside its subvolume, keyed by a KMS passphrase, so Ceph stores only ciphertext
 (file contents and names). The KMS layer and fscrypt helpers are shared with RBD
 (`internal/cephenc`), so every KMS provider works via the subvolume metadata store.
 
+The **iSCSI** backend is the reference **attach-style** backend: a volume is an
+LVM logical volume exported through an LIO target, and making it reachable is a
+control-plane operation (`ControllerPublishVolume` masks the LUN to the staging
+node's initiator IQN) rather than a node-side map. Beyond block/ReadWriteOnce/
+expand it supports thin-pool snapshots and clone-from-snapshot,
+`ListVolumes`/`ListSnapshots`, optional per-instance CHAP (a 2-line
+userid/password Secret, or 4 lines with a mutual pair, read by both planes and
+never present in the ConfigMap, StorageClass, or PublishContext), and
+**dm-multipath** -- an instance `portals` list yields explicit per-address LIO
+portals, and the node logs in through every portal and mounts the
+multipathd-assembled mapper by its `dm-uuid-mpath-<wwid>` link, with failover
+proven under live I/O. Management is local targetcli/configfs by default, or
+`management: targetd` to drive a **remote** LIO host over targetd's JSON-RPC
+API, so the controller no longer has to run on the target host.
+
 ## Not yet
 
 On the CephFS backend, **encrypted volumes cannot be restored from a snapshot or
@@ -99,5 +114,12 @@ cloned** -- CephFS subvolume clone does not preserve the fscrypt context (unlike
 block-level clone, which copies the LUKS header byte-for-byte); the combination is
 rejected rather than producing an unmountable volume.
 Also: true node-local LVM (TopoLVM-style node agent + per-volume CRD; today's LVM
-plugin is shared-VG), a cloud-disk backend, and iSCSI snapshots/CHAP/multipath
-(the iSCSI backend ships without them today).
+plugin is shared-VG) and a cloud-disk backend.
+
+On a **targetd-managed** iSCSI instance (`management: targetd`), snapshots,
+clone, and CHAP are unavailable -- and are rejected explicitly rather than
+silently ignored. targetd's `vol_copy` is a synchronous full copy (unsafe under
+provisioner retries), and its `export_create` hardcodes the shared target's TPG
+`authentication` attribute to `"0"` with no API to override it, so CHAP
+credentials are never actually enforced; access control on a targetd instance is
+IQN-based ACLs only. Local (targetcli) management supports all three.

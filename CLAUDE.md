@@ -751,7 +751,9 @@ Record your cluster's actual addresses in `CLAUDE.local.md`.
   lists. Each plugin opts in via the `VolumeLister`/`SnapshotLister` interfaces:
   ceph-rbd (`rbd ls`/`rbd snap ls`), cephfs (`fs subvolume ls`/`snapshot ls`), nfs
   (readdir the export / `.snapshots`), lvm + iscsi (`lvs`, filtered to `bard-`/
-  `snap-`, excluding thin pools). iSCSI has no snapshots so no SnapshotLister.
+  `snap-`, excluding thin pools). iSCSI implements SnapshotLister too now that it
+  has thin snapshots; a targetd-managed instance rejects snapshots outright, so it
+  lists none.
   **NFS snapshot provenance:** the tarball name doesn't record its source, so
   CreateSnapshot now writes a `.snapshots/<id>.src` sidecar; a snapshot without one
   carries no source and is dropped by core's handle validation. Only the Python
