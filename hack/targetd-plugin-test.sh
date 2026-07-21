@@ -214,7 +214,7 @@ echo "  vol2 staged+mounted+written via the SAME session (lun=$LUN2, dev=$DEV2, 
 echo "## snapshot/create on vol1 -> targetd instances must reject with a CLEAN Unsupported error"
 CODE=$(postraw /snapshot/create '{"name":"tdsnap","sourceVolume":'"$V"'}')
 BODY=$(postbody /snapshot/create '{"name":"tdsnap","sourceVolume":'"$V"'}')
-[ "$CODE" = 500 ] || { echo "FAIL: expected HTTP 500 for an unsupported snapshot, got $CODE"; exit 1; }
+[ "$CODE" = 501 ] || { echo "FAIL: expected HTTP 501 (Not Implemented) for an unsupported snapshot, got $CODE"; exit 1; }
 echo "$BODY" | grep -q '"code":"Unsupported"' || { echo "FAIL: expected error code Unsupported, got: $BODY"; exit 1; }
 echo "  snapshot/create cleanly rejected (Unsupported) OK"
 

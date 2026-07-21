@@ -322,3 +322,57 @@ func TestViolationsAreCaught(t *testing.T) {
 		t.Errorf("volume/create should still PASS, got %s", byName["volume/create"].Status)
 	}
 }
+
+// unsupportedSnapshotBackend declares the Snapshots capability (capabilities in
+// /info are per-PLUGIN) but refuses CreateSnapshot with Unsupported -- modeling
+// the iSCSI plugin serving a targetd-managed INSTANCE, which cannot snapshot
+// even though the same plugin can on a local instance. No single capability
+// flag can express per-instance ability, so this refusal is legitimate.
+type unsupportedSnapshotBackend struct{ *refBackend }
+
+func (b *unsupportedSnapshotBackend) CreateSnapshot(context.Context, *bardplugin.CreateSnapshotRequest) (*bardplugin.CreateSnapshotResponse, error) {
+	return nil, bardplugin.Errorf(bardplugin.CodeUnsupported, "snapshots not supported on this instance")
+}
+
+// TestPerInstanceUnsupportedSnapshotSkips pins PR #8's behavior: a declared
+// capability refused per-instance with Unsupported is recorded as Skip (CSI
+// permits UNIMPLEMENTED for an RPC "disabled in the plugin's current mode of
+// operation"), NOT Fail -- otherwise a targetd instance could never pass. The
+// snapshot-dependent checks then Skip on the missing prerequisite (they must
+// still appear, not silently vanish), while everything non-snapshot -- including
+// volume/clone from a source VOLUME, which this backend does support -- still
+// runs and passes.
+func TestPerInstanceUnsupportedSnapshotSkips(t *testing.T) {
+	sock := startPlugin(t, &unsupportedSnapshotBackend{newRefBackend()})
+	results, err := Run(context.Background(), Config{
+		Socket: sock, Instance: "i1", CapacityBytes: 1 << 20, Logf: t.Logf,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	byName := resultsByName(results)
+	for _, r := range results {
+		if r.Status == Fail {
+			t.Errorf("a per-instance Unsupported must never Fail conformance: %s -- %s", r.Name, r.Detail)
+		}
+	}
+	// The refused RPC and the always-accounted checks gated on its result are
+	// Skip -- present, not dropped. (snapshot/create-idempotent is a nested
+	// sub-check of a SUCCESSFUL create, so it legitimately does not appear here.)
+	for _, name := range []string{"snapshot/create", "snapshot/list", "snapshot/restore", "snapshot/delete"} {
+		r, ok := byName[name]
+		if !ok {
+			t.Errorf("check %s vanished from the results (want Skip)", name)
+			continue
+		}
+		if r.Status != Skip {
+			t.Errorf("check %s: %s -- %s (want SKIP)", name, r.Status, r.Detail)
+		}
+	}
+	// The rest of the suite still ran for real.
+	for _, name := range []string{"volume/create", "volume/expand", "volume/clone", "volume/delete"} {
+		if byName[name].Status != Pass {
+			t.Errorf("check %s: %s -- %s (want PASS)", name, byName[name].Status, byName[name].Detail)
+		}
+	}
+}
