@@ -558,7 +558,23 @@ func TestBackendCreateAndDeleteVolumeTargetd(t *testing.T) {
 // Runner entirely.
 func TestBackendExpandVolumeAndGetCapacityTargetd(t *testing.T) {
 	srv := newTdFakeServer(t)
-	srv.on("vol_resize", func(map[string]interface{}) (interface{}, *tdRPCError) {
+	// Expand looks the volume up first so an already-big-enough volume is a
+	// no-op: targetd's vol_resize hard-errors on a same-size request, which
+	// would otherwise make the resizer's retry fail forever.
+	curSize := int64(1 << 30)
+	resizes := 0
+	srv.on("vol_list", func(map[string]interface{}) (interface{}, *tdRPCError) {
+		return []tdVolume{{Name: "bard-x", Size: curSize}}, nil
+	})
+	srv.on("vol_resize", func(p map[string]interface{}) (interface{}, *tdRPCError) {
+		resizes++
+		if sz, ok := p["size"].(float64); ok {
+			if int64(sz) <= curSize {
+				// Mirror real targetd 0.10.4, which refuses a non-growing resize.
+				return nil, &tdRPCError{Code: -32602, Message: "Size need a larger than size in original volume"}
+			}
+			curSize = int64(sz)
+		}
 		return nil, nil
 	})
 	srv.on("pool_list", func(map[string]interface{}) (interface{}, *tdRPCError) {
@@ -577,6 +593,25 @@ func TestBackendExpandVolumeAndGetCapacityTargetd(t *testing.T) {
 	}
 	if expResp.CapacityBytes != 2<<30 || !expResp.NodeExpansionRequired {
 		t.Fatalf("unexpected ExpandVolume response %+v", expResp)
+	}
+	if resizes != 1 {
+		t.Fatalf("first expand should issue exactly one vol_resize, got %d", resizes)
+	}
+
+	// The SAME expand again (what the external-resizer retries) must succeed as
+	// a no-op and must NOT re-issue vol_resize -- real targetd rejects a
+	// non-growing resize, so a re-issue would wedge the PVC forever.
+	again, err := b.ExpandVolume(context.Background(), &bardplugin.ExpandVolumeRequest{
+		Volume: bardplugin.VolumeRef{Instance: "remote", Location: "vg-targetd", Name: "bard-x"}, NewSizeBytes: 2 << 30,
+	})
+	if err != nil {
+		t.Fatalf("repeated ExpandVolume to the same size must succeed (resizer retry): %v", err)
+	}
+	if again.CapacityBytes != 2<<30 {
+		t.Fatalf("repeat expand should report the current size, got %+v", again)
+	}
+	if resizes != 1 {
+		t.Fatalf("repeat expand must not re-issue vol_resize, got %d calls", resizes)
 	}
 
 	capResp, err := b.GetCapacity(context.Background(), &bardplugin.GetCapacityRequest{Instance: "remote"})

@@ -1920,6 +1920,13 @@ func (b *Backend) GetCapacity(ctx context.Context, req *bardplugin.GetCapacityRe
 // GetVolumeHealth (bardplugin.HealthReporter) reports whether the backing LV
 // still exists (deleted out of band => abnormal).
 func (b *Backend) GetVolumeHealth(ctx context.Context, req *bardplugin.GetVolumeHealthRequest) (*bardplugin.GetVolumeHealthResponse, error) {
+	// A targetd volume lives in a pool on a REMOTE host -- there is no local VG
+	// to inspect, and its Location carries the tdLocationPrefix marker, which is
+	// not a legal VG name ("Volume group name ... has invalid characters"). Ask
+	// targetd instead. Caught by conformance against a live targetd instance.
+	if isTdLocation(req.Volume.Location) {
+		return b.getVolumeHealthTargetd(ctx, req.Volume.Instance, req.Volume.Location, req.Volume.Name)
+	}
 	_, found, err := b.lvSizeBytes(ctx, req.Volume.Location, req.Volume.Name)
 	if err != nil {
 		return nil, err
