@@ -27,6 +27,25 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # A tag's own semver prerelease identifier (the `-rc.4` in v0.1.0-rc.4) is
+      # the single source of truth for whether this is a real release or a
+      # release candidate -- softprops/action-gh-release defaults prerelease to
+      # false and make_latest to true, so without this every RC tag would ship
+      # as a full "Latest" release (caught the hard way on rc.4: rc.2/rc.3 only
+      # looked right because someone had hand-patched them after the fact with
+      # `gh release edit`, which never fixed the workflow itself).
+      - name: Determine release flags
+        id: relflags
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [[ "$ver" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build static binaries
         env:
           CGO_ENABLED: "0"
@@ -48,6 +67,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          prerelease: ${{ steps.relflags.outputs.prerelease }}
+          make_latest: ${{ steps.relflags.outputs.make_latest }}
 
   # kubectl-bard is a client-side tool (it wraps `kubectl exec` from the
   # operator's machine), so unlike the server binaries above it also ships for
@@ -62,6 +83,18 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Determine release flags
+        id: relflags
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [[ "$ver" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Build for client platforms
         env:
@@ -82,6 +115,8 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*
+          prerelease: ${{ steps.relflags.outputs.prerelease }}
+          make_latest: ${{ steps.relflags.outputs.make_latest }}
 
   # Package the chart with the TAG's version (Chart.yaml's version/appVersion are
   # dev placeholders -- the tag is the single source of truth, so cutting a
@@ -98,6 +133,18 @@ jobs:
       - uses: actions/checkout@v5
       - uses: azure/setup-helm@v5
       - uses: sigstore/cosign-installer@v3
+
+      - name: Determine release flags
+        id: relflags
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [[ "$ver" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
 
       # cosign resolves registry credentials from the Docker config, NOT from
       # helm's registry config -- without this login the signature push 401s
@@ -129,3 +176,5 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: dist/*.tgz
+          prerelease: ${{ steps.relflags.outputs.prerelease }}
+          make_latest: ${{ steps.relflags.outputs.make_latest }}
