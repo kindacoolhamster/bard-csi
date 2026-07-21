@@ -54,7 +54,12 @@ docker buildx imagetools inspect ghcr.io/kindacoolhamster/bard-csi:0.1.0 \
 2. Skim `git log <last-tag>..` and write the Release notes (the workflow
    creates the Release; edit its body on GitHub afterwards — call out breaking
    changes and any plugin-contract version change).
-3. Tag + push (above). Watch the two workflow runs.
+3. Tag + push (above). Watch the two workflow runs. For a pre-release tag
+   (`v0.1.0-rc.N`), confirm the resulting GitHub Release actually landed as a
+   prerelease and isn't flagged the repo's "Latest" release --
+   `gh api repos/kindacoolhamster/bard-csi/releases/latest` should 404 while
+   the newest tag is still an RC. The workflow derives this from the tag's own
+   semver prerelease identifier, but it's cheap enough to eyeball once per cut.
 4. Sanity: `helm install` the pushed chart with the quickstart values on a
    fresh kind cluster (docs/quickstart.md flow, which pulls everything from
    the registry).
