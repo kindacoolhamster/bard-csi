@@ -63,6 +63,11 @@ jobs:
           # controller-placement coupling) with a controller-only targetd creds mount
           helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
             --set-json 'plugins.iscsi.instances={"remote":{"management":"targetd","targetdEndpoint":"http://192.0.2.5:18700/targetrpc","targetdPool":"vg-targetd","targetIqn":"iqn.2003-01.org.linux-iscsi.host:targetd","portal":"192.0.2.5:3260"}}' >/dev/null
+      # The install version the docs hand a reader is part of the product: an
+      # unpinned quickstart cannot install a pre-release-only chart at all, and a
+      # stale pin quietly installs the wrong release.
+      - name: documented install version is consistent
+        run: bash hack/check-doc-versions.sh
 
   conformance:
     # The wire-contract bar: drive the Python localpath plugin (which shares no
