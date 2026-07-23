@@ -54,15 +54,29 @@ docker buildx imagetools inspect ghcr.io/kindacoolhamster/bard-csi:0.1.0 \
 2. Skim `git log <last-tag>..` and write the Release notes (the workflow
    creates the Release; edit its body on GitHub afterwards — call out breaking
    changes and any plugin-contract version change).
-3. Tag + push (above). Watch the two workflow runs. For a pre-release tag
+3. **Before tagging**, merge a docs commit setting the version the docs tell a
+   reader to install to the version you are about to cut: `BARD_VERSION` in
+   `docs/quickstart.md` and `--version` in `charts/bard-csi/README.md`. This
+   has to happen *first* — the workflow packages the chart from the tagged
+   commit, so docs bumped after the tag are absent from the release they
+   describe, and the tagged tree still advertises the previous version. Both
+   docs pin `--version` deliberately (helm's unversioned OCI resolution skips
+   pre-releases, so an unpinned install of a pre-release-only chart resolves
+   nothing), and a stale pin can successfully install an older release, which
+   is why this is a step and not a nicety. `bash hack/check-doc-versions.sh
+   <version>` asserts it; the release workflow runs the same check and fails
+   the cut if it doesn't hold.
+4. Tag + push (above). Watch the two workflow runs. For a pre-release tag
    (`v0.1.0-rc.N`), confirm the resulting GitHub Release actually landed as a
    prerelease and isn't flagged the repo's "Latest" release --
    `gh api repos/kindacoolhamster/bard-csi/releases/latest` should 404 while
    the newest tag is still an RC. The workflow derives this from the tag's own
    semver prerelease identifier, but it's cheap enough to eyeball once per cut.
-4. Sanity: `helm install` the pushed chart with the quickstart values on a
-   fresh kind cluster (docs/quickstart.md flow, which pulls everything from
-   the registry).
+5. Sanity: run the **docs/quickstart.md flow verbatim** — copy-paste the
+   commands exactly as written, on a fresh cluster, pulling chart and images
+   from the registry. Do not add flags, substitute versions, or rewrite URLs:
+   an un-installable quickstart shipped through three RCs because this step
+   was run in spirit rather than to the letter.
 
 ## One-time setup (before/at the first public release)
 

@@ -13,15 +13,24 @@ real storage, swap in a real backend afterwards (see "Where next").
 kind create cluster
 kubectl label node --all topology.kubernetes.io/zone=quickstart
 
-# 2. Bard + the demo backend
+# 2. the release to install. Pin it: helm's unversioned OCI resolution does not
+#    select pre-release versions, and every published Bard chart version is
+#    currently a pre-release, so omitting --version resolves nothing ("Could not
+#    locate a version matching provided version string"). Pinning the chart and
+#    the manifests below to the same tag also stops them drifting apart.
+#    See Releases for the current version.
+BARD_VERSION=0.1.0-rc.4
+
+# 3. Bard + the demo backend
 helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
+  --version "$BARD_VERSION" \
   -n kube-system \
-  -f https://raw.githubusercontent.com/kindacoolhamster/bard-csi/main/deploy/quickstart/values.yaml
+  -f "https://raw.githubusercontent.com/kindacoolhamster/bard-csi/v$BARD_VERSION/deploy/quickstart/values.yaml"
 
-# 3. backend config + StorageClass + a demo PVC/pod
-kubectl apply -f https://raw.githubusercontent.com/kindacoolhamster/bard-csi/main/deploy/quickstart/quickstart.yaml
+# 4. backend config + StorageClass + a demo PVC/pod
+kubectl apply -f "https://raw.githubusercontent.com/kindacoolhamster/bard-csi/v$BARD_VERSION/deploy/quickstart/quickstart.yaml"
 
-# 4. proof
+# 5. proof
 kubectl wait --for=condition=Ready pod/bard-quickstart --timeout=180s
 kubectl exec bard-quickstart -- cat /data/hello
 # -> bard-csi-quickstart-works

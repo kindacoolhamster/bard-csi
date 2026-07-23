@@ -51,7 +51,11 @@ kubectl -n kube-system create secret generic bard-ceph-keys \
 
 # 3. install — the released chart + images pull straight from the registry:
 helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
-  --version 0.1.0-rc.2 -n kube-system -f my-values.yaml   # see Releases for the current version
+  --version 0.1.0-rc.4 -n kube-system -f my-values.yaml   # see Releases for the current version
+#    (pin --version: helm's unversioned OCI resolution does not select
+#     pre-releases, and every published chart version is currently a
+#     pre-release, so omitting it errors with "Could not locate a version
+#     matching provided version string".)
 #    (From a source checkout, `helm install bard-csi charts/bard-csi …` uses the
 #     dev-PLACEHOLDER appVersion, whose images are NOT published → ImagePullBackOff;
 #     build/load your own images, or --set image.tag / plugins.<backend>.image.tag.)

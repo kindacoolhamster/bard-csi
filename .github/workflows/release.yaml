@@ -156,6 +156,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Fail the cut BEFORE anything is published if the docs still tell readers
+      # to install a different version than the one being released -- the chart
+      # is packaged from this tagged commit, so the docs in it are the ones the
+      # release ships with. Bump them before tagging (RELEASING.md step 3).
+      - name: Documented install version matches the tag
+        run: bash hack/check-doc-versions.sh "$GITHUB_REF_NAME"
+
       - name: Package with the tag version
         run: |
           ver="${GITHUB_REF_NAME#v}"
