@@ -13,13 +13,14 @@ real storage, swap in a real backend afterwards (see "Where next").
 kind create cluster
 kubectl label node --all topology.kubernetes.io/zone=quickstart
 
-# 2. the release to install. Pin it: helm's unversioned OCI resolution does not
-#    select pre-release versions, and every published Bard chart version is
-#    currently a pre-release, so omitting --version resolves nothing ("Could not
-#    locate a version matching provided version string"). Pinning the chart and
-#    the manifests below to the same tag also stops them drifting apart.
-#    See Releases for the current version.
-BARD_VERSION=0.1.0-rc.4
+# 2. the release to install. Pinning keeps the chart and the manifests below on
+#    one tested tag instead of letting them drift apart, and makes the install
+#    reproducible. It is also the ONLY way to install a pre-release (an -rc.N):
+#    helm's unversioned OCI resolution ignores pre-release versions, so omitting
+#    --version silently gets you the latest STABLE release instead (and, before
+#    any stable release exists, fails outright with "Could not locate a version
+#    matching provided version string"). See Releases for the current version.
+BARD_VERSION=0.1.0
 
 # 3. Bard + the demo backend
 helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
@@ -45,7 +46,7 @@ The demo pod's PVC was provisioned through the full CSI control plane: the
 external-provisioner asked Bard's controller for a volume, Bard's dispatcher
 resolved the `quickstart` instance from the `BackendCluster` CR the chart
 created, and proxied the create to the **localpath plugin** — an out-of-tree
-backend that is a ~300-line stdlib-only **Python** script speaking HTTP+JSON
+backend that is a ~240-line stdlib-only **Python** script speaking HTTP+JSON
 over a unix socket. On the node, the same plugin bind-mounted the volume's
 directory into the pod. Nothing about the flow is demo-specific: a Ceph RBD
 volume takes exactly the same path with `rbd` instead of `mkdir`.

@@ -44,10 +44,17 @@ jobs:
       - name: lint + template the chart
         run: |
           helm lint charts/bard-csi
-          # render with a couple of plugins enabled to catch template breakage
-          helm template charts/bard-csi \
+          # ceph-rbd profile: render WITH an instance and assert the sidecar and
+          # BackendCluster actually appear. `enabled` alone emits no plugin
+          # container, ConfigMap or BackendCluster at all (the profile keys off a
+          # non-empty `instances` -- see _profiles.tpl), so the old instance-less
+          # render succeeded while proving nothing about the ceph-rbd templates.
+          out=$(helm template charts/bard-csi \
             --set plugins.ceph-rbd.enabled=true \
-            --set installCRDs=true >/dev/null
+            --set-json 'plugins.ceph-rbd.instances={"galileo":{"monitors":["192.0.2.1:3300"],"pool":"k8s-csi-test","user":"k8s-csi-test","default":true}}' \
+            --set installCRDs=true)
+          echo "$out" | grep -q bard-plugin-ceph-rbd || { echo "ceph-rbd profile rendered no plugin sidecar"; exit 1; }
+          echo "$out" | grep -q "kind: BackendCluster" || { echo "ceph-rbd profile rendered no BackendCluster"; exit 1; }
           # iscsi profile: positive render with attach on (the only attach-style
           # backend -- see templates/_validate.tpl)
           helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
@@ -64,8 +71,9 @@ jobs:
           helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
             --set-json 'plugins.iscsi.instances={"remote":{"management":"targetd","targetdEndpoint":"http://192.0.2.5:18700/targetrpc","targetdPool":"vg-targetd","targetIqn":"iqn.2003-01.org.linux-iscsi.host:targetd","portal":"192.0.2.5:3260"}}' >/dev/null
       # The install version the docs hand a reader is part of the product: an
-      # unpinned quickstart cannot install a pre-release-only chart at all, and a
-      # stale pin quietly installs the wrong release.
+      # unpinned install cannot reach a pre-release at all and silently resolves
+      # to the latest stable instead, and a stale pin quietly installs the wrong
+      # release. Covers README.md, docs/quickstart.md and the chart README.
       - name: documented install version is consistent
         run: bash hack/check-doc-versions.sh
 

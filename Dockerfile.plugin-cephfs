@@ -18,6 +18,9 @@ RUN CGO_ENABLED=0 go build -ldflags "-X main.version=${VERSION}" -o /out/bard-pl
 FROM ${RUNTIME_BASE}
 # Ceph client from the UPSTREAM apt repo (bookworm's is EOL Pacific 16.2); see
 # Dockerfile.plugin-ceph-rbd for the rationale. Match CEPH_RELEASE to your cluster.
+# nfs-common supplies mount.nfs for `mounter: nfs`, which mounts the Ganesha
+# export with `mount -t nfs` rather than talking to Ceph directly; mount(8)
+# needs that helper binary or the documented mounter fails at NodeStage.
 ARG CEPH_RELEASE=tentacle
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -32,6 +35,7 @@ RUN apt-get update \
         ceph-fuse \
         fuse \
         util-linux \
+        nfs-common \
     && apt-get purge -y curl \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*

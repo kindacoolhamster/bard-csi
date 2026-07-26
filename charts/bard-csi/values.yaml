@@ -29,10 +29,11 @@ imagePullSecrets: []
 
 # -- Pod-level securityContext for the controller + node pods. The default fsGroup
 # group-owns the per-pod `plugins` emptyDir (and its 0660 plugin sockets), so a
-# non-root core -- e.g. a hardened/distroless image whose default user is nonroot
-# (cgr.dev/chainguard/static is 65532) -- can connect to a plugin running as root.
-# Required for hardened core images; harmless with the default root core. Set to {}
-# to omit. See docs/hardened-images.md.
+# non-root core can connect to a plugin running as root. The default core image
+# IS non-root -- it is built on cgr.dev/chainguard/static, whose user is 65532 --
+# so this is load-bearing, not optional hardening; it is merely harmless if you
+# swap in a root base (e.g. Google distroless static). Set to {} to omit.
+# See docs/hardened-images.md.
 podSecurityContext:
   fsGroup: 65532
 

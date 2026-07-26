@@ -61,14 +61,20 @@ APK that isn't in a catalog; see the gaps below).
 
 Express deps as the binaries the plugin execs — package names differ by base.
 
+`mkfs.<fstype>` below means whichever the StorageClass asks for — `mkfs.ext4`
+(e2fsprogs), `mkfs.xfs` (xfsprogs), `mkfs.btrfs` (btrfs-progs); ship the ones
+your classes actually name. The grow tools pair with them: a base carrying
+`mkfs.ext4` but not `resize2fs` formats fine and then fails every expand.
+
 | Plugin | Runtime binaries needed |
 | --- | --- |
 | **core** | *(none — static binary only)* |
 | **localpath** | `python3`, `mount`, `umount`, `findmnt` |
-| **nfs** | `mount.nfs` (nfs-utils), `mount`, `umount`, `findmnt`, `tar`, `gzip` |
-| **lvm** | `lvcreate`/`lvremove`/`lvextend`/`lvs` (lvm2), `mkfs.ext4`, `mkfs.xfs`, `mount`, `umount`, `findmnt`, `blkid`; **thin pools also need** `thin_check`/`thin_repair` (thin-provisioning-tools) |
-| **ceph-rbd** | `rbd`, `rbd-nbd` (ceph-common + rbd-nbd), `cryptsetup`, `mkfs.ext4`, `mkfs.xfs`, `mount`, `umount`, `findmnt`, `blkid` |
-| **cephfs** | `mount.ceph` (ceph-common), `ceph-fuse`, `mount`, `umount`, `findmnt` |
+| **nfs** | `mount.nfs` (nfs-utils), `mount`, `umount`, `findmnt`, `cp`, and `tar` + `gzip` (snapshots are gzipped tarballs) |
+| **lvm** | `lvcreate`/`lvremove`/`lvextend`/`lvchange`/`lvs`/`vgs` (lvm2), `mkfs.<fstype>`, `mount`, `umount`, `findmnt`, `blkid`; **expand also needs** `resize2fs`/`xfs_growfs`/`btrfs`; **`NodeReclaimSpace`** `fstrim`; **thin pools** `thin_check`/`thin_repair` (thin-provisioning-tools) |
+| **iscsi** | *Controller:* `targetcli` (targetcli-fb) plus the lvm2 set above — a `management: targetd` instance needs **neither**, since it drives a remote LIO host over JSON-RPC. *Node:* `iscsiadm` (open-iscsi), `chroot` (to run `iscsiadm` against the host's iscsid — see `--iscsiadm-chroot`), `multipath`/`multipathd`/`dmsetup` (multipath-tools; only for a `portals` instance), `mkfs.<fstype>`, `mount`, `umount`, `findmnt`, `blkid`, `blockdev`, `resize2fs`/`xfs_growfs`/`btrfs`, `fstrim`. **Thin pools** need `thin_check`/`thin_repair` |
+| **ceph-rbd** | `rbd`, `rbd-nbd` (ceph-common + rbd-nbd), **`ceph`** (single-writer/network fencing via `osd blocklist`, and `ceph df` for `GetCapacity`), `cryptsetup` (LUKS), `mkfs.<fstype>`, `mount`, `umount`, `findmnt`, `blkid`, `blockdev`, `resize2fs`/`xfs_growfs`/`btrfs`, `fstrim`, plus `rm`/`gzip` for the rbd-nbd log `cephLogStrategy` |
+| **cephfs** | **`ceph`** — the whole control plane is `ceph fs subvolume …` (create/delete/snapshot/clone/metadata/pin), so this one is not optional — plus the mounter you use: `mount.ceph` (ceph-common) for `mounter: kernel`, `ceph-fuse` for `mounter: fuse`, or `mount.nfs` (nfs-common) for `mounter: nfs`, which mounts the Ganesha export instead of talking to Ceph directly; and `mount`, `umount`, `findmnt` |
 
 ## Debian → Wolfi package mapping, and the gotchas
 
@@ -92,9 +98,10 @@ lists `mount umount findmnt` explicitly.
 
 ## The honest gaps (where a license / custom APK earns its keep)
 
-These two dependencies are **not in the public Wolfi catalog**, so a fully
-hardened build of the affected images needs a custom APK (build it with `melange`)
-or a licensed Chainguard repo that carries it:
+Two dependencies are **confirmed absent from the public Wolfi catalog**, so a
+fully hardened build of the affected images needs a custom APK (build it with
+`melange`) or a licensed Chainguard repo that carries it. A third case is
+**unverified** rather than known-absent, and is called out as such:
 
 - **Ceph client** (`ceph-common`, `rbd-nbd`, `ceph-fuse`) → blocks hardened
   **ceph-rbd** and **cephfs** images. This is the big one. Until you supply it,
@@ -107,6 +114,12 @@ or a licensed Chainguard repo that carries it:
   image supports **thick LVM only**. The binary detects thin from `lv_attr` at
   runtime and degrades cleanly: thick volumes work; a thin StorageClass simply
   fails when `lvm2` can't find the thin tools. Add the package to recover thin.
+- *(unverified, not a known gap)* **iSCSI target/initiator tooling**
+  (`targetcli-fb`, `open-iscsi`, `multipath-tools`) → no hardened **iscsi**
+  variant is shipped or proven; that image is Debian-based, and whether Wolfi
+  carries equivalents has not been checked either way. The `RUNTIME_BASE` swap
+  still applies, but you are on untested ground — confirm the binaries in the
+  iscsi row above are present and working before relying on it.
 
 So, answering the two design questions directly:
 

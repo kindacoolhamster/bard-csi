@@ -7,16 +7,22 @@ description: |
   language) that run as sidecars alongside the backend-agnostic core.
 
   This chart deploys the driver runtime: core (controller + node), the CSI
-  sidecars, and whatever backend plugin sidecars you enable. Backend connection
-  config and credentials are NOT owned by this chart — you supply them as
-  ConfigMaps/Secrets the plugin sidecars reference by name.
+  sidecars, and whatever backend plugin sidecars you enable. For a backend with
+  a native profile (ceph-rbd, cephfs, iscsi) you describe each instance in the
+  backend's own terms and the chart renders its connection ConfigMap and
+  BackendCluster; a custom plugin supplies its own ConfigMap instead.
+  Credentials are never owned by this chart — you create those Secrets and the
+  chart references them by name.
 type: application
 # version/appVersion here are DEV placeholders: the release workflow packages
 # the chart with the git tag's version (helm package --version/--app-version),
-# so cutting a release never needs a bump commit here.
-version: 0.1.0
+# so cutting a release never needs a bump commit here. They are deliberately
+# set to a version that is NEVER published, so installing straight from a
+# source checkout fails loudly on ImagePullBackOff rather than silently
+# deploying whichever release happens to share the placeholder's number.
+version: 0.0.0-dev
 # The bard-csi core image tag a plugin/sidecar image tag defaults to when unset.
-appVersion: "0.1.0"
+appVersion: "0.0.0-dev"
 keywords:
   - csi
   - storage

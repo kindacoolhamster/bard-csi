@@ -10,8 +10,9 @@ snapshotter, health-monitor, registrar, liveness-probe), plugin sidecar wiring,
 RBAC, the `BackendCluster` CRD, the `CSIDriver` object, and (optional) the
 StorageClass / VolumeSnapshotClass / VolumeAttributesClass / VolumeGroupSnapshotClass.
 
-For a **first-party backend** (ceph-rbd, cephfs) you describe it in its own terms
-(mons, pool/fsName, user, zone) under `plugins.<backend>.instances`, and the chart
+For a **first-party backend with a native profile** (ceph-rbd, cephfs, iscsi) you
+describe it in its own terms (mons, pool/fsName, user, zone — or for iscsi, its VG
+and portal) under `plugins.<backend>.instances`, and the chart
 generates the plugin config ConfigMap, the `BackendCluster` CRs, and all the sidecar
 wiring (args, mounts, host flags). **You own** only:
 
@@ -51,14 +52,17 @@ kubectl -n kube-system create secret generic bard-ceph-keys \
 
 # 3. install — the released chart + images pull straight from the registry:
 helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
-  --version 0.1.0-rc.4 -n kube-system -f my-values.yaml   # see Releases for the current version
-#    (pin --version: helm's unversioned OCI resolution does not select
-#     pre-releases, and every published chart version is currently a
-#     pre-release, so omitting it errors with "Could not locate a version
-#     matching provided version string".)
-#    (From a source checkout, `helm install bard-csi charts/bard-csi …` uses the
-#     dev-PLACEHOLDER appVersion, whose images are NOT published → ImagePullBackOff;
-#     build/load your own images, or --set image.tag / plugins.<backend>.image.tag.)
+  --version 0.1.0 -n kube-system -f my-values.yaml   # see Releases for the current version
+#    (pin --version for a reproducible install. It is also the only way to get a
+#     pre-release (an -rc.N): helm's unversioned OCI resolution ignores
+#     pre-release versions, so omitting it silently installs the latest STABLE
+#     release instead -- and errors with "Could not locate a version matching
+#     provided version string" when no stable release exists yet.)
+#    (From a source checkout, `helm install bard-csi charts/bard-csi …` uses
+#     Chart.yaml's dev-PLACEHOLDER appVersion `0.0.0-dev`, whose images are NOT
+#     published → ImagePullBackOff. That failure is deliberate: it stops a
+#     source tree from silently deploying some older release's images. Build and
+#     load your own, or --set image.tag / plugins.<backend>.image.tag.)
 
 # 4. label your nodes per zone: kubectl label node <n> topology.kubernetes.io/zone=<zone>
 ```
@@ -103,6 +107,13 @@ user, zone, default, [mounter: kernel|fuse|nfs], [subvolumeGroup], [nfsCluster],
 [nfsServer]`. Both Ceph backends take the optional `encryption:`/`kms:` blocks;
 `--kms-config` is emitted **only** when a `kms:` block is present, so a no-KMS
 install never references a missing file.
+
+CephFS `mounter: kernel` (the default) and `mounter: fuse` are the proven
+transports. **`mounter: nfs`** — which mounts a Ganesha export with `mount -t
+nfs` instead of speaking Ceph on the node — is implemented and its `mount.nfs`
+dependency ships in the plugin image, but it has **not been exercised against a
+live NFS-gateway deployment**; treat it as untested and verify it yourself
+before depending on it.
 
 **iscsi** — the reference *attach-style* backend (`ControllerPublish` masks the
 LUN to the staging node's initiator via a targetcli ACL; see

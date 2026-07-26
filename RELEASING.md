@@ -60,18 +60,22 @@ docker buildx imagetools inspect ghcr.io/kindacoolhamster/bard-csi:0.1.0 \
    has to happen *first* — the workflow packages the chart from the tagged
    commit, so docs bumped after the tag are absent from the release they
    describe, and the tagged tree still advertises the previous version. Both
-   docs pin `--version` deliberately (helm's unversioned OCI resolution skips
-   pre-releases, so an unpinned install of a pre-release-only chart resolves
-   nothing), and a stale pin can successfully install an older release, which
+   docs pin `--version` deliberately — it keeps the chart and the quickstart's
+   manifest URLs on one tested tag, and for a pre-release tag it is the only
+   way to install at all (helm's unversioned OCI resolution skips pre-release
+   versions). A stale pin can successfully install an older release, which
    is why this is a step and not a nicety. `bash hack/check-doc-versions.sh
    <version>` asserts it; the release workflow runs the same check and fails
    the cut if it doesn't hold.
 4. Tag + push (above). Watch the two workflow runs. For a pre-release tag
    (`v0.1.0-rc.N`), confirm the resulting GitHub Release actually landed as a
-   prerelease and isn't flagged the repo's "Latest" release --
-   `gh api repos/kindacoolhamster/bard-csi/releases/latest` should 404 while
-   the newest tag is still an RC. The workflow derives this from the tag's own
-   semver prerelease identifier, but it's cheap enough to eyeball once per cut.
+   prerelease and isn't flagged the repo's "Latest" release:
+   `gh api repos/kindacoolhamster/bard-csi/releases/latest --jq .tag_name`
+   must still name the newest **stable** tag, never the RC you just pushed.
+   (Before the first stable release that endpoint 404s instead; either answer
+   is fine, "it names the RC" is the failure.) The workflow derives this from
+   the tag's own semver prerelease identifier, but it's cheap enough to eyeball
+   once per cut.
 5. Sanity: run the **docs/quickstart.md flow verbatim** — copy-paste the
    commands exactly as written, on a fresh cluster, pulling chart and images
    from the registry. Do not add flags, substitute versions, or rewrite URLs:
