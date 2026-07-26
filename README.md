@@ -11,11 +11,11 @@ needed.
 Every backend is an out-of-tree plugin. The flagship is the **Ceph RBD** backend —
 the most feature-rich (see [Status](#status)) and where the deeper features are
 proven — but it is one backend among several: **CephFS** (a shared, ReadWriteMany
-filesystem), **NFS**, **LVM** (host-local block volumes), and **iSCSI** (network
-block that attaches via the control plane, with per-node LUN masking). Together they
-show the backend contract generalises across very different storage shapes (network
-block, distributed filesystem, network filesystem, host-local block, and
-control-plane attach).
+filesystem), **NFS**, **LVM** (block volumes carved from a shared volume group),
+and **iSCSI** (network block that attaches via the control plane, with per-node LUN
+masking). Together they show the backend contract generalises across very different
+storage shapes (network block, distributed filesystem, network filesystem,
+volume-group block, and control-plane attach).
 
 The headline capability — one StorageClass provisioning across multiple backend
 instances/zones — is itself backend-agnostic: most CSI drivers bake a single
@@ -48,12 +48,15 @@ per-volume by where the workload landed.
 Bard **core** is backend-agnostic: it implements the CSI spec, resolves topology
 to a backend instance, and **proxies every operation to an out-of-tree plugin**
 over a unix socket. Storage backends — including the first-party Ceph RBD one —
-are plugins that bring their own tools; core ships none (its image is a ~22 MB
-static distroless binary). See [docs/writing-a-plugin.md](docs/writing-a-plugin.md).
+are plugins that bring their own tools; core ships none, so its image is just a
+single static binary on a minimal base (`cgr.dev/chainguard/static` by default,
+swappable via the `RUNTIME_BASE` build-arg — see
+[docs/hardened-images.md](docs/hardened-images.md)). For the plugin contract
+itself, see [docs/writing-a-plugin.md](docs/writing-a-plugin.md).
 
 ```
 ┌────────────────────────────────────────────────┐
-│  Bard core  (distroless, backend-agnostic)     │
+│  Bard core  (backend-agnostic, no tools)       │
 │   CSI gRPC (Identity/Controller/Node)          │  internal/driver
 │   Dispatcher: zone → backend instance          │  internal/dispatch
 │   Plugin proxy (backend registry)              │  internal/backend(/plugin)
@@ -71,7 +74,8 @@ static distroless binary). See [docs/writing-a-plugin.md](docs/writing-a-plugin.
 | `internal/backend` | Internal `Backend` interface + capability model + registry (what core programs against). |
 | `internal/backend/plugin` | `Client`: dials a plugin's socket and implements `backend.Backend` by proxying to it. |
 | `internal/cephplugin` | Ceph RBD plugin backend — depends only on `pkg/bardplugin`, exactly like a third-party plugin. |
-| `cmd/bard-plugin-ceph-rbd`, `cmd/bard-plugin-nfs` | The plugin binaries (own images, own tools). |
+| `cmd/bard-plugin-*` | The plugin binaries — `ceph-rbd`, `cephfs`, `nfs`, `lvm`, `iscsi` (own images, own tools), plus `conformance`, the acceptance-test tool for any plugin. |
+| `cmd/kubectl-bard` | The `kubectl bard inspect` client (see [Day-2](#day-2-the-consistency-scanner)). |
 | `internal/dispatch` | Resolves `(StorageClass params, topology)` → `(backend, instance, zone)`. |
 | `internal/driver` | The three CSI gRPC services + the unix-socket gRPC server. |
 | `internal/volumeid` | The self-describing CSI volume handle (`swsk\|1\|ceph-rbd\|east\|pool\|name`). |
@@ -93,7 +97,7 @@ See [docs/writing-a-plugin.md](docs/writing-a-plugin.md). Worked examples:
 [Ceph RBD](cmd/bard-plugin-ceph-rbd/main.go) (network block, RWO),
 [CephFS](cmd/bard-plugin-cephfs/main.go) (distributed filesystem, RWX),
 [NFS](cmd/bard-plugin-nfs/main.go) (a network filesystem),
-[LVM](cmd/bard-plugin-lvm/main.go) (host-local block, RWO),
+[LVM](cmd/bard-plugin-lvm/main.go) (shared-VG block, RWO),
 [iSCSI](cmd/bard-plugin-iscsi/main.go) (network block with control-plane attach —
 the reference `ControllerPublish` backend, masking a LUN to the node's initiator),
 and [localpath](plugins/localpath/bard-plugin-localpath) — a directory bind-mount
@@ -113,22 +117,40 @@ make image VERSION=0.1.0
 
 ## Deploy
 
-Raw manifests:
+**The Helm chart is the supported install** (below, and the
+[quickstart](docs/quickstart.md)). The raw manifests under `deploy/` are the
+**source-tree development** path: they and everything in `deploy/examples/`
+reference `:dev` image tags, which are built locally and are *not* published to
+the registry — applied as-is against a released cluster they ImagePullBackOff.
+Use them when you are building your own images; otherwise use the chart.
 
 ```sh
 # The CRD must exist before its CRs; apply it first, then the rest.
 kubectl apply -f deploy/05-crd-backendcluster.yaml
 # Edit deploy/20-config.yaml (BackendCluster clusters/zones) and the Secret keys.
+# Point the `:dev` images at a release first if you are not building your own
+# (see Releases for the version): V=<release>
+#   sed -i "s/:dev$/:$V/" deploy/30-controller.yaml deploy/40-node.yaml
 kubectl apply -f deploy/
 ```
 
-Or the Helm chart ([charts/bard-csi](charts/bard-csi)), which assembles the driver
-runtime + the backend plugin sidecars you enable (backend connection config +
-credentials stay yours, referenced by name):
+The chart ([charts/bard-csi](charts/bard-csi)) assembles the driver runtime + the
+backend plugin sidecars you enable (backend credentials stay yours, referenced by
+name):
 
 ```sh
-helm install bard-csi charts/bard-csi -n kube-system --set 'plugins.ceph-rbd.enabled=true'
+helm install bard-csi oci://ghcr.io/kindacoolhamster/charts/bard-csi \
+  --version 0.1.0 -n kube-system -f my-values.yaml
 ```
+
+A backend using a **native profile** (ceph-rbd, cephfs, iscsi) needs `enabled:
+true` *and* a non-empty `instances` map — the chart builds the plugin sidecar,
+its config, and the `BackendCluster` from the instances, so `enabled` on its own
+installs core with no backend at all. A custom plugin instead omits `instances`
+and supplies its own `controller`/`node` wiring. See
+[the chart README](charts/bard-csi/README.md) for `my-values.yaml`; installing
+from this source tree instead of the released chart needs images you build
+yourself (`Chart.yaml`'s appVersion is an unpublished dev placeholder).
 
 Manifests: `00-csidriver`, `05-crd-backendcluster` (the `BackendCluster` CRD),
 `10-rbac`, `20-config` (BackendCluster CRs + the plugin's ConfigMap/Secret),

@@ -28,16 +28,15 @@ image:
 	rm -f $(IMAGE_TAR)
 	podman save -o $(IMAGE_TAR) $(IMAGE)
 
-images: image  ## build core + ceph-rbd + cephfs + nfs + lvm plugin images, save tars
-	podman build -f Dockerfile.plugin-ceph-rbd --build-arg VERSION=$(VERSION) -t $(REGISTRY)/bard-plugin-ceph-rbd:$(VERSION) .
-	podman build -f Dockerfile.plugin-cephfs --build-arg VERSION=$(VERSION) -t $(REGISTRY)/bard-plugin-cephfs:$(VERSION) .
-	podman build -f Dockerfile.plugin-nfs --build-arg VERSION=$(VERSION) -t $(REGISTRY)/bard-plugin-nfs:$(VERSION) .
-	podman build -f Dockerfile.plugin-lvm --build-arg VERSION=$(VERSION) -t $(REGISTRY)/bard-plugin-lvm:$(VERSION) .
-	rm -f /tmp/bard-plugin-ceph-rbd.tar /tmp/bard-plugin-cephfs.tar /tmp/bard-plugin-nfs.tar /tmp/bard-plugin-lvm.tar
-	podman save -o /tmp/bard-plugin-ceph-rbd.tar $(REGISTRY)/bard-plugin-ceph-rbd:$(VERSION)
-	podman save -o /tmp/bard-plugin-cephfs.tar $(REGISTRY)/bard-plugin-cephfs:$(VERSION)
-	podman save -o /tmp/bard-plugin-nfs.tar $(REGISTRY)/bard-plugin-nfs:$(VERSION)
-	podman save -o /tmp/bard-plugin-lvm.tar $(REGISTRY)/bard-plugin-lvm:$(VERSION)
+# The same seven images the release workflow publishes (.github/workflows/images.yaml).
+PLUGINS ?= ceph-rbd cephfs nfs lvm iscsi localpath
+
+images: image  ## build core + every backend plugin image, save tars
+	for p in $(PLUGINS); do \
+	  podman build -f Dockerfile.plugin-$$p --build-arg VERSION=$(VERSION) -t $(REGISTRY)/bard-plugin-$$p:$(VERSION) . || exit 1; \
+	  rm -f /tmp/bard-plugin-$$p.tar; \
+	  podman save -o /tmp/bard-plugin-$$p.tar $(REGISTRY)/bard-plugin-$$p:$(VERSION) || exit 1; \
+	done
 
 ## --- local end-to-end harness (rootful kind, see CLAUDE.md) ---
 kind-up:            ## create the cluster + all host fixes
@@ -48,10 +47,9 @@ kind-down:          ## delete the cluster
 
 images-load:        ## load core + plugin images into the cluster
 	sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive $(IMAGE_TAR) --name $(CLUSTER)
-	sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive /tmp/bard-plugin-ceph-rbd.tar --name $(CLUSTER)
-	sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive /tmp/bard-plugin-cephfs.tar --name $(CLUSTER)
-	sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive /tmp/bard-plugin-nfs.tar --name $(CLUSTER)
-	sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive /tmp/bard-plugin-lvm.tar --name $(CLUSTER)
+	for p in $(PLUGINS); do \
+	  sudo env KIND_EXPERIMENTAL_PROVIDER=podman $(KIND) load image-archive /tmp/bard-plugin-$$p.tar --name $(CLUSTER) || exit 1; \
+	done
 
 deploy:             ## apply manifests + real secret (needs KUBECONFIG=~/.kube/config-bard)
 	kubectl apply -f deploy/
