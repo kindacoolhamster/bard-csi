@@ -70,6 +70,66 @@ jobs:
           # controller-placement coupling) with a controller-only targetd creds mount
           helm template bard charts/bard-csi --set attach.enabled=true --set plugins.iscsi.enabled=true \
             --set-json 'plugins.iscsi.instances={"remote":{"management":"targetd","targetdEndpoint":"http://192.0.2.5:18700/targetrpc","targetdPool":"vg-targetd","targetIqn":"iqn.2003-01.org.linux-iscsi.host:targetd","portal":"192.0.2.5:3260"}}' >/dev/null
+      # Metrics wiring. Each assertion below corresponds to a way this has
+      # already been broken: the node shipped --metrics-addr with no
+      # containerPort (unreachable), and giving every sidecar the port name
+      # "metrics" makes the whole controller pod invalid, since port names must
+      # be unique within a pod -- neither is caught by `helm lint`.
+      - name: metrics wiring renders and is scrapeable
+        run: |
+          set -euo pipefail
+          # Ports pinned here rather than inherited from values.yaml, so this
+          # proves the wiring independently of whatever the defaults become.
+          on=(--set metrics.enabled=true --set metrics.serviceMonitor.enabled=true
+              --set metrics.podMonitor.enabled=true --set metrics.dashboard.enabled=true
+              --set attach.enabled=true --set metrics.port=9809 --set metrics.nodePort=9815)
+
+          node=$(helm template bard charts/bard-csi "${on[@]}" --show-only templates/node.yaml)
+          echo "$node" | grep -q -- "--metrics-addr=:9815" || { echo "node core has no --metrics-addr"; exit 1; }
+          echo "$node" | grep -q "containerPort: 9815" || { echo "node core declares no metrics containerPort"; exit 1; }
+
+          # The node port must not equal the controller port: a hostNetwork
+          # profile (iscsi sets it on BOTH planes) puts them in the same host
+          # netns, and the loser silently fails to bind.
+          if helm template bard charts/bard-csi --set metrics.enabled=true \
+               --set metrics.nodePort=9809 >/dev/null 2>&1; then
+            echo "port-collision guard did not fire for nodePort == metrics.port"; exit 1
+          fi
+
+          ctrl=$(helm template bard charts/bard-csi "${on[@]}" --show-only templates/controller.yaml)
+          n=$(echo "$ctrl" | grep -c -- "--http-endpoint=:") || true
+          [ "$n" = "5" ] || { echo "expected 5 sidecar --http-endpoint flags, got $n"; exit 1; }
+          dupes=$(echo "$ctrl" | grep -oE "name: metrics[a-z-]*" | sort | uniq -d)
+          [ -z "$dupes" ] || { echo "duplicate containerPort names in one pod:"; echo "$dupes"; exit 1; }
+
+          for t in metrics-service metrics-servicemonitor metrics-podmonitor grafana-dashboard; do
+            helm template bard charts/bard-csi "${on[@]}" --show-only "templates/$t.yaml" >/dev/null \
+              || { echo "$t did not render"; exit 1; }
+          done
+
+          # A ServiceMonitor endpoint naming a port the Service does not publish
+          # scrapes nothing, silently. Assert the two lists agree.
+          svc=$(helm template bard charts/bard-csi "${on[@]}" --show-only templates/metrics-service.yaml \
+                | grep -oE "^    - name: metrics[a-z-]*" | awk '{print $3}' | sort)
+          sm=$(helm template bard charts/bard-csi "${on[@]}" --show-only templates/metrics-servicemonitor.yaml \
+               | grep -oE "^    - port: metrics[a-z-]*" | awk '{print $3}' | sort)
+          [ "$svc" = "$sm" ] || { echo "Service ports and ServiceMonitor endpoints disagree:"; diff <(echo "$svc") <(echo "$sm") || true; exit 1; }
+
+          # Metrics off must stay entirely off. Written as `if` rather than
+          # `grep -q ... && exit 1`, which under `set -e` aborts the script on the
+          # HEALTHY path (grep returns 1 when it finds nothing).
+          off=$(helm template bard charts/bard-csi)
+          if echo "$off" | grep -q -- "--metrics-addr"; then
+            echo "metrics-addr present with metrics disabled"; exit 1
+          fi
+          if echo "$off" | grep -qE "kind: (ServiceMonitor|PodMonitor)"; then
+            echo "monitor CRs present with metrics disabled"; exit 1
+          fi
+
+          python3 -c "import json;json.load(open('charts/bard-csi/dashboards/bard-csi.json'))" \
+            || { echo "dashboard JSON is invalid"; exit 1; }
+          echo "metrics wiring OK"
+
       # The install version the docs hand a reader is part of the product: an
       # unpinned install cannot reach a pre-release at all and silently resolves
       # to the latest stable instead, and a stale pin quietly installs the wrong

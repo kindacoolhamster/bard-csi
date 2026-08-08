@@ -1,0 +1,40 @@
+{{- if and .Values.metrics.enabled .Values.metrics.podMonitor.enabled }}
+{{- $pm := .Values.metrics.podMonitor }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-node
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+    {{- with $pm.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ include "bard-csi.namespace" . }}
+  selector:
+    matchLabels:
+      app: {{ include "bard-csi.fullname" . }}-node
+  # The node plane is a DaemonSet with no Service, so it is scraped per pod. Under
+  # hostNetwork the pod IP is the node IP -- Prometheus must be able to reach node
+  # IPs on metrics.nodePort for this to return anything.
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: {{ $pm.interval }}
+      relabelings:
+        # Carry the node name onto every node-plane series; without it the only
+        # identity is a pod name that changes on every DaemonSet roll, which makes
+        # "is this one node misbehaving?" unanswerable across a restart.
+        - sourceLabels: [__meta_kubernetes_pod_node_name]
+          targetLabel: node
+        {{- with $pm.relabelings }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $pm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

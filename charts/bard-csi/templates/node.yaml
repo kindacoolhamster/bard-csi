@@ -91,9 +91,14 @@ spec:
             - "--max-volumes-per-node={{ .Values.node.maxVolumesPerNode }}"
             {{- end }}
             {{- if .Values.metrics.enabled }}
-            - "--metrics-addr=:{{ .Values.metrics.port }}"
+            - "--metrics-addr=:{{ .Values.metrics.nodePort }}"
             {{- end }}
             - "--v=2"
+          {{- if .Values.metrics.enabled }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.nodePort }}
+          {{- end }}
           env:
             - name: NODE_ID
               valueFrom:

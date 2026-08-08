@@ -26,4 +26,30 @@ Call: (include "bard-csi.validate" .) -- pass the ROOT context.
 {{- if and $hostNetwork (gt (.Values.controller.replicas | int) 1) -}}
 {{- fail (printf "a hostNetwork controller plugin is single-replica only (it binds host ports and is pinned to one node via controller.nodeSelector) -- set controller.replicas: 1 (got controller.replicas=%d)." (.Values.controller.replicas | int)) -}}
 {{- end -}}
+{{- /* Every enabled metrics port must be distinct. Under a hostNetwork profile
+     (iscsi sets it on BOTH planes) the controller pod and a node pod share the
+     host netns on the controller's node, so a duplicate port means the second
+     listener never binds -- and the core only warning-logs that failure, so the
+     driver keeps serving CSI while a scrape target is silently dead. Fail the
+     render instead of shipping a half-observable install. */ -}}
+{{- if .Values.metrics.enabled -}}
+{{- $m := .Values.metrics -}}
+{{- $ports := dict (printf "%d" (int $m.port)) "metrics.port" -}}
+{{- $add := dict -}}
+{{- $_ := set $add "metrics.nodePort" (int $m.nodePort) -}}
+{{- if $m.sidecars.enabled -}}
+{{-   if .Values.sidecars.provisioner.enabled }}{{ $_ := set $add "metrics.sidecars.provisionerPort" (int $m.sidecars.provisionerPort) }}{{ end -}}
+{{-   if .Values.sidecars.snapshotter.enabled }}{{ $_ := set $add "metrics.sidecars.snapshotterPort" (int $m.sidecars.snapshotterPort) }}{{ end -}}
+{{-   if .Values.sidecars.resizer.enabled }}{{ $_ := set $add "metrics.sidecars.resizerPort" (int $m.sidecars.resizerPort) }}{{ end -}}
+{{-   if .Values.attach.enabled }}{{ $_ := set $add "metrics.sidecars.attacherPort" (int $m.sidecars.attacherPort) }}{{ end -}}
+{{-   if .Values.sidecars.healthMonitor.enabled }}{{ $_ := set $add "metrics.sidecars.healthMonitorPort" (int $m.sidecars.healthMonitorPort) }}{{ end -}}
+{{- end -}}
+{{- range $key, $port := $add -}}
+{{-   $s := printf "%d" $port -}}
+{{-   if hasKey $ports $s -}}
+{{-     fail (printf "metrics port %d is used by both %s and %s -- every enabled metrics port must be unique, because a hostNetwork profile puts the controller and node listeners in the same host network namespace. Change one of them." $port (index $ports $s) $key) -}}
+{{-   end -}}
+{{-   $_ := set $ports $s $key -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}

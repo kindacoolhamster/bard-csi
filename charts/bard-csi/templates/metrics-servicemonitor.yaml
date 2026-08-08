@@ -1,0 +1,55 @@
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+{{- if not .Values.metrics.service.enabled }}
+{{- fail "metrics.serviceMonitor.enabled requires metrics.service.enabled (a ServiceMonitor selects a Service)" }}
+{{- end }}
+{{- $sm := .Values.metrics.serviceMonitor }}
+{{- $sc := .Values.metrics.sidecars }}
+{{- /* Mirror exactly the ports metrics-service.yaml publishes, so no endpoint
+       refers to a port the Service does not expose. */ -}}
+{{- $ports := list "metrics" -}}
+{{- if $sc.enabled -}}
+{{-   if .Values.sidecars.provisioner.enabled }}{{ $ports = append $ports "metrics-prov" }}{{ end -}}
+{{-   if .Values.sidecars.snapshotter.enabled }}{{ $ports = append $ports "metrics-snap" }}{{ end -}}
+{{-   if .Values.sidecars.resizer.enabled }}{{ $ports = append $ports "metrics-resize" }}{{ end -}}
+{{-   if .Values.attach.enabled }}{{ $ports = append $ports "metrics-attach" }}{{ end -}}
+{{-   if .Values.sidecars.healthMonitor.enabled }}{{ $ports = append $ports "metrics-health" }}{{ end -}}
+{{- end -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+    {{- with $sm.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ include "bard-csi.namespace" . }}
+  selector:
+    matchLabels:
+      app: {{ include "bard-csi.fullname" . }}-controller-metrics
+  # One endpoint per named port. A ServiceMonitor can scrape several ports on one
+  # Service, which is why this (not pod annotations) is the supported path for the
+  # driver plus its sidecars: the classic prometheus.io/port annotation describes a
+  # single endpoint per pod and cannot express a six-port pod.
+  endpoints:
+    {{- range $port := $ports }}
+    - port: {{ $port }}
+      path: /metrics
+      interval: {{ $sm.interval }}
+      {{- with $sm.scrapeTimeout }}
+      scrapeTimeout: {{ . }}
+      {{- end }}
+      {{- with $sm.relabelings }}
+      relabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $sm.metricRelabelings }}
+      metricRelabelings:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}

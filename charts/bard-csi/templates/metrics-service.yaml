@@ -1,0 +1,60 @@
+{{- if and .Values.metrics.enabled .Values.metrics.service.enabled }}
+{{- $sc := .Values.metrics.sidecars }}
+{{- $sidecarMetrics := and .Values.metrics.enabled $sc.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bard-csi.fullname" . }}-controller-metrics
+  namespace: {{ include "bard-csi.namespace" . }}
+  labels:
+    {{- include "bard-csi.labels" . | nindent 4 }}
+    app: {{ include "bard-csi.fullname" . }}-controller-metrics
+  {{- with .Values.metrics.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  # Headless because this Service exists only for scrape discovery, so there is no
+  # reason to consume a ClusterIP from the service network. Scraping is unaffected
+  # either way: a ServiceMonitor targets the individual EndpointSlice addresses,
+  # not the Service VIP, so per-pod series stay per-pod with or without a VIP.
+  clusterIP: None
+  selector:
+    app: {{ include "bard-csi.fullname" . }}-controller
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+    {{- if and $sidecarMetrics .Values.sidecars.provisioner.enabled }}
+    - name: metrics-prov
+      port: {{ $sc.provisionerPort }}
+      targetPort: metrics-prov
+      protocol: TCP
+    {{- end }}
+    {{- if and $sidecarMetrics .Values.sidecars.snapshotter.enabled }}
+    - name: metrics-snap
+      port: {{ $sc.snapshotterPort }}
+      targetPort: metrics-snap
+      protocol: TCP
+    {{- end }}
+    {{- if and $sidecarMetrics .Values.sidecars.resizer.enabled }}
+    - name: metrics-resize
+      port: {{ $sc.resizerPort }}
+      targetPort: metrics-resize
+      protocol: TCP
+    {{- end }}
+    {{- if and $sidecarMetrics .Values.attach.enabled }}
+    - name: metrics-attach
+      port: {{ $sc.attacherPort }}
+      targetPort: metrics-attach
+      protocol: TCP
+    {{- end }}
+    {{- if and $sidecarMetrics .Values.sidecars.healthMonitor.enabled }}
+    - name: metrics-health
+      port: {{ $sc.healthMonitorPort }}
+      targetPort: metrics-health
+      protocol: TCP
+    {{- end }}
+{{- end }}
