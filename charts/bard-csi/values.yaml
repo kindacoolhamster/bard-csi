@@ -51,13 +51,69 @@ storageCapacity: true
 # Set false only on Kubernetes older than the SELinuxMount feature (<1.25).
 seLinuxMount: true
 
-# -- Prometheus /metrics endpoint for the core (gRPC request counts by status code,
-# handler-latency histogram, in-flight gauge). Adds --metrics-addr to the controller
-# + node core and a containerPort; scrape it with a podMonitor/annotations. The node
-# runs hostNetwork, so its port binds the host.
+# -- Prometheus metrics. Enables the core's /metrics endpoint (gRPC RED metrics,
+# per-backend/instance plugin call latency + outcomes, and volume placements by
+# dispatch decision) on both the controller and the node, and optionally the CSI
+# sidecars' own csi_sidecar_operations_seconds. See docs/monitoring.md.
 metrics:
   enabled: false
+  # -- Controller core metrics port.
   port: 9809
+  # -- Node core metrics port. MUST differ from every controller port above: with a
+  # host-networked profile (the iscsi profile sets hostNetwork on BOTH planes) the
+  # controller pod and a node DaemonSet pod share the host network namespace on the
+  # controller's node, so identical ports mean the second listener fails to bind --
+  # and the driver only warning-logs that, so CSI keeps working while one scrape
+  # target silently stays down. The chart fails the render on a collision.
+  # No hostPort is declared -- containerPort is metadata only, and under
+  # hostNetwork the process binds the host port directly regardless.
+  nodePort: 9815
+
+  # -- CSI sidecar metrics (csi_sidecar_operations_seconds -- the standard
+  # provision/attach/snapshot/resize operation counters most CSI dashboards are
+  # built on). Each sidecar gets --http-endpoint on its own port. Only takes
+  # effect when metrics.enabled is true.
+  sidecars:
+    enabled: true
+    provisionerPort: 9810
+    snapshotterPort: 9811
+    resizerPort: 9812
+    attacherPort: 9813
+    healthMonitorPort: 9814
+
+  # -- ClusterIP Service fronting the controller's metrics ports. Required for
+  # the ServiceMonitor below; harmless otherwise.
+  service:
+    enabled: true
+    annotations: {}
+
+  # -- ServiceMonitor for the controller (prometheus-operator CRDs required).
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: ""
+    # Extra labels, e.g. the `release: kube-prometheus-stack` your Prometheus selects on.
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+
+  # -- PodMonitor for the node DaemonSet (prometheus-operator CRDs required). The
+  # node plane is a DaemonSet with no Service, so it is scraped per-pod.
+  podMonitor:
+    enabled: false
+    interval: 30s
+    additionalLabels: {}
+    relabelings: []
+    metricRelabelings: []
+
+  # -- Ship the Grafana dashboard as a ConfigMap for the Grafana sidecar to pick
+  # up (it watches for the label below). The JSON is charts/bard-csi/dashboards/
+  # bard-csi.json -- import that file directly if you do not use the sidecar.
+  dashboard:
+    enabled: false
+    labels:
+      grafana_dashboard: "1"
+    annotations: {}
 
 controller:
   replicas: 1

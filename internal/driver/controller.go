@@ -15,6 +15,7 @@ import (
 
 	"github.com/kindacoolhamster/bard-csi/internal/backend"
 	"github.com/kindacoolhamster/bard-csi/internal/dispatch"
+	"github.com/kindacoolhamster/bard-csi/internal/metrics"
 	"github.com/kindacoolhamster/bard-csi/internal/volumeid"
 )
 
@@ -58,8 +59,30 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	preferred, requisite := zonesFrom(req.GetAccessibilityRequirements())
 	res, err := bk.disp.Resolve(req.GetParameters(), preferred, requisite)
 	if err != nil {
+		// Recorded here rather than inside Resolve: GetCapacity resolves too, and
+		// capacity polling (on by default via the provisioner's --enable-capacity)
+		// would otherwise swamp a metric that is meant to count volume placements.
+		// The requested type is caller-controlled, so it is only used as a label
+		// when it names a backend that actually exists -- otherwise a typo in a
+		// StorageClass would mint a permanent series.
+		requested := req.GetParameters()[dispatch.BackendParamKey]
+		if _, rerr := bk.registry.Get(requested); rerr != nil {
+			requested = metrics.BackendUnknown
+		}
+		metrics.ObservePlacement(requested,
+			metrics.InstanceNone, metrics.ZoneNone, metrics.DecisionUnresolved, metrics.PlacementDispatchError)
 		return nil, status.Errorf(codes.InvalidArgument, "dispatch: %v", err)
 	}
+
+	// One record per attempt that reached dispatch, on EVERY exit path below --
+	// registry lookup, access-mode and content-source validation all fail after an
+	// instance has been chosen, and counting only the ones that reached the backend
+	// would quietly under-report failures on the very panel meant to surface them.
+	placement := metrics.PlacementError
+	defer func() {
+		metrics.ObservePlacement(res.Backend, res.Instance, res.Zone, string(res.Decision), placement)
+	}()
+
 	be, err := bk.registry.Get(res.Backend)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -92,6 +115,8 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err != nil {
 		return nil, toStatus(err, "create volume")
 	}
+	// Past every failure path: the deferred record above now reports success.
+	placement = metrics.ResultSuccess
 
 	vol := &csi.Volume{
 		VolumeId:      out.Handle.String(),

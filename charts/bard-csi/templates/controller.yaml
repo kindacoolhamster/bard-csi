@@ -92,7 +92,15 @@ spec:
             {{- range .Values.sidecars.provisioner.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+            {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.sidecars.provisionerPort }}"
+            {{- end }}
             - "--v=2"
+          {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+          ports:
+            - name: metrics-prov
+              containerPort: {{ .Values.metrics.sidecars.provisionerPort }}
+          {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -118,7 +126,15 @@ spec:
             {{- range .Values.sidecars.snapshotter.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+            {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.sidecars.snapshotterPort }}"
+            {{- end }}
             - "--v=2"
+          {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+          ports:
+            - name: metrics-snap
+              containerPort: {{ .Values.metrics.sidecars.snapshotterPort }}
+          {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -135,7 +151,15 @@ spec:
             {{- range .Values.sidecars.resizer.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+            {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.sidecars.resizerPort }}"
+            {{- end }}
             - "--v=2"
+          {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+          ports:
+            - name: metrics-resize
+              containerPort: {{ .Values.metrics.sidecars.resizerPort }}
+          {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -156,7 +180,15 @@ spec:
             {{- range .Values.attach.extraArgs }}
             - {{ . | quote }}
             {{- end }}
+            {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.sidecars.attacherPort }}"
+            {{- end }}
             - "--v=2"
+          {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+          ports:
+            - name: metrics-attach
+              containerPort: {{ .Values.metrics.sidecars.attacherPort }}
+          {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock
@@ -171,7 +203,15 @@ spec:
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
             - "--monitor-interval={{ .Values.sidecars.healthMonitor.monitorInterval }}"
+            {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+            - "--http-endpoint=:{{ .Values.metrics.sidecars.healthMonitorPort }}"
+            {{- end }}
             - "--v=2"
+          {{- if and .Values.metrics.enabled .Values.metrics.sidecars.enabled }}
+          ports:
+            - name: metrics-health
+              containerPort: {{ .Values.metrics.sidecars.healthMonitorPort }}
+          {{- end }}
           env:
             - name: ADDRESS
               value: /csi/csi.sock

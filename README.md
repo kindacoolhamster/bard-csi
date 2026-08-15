@@ -177,6 +177,21 @@ go install github.com/kindacoolhamster/bard-csi/cmd/kubectl-bard@latest
 kubectl bard inspect
 ```
 
+## Metrics and dashboard
+
+Prometheus metrics for both planes, plus a Grafana dashboard shipped with the
+chart. Beyond the usual RPC rate/error/latency, the metrics carry the dimension
+that makes a multi-backend driver legible: every plugin call is labelled by
+**backend instance**, and every volume placement records **why dispatch chose that
+instance** — so a fleet that has silently stopped doing topology-aware placement
+and is piling every volume onto the default instance is visible, instead of
+looking like healthy provisioning. See [docs/monitoring.md](docs/monitoring.md).
+
+```sh
+helm upgrade --install bard-csi ... --set metrics.enabled=true \
+  --set metrics.serviceMonitor.enabled=true --set metrics.dashboard.enabled=true
+```
+
 ## Status
 
 The implemented-feature inventory and the roadmap live in [STATUS.md](STATUS.md).

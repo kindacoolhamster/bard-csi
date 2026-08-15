@@ -232,6 +232,10 @@ across all enabled node plugins, since they are pod-wide.
 | `sidecars.csiAddons.enabled` | `false` | csi-addons ops: ReclaimSpace, NetworkFence, VolumeReplication (mirroring/DR), VolumeGroup, EncryptionKeyRotation (sidecar + endpoint + RBAC); needs the csi-addons controller installed separately |
 | `attach.enabled` | `false` | control-plane attach: flips the CSIDriver's `attachRequired` (immutable) + adds the external-attacher + RBAC. **Required by `plugins.iscsi`** (the chart fails the render otherwise); node-mapped backends no-op it |
 | `node.kubeletDir` | `/var/lib/kubelet` | override for non-standard distros |
+| `metrics.enabled` | `false` | Prometheus metrics on the controller + node cores (`metrics.port` / `metrics.nodePort`) |
+| `metrics.sidecars.enabled` | `true` | adds `--http-endpoint` to the CSI sidecars (`csi_sidecar_operations_seconds`); only applies when `metrics.enabled` |
+| `metrics.serviceMonitor.enabled` / `metrics.podMonitor.enabled` | `false` | scrape config for the controller / node planes; needs the prometheus-operator CRDs |
+| `metrics.dashboard.enabled` | `false` | ships the Grafana dashboard as a ConfigMap labelled `grafana_dashboard: "1"` |
 | `plugins` | ceph-rbd + cephfs + iscsi profiles (disabled) | the backend plugins to run |
 | `plugins.<backend>.instances` | `{}` | high-level: backend-native config per instance; generates the config ConfigMap + a BackendCluster (zone→instance) each |
 | `plugins.<backend>.keysSecret` | `bard-<backend>-keys` | name of the credentials Secret you create (one key per instance id; cephx for the Ceph backends) |

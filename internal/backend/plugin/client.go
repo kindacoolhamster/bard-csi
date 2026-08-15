@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kindacoolhamster/bard-csi/internal/backend"
+	"github.com/kindacoolhamster/bard-csi/internal/metrics"
 	"github.com/kindacoolhamster/bard-csi/internal/volumeid"
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
 )
@@ -49,7 +51,7 @@ func Dial(ctx context.Context, backendType, socketPath string) (*Client, error) 
 	var info bardplugin.Info
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		err := c.call(ctx, bardplugin.PathInfo, struct{}{}, &info)
+		err := c.call(ctx, bardplugin.PathInfo, metrics.InstanceAll, struct{}{}, &info)
 		if err == nil {
 			break
 		}
@@ -88,32 +90,93 @@ func (c *Client) Type() string                       { return c.backendType }
 func (c *Client) Capabilities() backend.Capabilities { return c.caps }
 
 // call POSTs reqBody as JSON to path and decodes the response, mapping plugin
-// error codes to backend sentinel errors.
-func (c *Client) call(ctx context.Context, path string, reqBody, respOut any) error {
+// error codes to backend sentinel errors, and records the call.
+//
+// instance is the concrete backend instance this call targets, or
+// metrics.InstanceAll for the genuinely cross-instance routes (the list calls
+// and the startup /info probe). This is the one place in core where the
+// instance is visible alongside the operation, which is what makes per-instance
+// latency and error rates observable at all.
+func (c *Client) call(ctx context.Context, path, instance string, reqBody, respOut any) error {
+	defer metrics.PluginCallStarted(c.backendType)()
+	start := time.Now()
+	result, err := c.do(ctx, path, reqBody, respOut)
+	metrics.ObservePluginCall(c.backendType, instance, path, result, time.Since(start))
+	return err
+}
+
+// do performs the request and classifies the outcome. The result is decided at
+// each return point rather than inferred from the returned error afterwards, so
+// the classification cannot drift from the control flow.
+func (c *Client) do(ctx context.Context, path string, reqBody, respOut any) (string, error) {
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return metrics.ResultDecodeError, fmt.Errorf("marshal: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://plugin"+path, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return metrics.ResultTransport, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		// The call carries the CO's deadline, so a timeout here means the CO
+		// gave up on us -- distinct from the plugin refusing the work, and the
+		// operator response is different (raise the sidecar --timeout vs. fix
+		// the backend).
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return metrics.ResultTimeout, err
+		case errors.Is(err, context.Canceled):
+			return metrics.ResultCanceled, err
+		}
+		return metrics.ResultTransport, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, rerr := io.ReadAll(resp.Body)
+	if rerr != nil {
+		// The status line arrived but the body did not. This is a deliberate
+		// behaviour change: the read error used to be discarded, so a truncated
+		// body was fed to mapError/Unmarshal -- and on a 200 with no response
+		// object to decode, a failed read returned SUCCESS. Failing here is both
+		// more honest and lets the metric say transport rather than blaming the
+		// plugin for a decode error.
+		switch {
+		case errors.Is(rerr, context.DeadlineExceeded):
+			return metrics.ResultTimeout, rerr
+		case errors.Is(rerr, context.Canceled):
+			return metrics.ResultCanceled, rerr
+		}
+		return metrics.ResultTransport, rerr
+	}
 	if resp.StatusCode != http.StatusOK {
-		return mapError(data, resp.StatusCode)
+		err := mapError(data, resp.StatusCode)
+		return classify(err), err
 	}
 	if respOut != nil {
 		if err := json.Unmarshal(data, respOut); err != nil {
-			return fmt.Errorf("decode response: %w", err)
+			return metrics.ResultDecodeError, fmt.Errorf("decode response: %w", err)
 		}
 	}
-	return nil
+	return metrics.ResultSuccess, nil
+}
+
+// classify maps a plugin-reported error onto a bounded metric label. The mapped
+// sentinels are kept distinct from a generic failure because several of them are
+// routine in CSI's idempotency flows (NotFound on a repeated delete,
+// AlreadyExists on a retried create) and should not read as backend trouble.
+func classify(err error) string {
+	switch {
+	case errors.Is(err, backend.ErrNotFound):
+		return metrics.ResultNotFound
+	case errors.Is(err, backend.ErrAlreadyExists):
+		return metrics.ResultAlreadyExists
+	case errors.Is(err, backend.ErrInvalidArgument):
+		return metrics.ResultInvalidArg
+	case errors.Is(err, backend.ErrUnsupported):
+		return metrics.ResultUnsupported
+	}
+	return metrics.ResultPluginError
 }
 
 func mapError(body []byte, status int) error {
@@ -157,7 +220,7 @@ func refPtr(h *volumeid.Handle) *bardplugin.VolumeRef {
 
 func (c *Client) CreateVolume(ctx context.Context, req *backend.CreateVolumeRequest) (*backend.Volume, error) {
 	var resp bardplugin.CreateVolumeResponse
-	err := c.call(ctx, bardplugin.PathCreateVolume, bardplugin.CreateVolumeRequest{
+	err := c.call(ctx, bardplugin.PathCreateVolume, req.Instance, bardplugin.CreateVolumeRequest{
 		Name:           req.Name,
 		CapacityBytes:  req.CapacityBytes,
 		Instance:       req.Instance,
@@ -184,7 +247,7 @@ func (c *Client) CreateVolume(ctx context.Context, req *backend.CreateVolumeRequ
 }
 
 func (c *Client) DeleteVolume(ctx context.Context, h volumeid.Handle, secrets map[string]string) error {
-	return c.call(ctx, bardplugin.PathDeleteVolume, bardplugin.DeleteVolumeRequest{Volume: ref(h), Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathDeleteVolume, h.Instance, bardplugin.DeleteVolumeRequest{Volume: ref(h), Secrets: secrets}, nil)
 }
 
 func (c *Client) GetCapacity(ctx context.Context, instance string, params map[string]string) (int64, error) {
@@ -192,7 +255,7 @@ func (c *Client) GetCapacity(ctx context.Context, instance string, params map[st
 		return 0, backend.ErrUnsupported
 	}
 	var resp bardplugin.GetCapacityResponse
-	if err := c.call(ctx, bardplugin.PathGetCapacity, bardplugin.GetCapacityRequest{Instance: instance, Parameters: params}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathGetCapacity, instance, bardplugin.GetCapacityRequest{Instance: instance, Parameters: params}, &resp); err != nil {
 		return 0, err
 	}
 	return resp.AvailableBytes, nil
@@ -203,7 +266,7 @@ func (c *Client) GetVolumeHealth(ctx context.Context, h volumeid.Handle, secrets
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.GetVolumeHealthResponse
-	if err := c.call(ctx, bardplugin.PathVolumeHealth, bardplugin.GetVolumeHealthRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathVolumeHealth, h.Instance, bardplugin.GetVolumeHealthRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
 		return nil, err
 	}
 	return &backend.VolumeHealth{Abnormal: resp.Abnormal, Message: resp.Message}, nil
@@ -213,7 +276,7 @@ func (c *Client) ModifyVolume(ctx context.Context, h volumeid.Handle, mutablePar
 	if !c.caps.ModifyVolume {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathModifyVolume, bardplugin.ModifyVolumeRequest{Volume: ref(h), MutableParams: mutableParams, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathModifyVolume, h.Instance, bardplugin.ModifyVolumeRequest{Volume: ref(h), MutableParams: mutableParams, Secrets: secrets}, nil)
 }
 
 func (c *Client) ReclaimSpace(ctx context.Context, h volumeid.Handle, secrets map[string]string) (*backend.SpaceUsage, error) {
@@ -221,7 +284,7 @@ func (c *Client) ReclaimSpace(ctx context.Context, h volumeid.Handle, secrets ma
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.ReclaimSpaceResponse
-	if err := c.call(ctx, bardplugin.PathReclaimSpace, bardplugin.ReclaimSpaceRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathReclaimSpace, h.Instance, bardplugin.ReclaimSpaceRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
 		return nil, err
 	}
 	return &backend.SpaceUsage{PreUsageBytes: resp.PreUsageBytes, PostUsageBytes: resp.PostUsageBytes}, nil
@@ -233,7 +296,7 @@ func (c *Client) NodeReclaimSpace(ctx context.Context, h volumeid.Handle, volume
 	}
 	var resp bardplugin.ReclaimSpaceResponse
 	req := bardplugin.NodeReclaimSpaceRequest{Volume: ref(h), VolumePath: volumePath, StagingPath: stagingPath, Block: block, Secrets: secrets}
-	if err := c.call(ctx, bardplugin.PathNodeReclaimSpace, req, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathNodeReclaimSpace, h.Instance, req, &resp); err != nil {
 		return nil, err
 	}
 	return &backend.SpaceUsage{PreUsageBytes: resp.PreUsageBytes, PostUsageBytes: resp.PostUsageBytes}, nil
@@ -241,7 +304,7 @@ func (c *Client) NodeReclaimSpace(ctx context.Context, h volumeid.Handle, volume
 
 func (c *Client) ExpandVolume(ctx context.Context, h volumeid.Handle, newSizeBytes int64, secrets map[string]string) (int64, bool, error) {
 	var resp bardplugin.ExpandVolumeResponse
-	err := c.call(ctx, bardplugin.PathExpandVolume, bardplugin.ExpandVolumeRequest{Volume: ref(h), NewSizeBytes: newSizeBytes, Secrets: secrets}, &resp)
+	err := c.call(ctx, bardplugin.PathExpandVolume, h.Instance, bardplugin.ExpandVolumeRequest{Volume: ref(h), NewSizeBytes: newSizeBytes, Secrets: secrets}, &resp)
 	if err != nil {
 		return 0, false, err
 	}
@@ -250,7 +313,7 @@ func (c *Client) ExpandVolume(ctx context.Context, h volumeid.Handle, newSizeByt
 
 func (c *Client) CreateSnapshot(ctx context.Context, req *backend.CreateSnapshotRequest) (*backend.Snapshot, error) {
 	var resp bardplugin.CreateSnapshotResponse
-	err := c.call(ctx, bardplugin.PathCreateSnapshot, bardplugin.CreateSnapshotRequest{
+	err := c.call(ctx, bardplugin.PathCreateSnapshot, req.SourceVolume.Instance, bardplugin.CreateSnapshotRequest{
 		Name:         req.Name,
 		SourceVolume: ref(req.SourceVolume),
 		Parameters:   req.Parameters,
@@ -275,7 +338,7 @@ func (c *Client) CreateSnapshot(ctx context.Context, req *backend.CreateSnapshot
 }
 
 func (c *Client) DeleteSnapshot(ctx context.Context, h volumeid.Handle, secrets map[string]string) error {
-	return c.call(ctx, bardplugin.PathDeleteSnapshot, bardplugin.DeleteSnapshotRequest{Snapshot: ref(h), Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathDeleteSnapshot, h.Instance, bardplugin.DeleteSnapshotRequest{Snapshot: ref(h), Secrets: secrets}, nil)
 }
 
 // ControllerPublish attaches the volume to a node. Backends that don't attach
@@ -288,7 +351,7 @@ func (c *Client) ControllerPublish(ctx context.Context, h volumeid.Handle, nodeI
 	}
 	var resp bardplugin.ControllerPublishResponse
 	req := bardplugin.ControllerPublishRequest{Volume: ref(h), NodeID: nodeID, Readonly: readonly, Context: volCtx, Secrets: secrets}
-	if err := c.call(ctx, bardplugin.PathControllerPublish, req, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathControllerPublish, h.Instance, req, &resp); err != nil {
 		return nil, err
 	}
 	return resp.PublishContext, nil
@@ -298,7 +361,7 @@ func (c *Client) ControllerUnpublish(ctx context.Context, h volumeid.Handle, nod
 	if !c.caps.RequiresControllerPublish {
 		return nil
 	}
-	return c.call(ctx, bardplugin.PathControllerUnpublish, bardplugin.ControllerUnpublishRequest{Volume: ref(h), NodeID: nodeID, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathControllerUnpublish, h.Instance, bardplugin.ControllerUnpublishRequest{Volume: ref(h), NodeID: nodeID, Secrets: secrets}, nil)
 }
 
 func (c *Client) ListVolumes(ctx context.Context) ([]backend.VolumeListEntry, error) {
@@ -306,7 +369,7 @@ func (c *Client) ListVolumes(ctx context.Context) ([]backend.VolumeListEntry, er
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.ListVolumesResponse
-	if err := c.call(ctx, bardplugin.PathListVolumes, bardplugin.ListVolumesRequest{}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathListVolumes, metrics.InstanceAll, bardplugin.ListVolumesRequest{}, &resp); err != nil {
 		return nil, err
 	}
 	out := make([]backend.VolumeListEntry, 0, len(resp.Entries))
@@ -325,7 +388,7 @@ func (c *Client) ListSnapshots(ctx context.Context) ([]backend.SnapshotListEntry
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.ListSnapshotsResponse
-	if err := c.call(ctx, bardplugin.PathListSnapshots, bardplugin.ListSnapshotsRequest{}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathListSnapshots, metrics.InstanceAll, bardplugin.ListSnapshotsRequest{}, &resp); err != nil {
 		return nil, err
 	}
 	out := make([]backend.SnapshotListEntry, 0, len(resp.Entries))
@@ -352,7 +415,7 @@ func (c *Client) FenceClusterNetwork(ctx context.Context, instance string, cidrs
 	if !c.caps.NetworkFence {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathFenceClusterNetwork, bardplugin.FenceClusterNetworkRequest{
+	return c.call(ctx, bardplugin.PathFenceClusterNetwork, instance, bardplugin.FenceClusterNetworkRequest{
 		Instance: instance, CIDRs: cidrs, Parameters: params, Secrets: secrets,
 	}, nil)
 }
@@ -361,7 +424,7 @@ func (c *Client) UnfenceClusterNetwork(ctx context.Context, instance string, cid
 	if !c.caps.NetworkFence {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathUnfenceClusterNetwork, bardplugin.UnfenceClusterNetworkRequest{
+	return c.call(ctx, bardplugin.PathUnfenceClusterNetwork, instance, bardplugin.UnfenceClusterNetworkRequest{
 		Instance: instance, CIDRs: cidrs, Parameters: params, Secrets: secrets,
 	}, nil)
 }
@@ -371,7 +434,7 @@ func (c *Client) ListClusterFence(ctx context.Context, instance string, params, 
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.ListClusterFenceResponse
-	if err := c.call(ctx, bardplugin.PathListClusterFence, bardplugin.ListClusterFenceRequest{
+	if err := c.call(ctx, bardplugin.PathListClusterFence, instance, bardplugin.ListClusterFenceRequest{
 		Instance: instance, Parameters: params, Secrets: secrets,
 	}, &resp); err != nil {
 		return nil, err
@@ -384,7 +447,7 @@ func (c *Client) GetFenceClients(ctx context.Context, instance string, params, s
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.GetFenceClientsResponse
-	if err := c.call(ctx, bardplugin.PathGetFenceClients, bardplugin.GetFenceClientsRequest{
+	if err := c.call(ctx, bardplugin.PathGetFenceClients, instance, bardplugin.GetFenceClientsRequest{
 		Instance: instance, Parameters: params, Secrets: secrets,
 	}, &resp); err != nil {
 		return nil, err
@@ -401,28 +464,28 @@ func (c *Client) EnableVolumeReplication(ctx context.Context, h volumeid.Handle,
 	if !c.caps.Replication {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathEnableReplication, bardplugin.EnableReplicationRequest{Volume: ref(h), Parameters: params, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathEnableReplication, h.Instance, bardplugin.EnableReplicationRequest{Volume: ref(h), Parameters: params, Secrets: secrets}, nil)
 }
 
 func (c *Client) DisableVolumeReplication(ctx context.Context, h volumeid.Handle, params, secrets map[string]string) error {
 	if !c.caps.Replication {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathDisableReplication, bardplugin.DisableReplicationRequest{Volume: ref(h), Parameters: params, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathDisableReplication, h.Instance, bardplugin.DisableReplicationRequest{Volume: ref(h), Parameters: params, Secrets: secrets}, nil)
 }
 
 func (c *Client) PromoteVolume(ctx context.Context, h volumeid.Handle, force bool, params, secrets map[string]string) error {
 	if !c.caps.Replication {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathPromoteVolume, bardplugin.PromoteVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathPromoteVolume, h.Instance, bardplugin.PromoteVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, nil)
 }
 
 func (c *Client) DemoteVolume(ctx context.Context, h volumeid.Handle, force bool, params, secrets map[string]string) error {
 	if !c.caps.Replication {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathDemoteVolume, bardplugin.DemoteVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathDemoteVolume, h.Instance, bardplugin.DemoteVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, nil)
 }
 
 func (c *Client) ResyncVolume(ctx context.Context, h volumeid.Handle, force bool, params, secrets map[string]string) (bool, error) {
@@ -430,7 +493,7 @@ func (c *Client) ResyncVolume(ctx context.Context, h volumeid.Handle, force bool
 		return false, backend.ErrUnsupported
 	}
 	var resp bardplugin.ResyncVolumeResponse
-	if err := c.call(ctx, bardplugin.PathResyncVolume, bardplugin.ResyncVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathResyncVolume, h.Instance, bardplugin.ResyncVolumeRequest{Volume: ref(h), Force: force, Parameters: params, Secrets: secrets}, &resp); err != nil {
 		return false, err
 	}
 	return resp.Ready, nil
@@ -441,7 +504,7 @@ func (c *Client) GetVolumeReplicationInfo(ctx context.Context, h volumeid.Handle
 		return time.Time{}, backend.ErrUnsupported
 	}
 	var resp bardplugin.ReplicationInfoResponse
-	if err := c.call(ctx, bardplugin.PathReplicationInfo, bardplugin.ReplicationInfoRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathReplicationInfo, h.Instance, bardplugin.ReplicationInfoRequest{Volume: ref(h), Secrets: secrets}, &resp); err != nil {
 		return time.Time{}, err
 	}
 	if resp.LastSyncTimeUnix == 0 {
@@ -456,7 +519,7 @@ func (c *Client) RotateEncryptionKey(ctx context.Context, h volumeid.Handle, vol
 	if !c.caps.EncryptionKeyRotation {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathRotateEncryptionKey, bardplugin.RotateEncryptionKeyRequest{
+	return c.call(ctx, bardplugin.PathRotateEncryptionKey, h.Instance, bardplugin.RotateEncryptionKeyRequest{
 		Volume: ref(h), VolumePath: volumePath, Parameters: params, Secrets: secrets,
 	}, nil)
 }
@@ -491,7 +554,7 @@ func (c *Client) CreateVolumeGroup(ctx context.Context, instance, pool, name str
 		return backend.VolumeGroup{}, backend.ErrUnsupported
 	}
 	var resp bardplugin.VolumeGroupResponse
-	if err := c.call(ctx, bardplugin.PathCreateVolumeGroup, bardplugin.CreateVolumeGroupRequest{
+	if err := c.call(ctx, bardplugin.PathCreateVolumeGroup, instance, bardplugin.CreateVolumeGroupRequest{
 		Instance: instance, Pool: pool, Name: name, Volumes: refs(members), Parameters: params, Secrets: secrets,
 	}, &resp); err != nil {
 		return backend.VolumeGroup{}, err
@@ -504,7 +567,7 @@ func (c *Client) ModifyVolumeGroup(ctx context.Context, g volumeid.Handle, membe
 		return backend.VolumeGroup{}, backend.ErrUnsupported
 	}
 	var resp bardplugin.VolumeGroupResponse
-	if err := c.call(ctx, bardplugin.PathModifyVolumeGroup, bardplugin.ModifyVolumeGroupRequest{
+	if err := c.call(ctx, bardplugin.PathModifyVolumeGroup, g.Instance, bardplugin.ModifyVolumeGroupRequest{
 		Group: ref(g), Volumes: refs(members), Parameters: params, Secrets: secrets,
 	}, &resp); err != nil {
 		return backend.VolumeGroup{}, err
@@ -516,7 +579,7 @@ func (c *Client) DeleteVolumeGroup(ctx context.Context, g volumeid.Handle, secre
 	if !c.caps.VolumeGroup {
 		return backend.ErrUnsupported
 	}
-	return c.call(ctx, bardplugin.PathDeleteVolumeGroup, bardplugin.DeleteVolumeGroupRequest{Group: ref(g), Secrets: secrets}, nil)
+	return c.call(ctx, bardplugin.PathDeleteVolumeGroup, g.Instance, bardplugin.DeleteVolumeGroupRequest{Group: ref(g), Secrets: secrets}, nil)
 }
 
 func (c *Client) GetVolumeGroup(ctx context.Context, g volumeid.Handle, secrets map[string]string) (backend.VolumeGroup, error) {
@@ -524,7 +587,7 @@ func (c *Client) GetVolumeGroup(ctx context.Context, g volumeid.Handle, secrets 
 		return backend.VolumeGroup{}, backend.ErrUnsupported
 	}
 	var resp bardplugin.VolumeGroupResponse
-	if err := c.call(ctx, bardplugin.PathGetVolumeGroup, bardplugin.GetVolumeGroupRequest{Group: ref(g), Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathGetVolumeGroup, g.Instance, bardplugin.GetVolumeGroupRequest{Group: ref(g), Secrets: secrets}, &resp); err != nil {
 		return backend.VolumeGroup{}, err
 	}
 	return c.group(resp), nil
@@ -535,7 +598,7 @@ func (c *Client) ListVolumeGroups(ctx context.Context, secrets map[string]string
 		return nil, backend.ErrUnsupported
 	}
 	var resp bardplugin.ListVolumeGroupsResponse
-	if err := c.call(ctx, bardplugin.PathListVolumeGroups, bardplugin.ListVolumeGroupsRequest{Secrets: secrets}, &resp); err != nil {
+	if err := c.call(ctx, bardplugin.PathListVolumeGroups, metrics.InstanceAll, bardplugin.ListVolumeGroupsRequest{Secrets: secrets}, &resp); err != nil {
 		return nil, err
 	}
 	out := make([]backend.VolumeGroup, 0, len(resp.Groups))
@@ -548,7 +611,7 @@ func (c *Client) ListVolumeGroups(ctx context.Context, secrets map[string]string
 // ---- node plane ----------------------------------------------------------
 
 func (c *Client) NodeStage(ctx context.Context, req *backend.NodeStageRequest) error {
-	return c.call(ctx, bardplugin.PathNodeStage, bardplugin.NodeStageRequest{
+	return c.call(ctx, bardplugin.PathNodeStage, req.Handle.Instance, bardplugin.NodeStageRequest{
 		Volume:         ref(req.Handle),
 		StagingPath:    req.StagingPath,
 		FsType:         req.FsType,
@@ -564,11 +627,11 @@ func (c *Client) NodeStage(ctx context.Context, req *backend.NodeStageRequest) e
 }
 
 func (c *Client) NodeUnstage(ctx context.Context, h volumeid.Handle, stagingPath string) error {
-	return c.call(ctx, bardplugin.PathNodeUnstage, bardplugin.NodeUnstageRequest{Volume: ref(h), StagingPath: stagingPath}, nil)
+	return c.call(ctx, bardplugin.PathNodeUnstage, h.Instance, bardplugin.NodeUnstageRequest{Volume: ref(h), StagingPath: stagingPath}, nil)
 }
 
 func (c *Client) NodePublish(ctx context.Context, req *backend.NodePublishRequest) error {
-	return c.call(ctx, bardplugin.PathNodePublish, bardplugin.NodePublishRequest{
+	return c.call(ctx, bardplugin.PathNodePublish, req.Handle.Instance, bardplugin.NodePublishRequest{
 		Volume:      ref(req.Handle),
 		StagingPath: req.StagingPath,
 		TargetPath:  req.TargetPath,
@@ -581,12 +644,12 @@ func (c *Client) NodePublish(ctx context.Context, req *backend.NodePublishReques
 }
 
 func (c *Client) NodeUnpublish(ctx context.Context, h volumeid.Handle, targetPath string) error {
-	return c.call(ctx, bardplugin.PathNodeUnpublish, bardplugin.NodeUnpublishRequest{Volume: ref(h), TargetPath: targetPath}, nil)
+	return c.call(ctx, bardplugin.PathNodeUnpublish, h.Instance, bardplugin.NodeUnpublishRequest{Volume: ref(h), TargetPath: targetPath}, nil)
 }
 
 func (c *Client) NodeExpand(ctx context.Context, h volumeid.Handle, volumePath string) (int64, error) {
 	var resp bardplugin.NodeExpandResponse
-	err := c.call(ctx, bardplugin.PathNodeExpand, bardplugin.NodeExpandRequest{Volume: ref(h), VolumePath: volumePath}, &resp)
+	err := c.call(ctx, bardplugin.PathNodeExpand, h.Instance, bardplugin.NodeExpandRequest{Volume: ref(h), VolumePath: volumePath}, &resp)
 	if err != nil {
 		return 0, err
 	}

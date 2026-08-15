@@ -60,11 +60,25 @@ func New(cfg Config) (*Dispatcher, error) {
 	return &Dispatcher{cfg: cfg, zoneIndex: idx}, nil
 }
 
+// Decision records WHICH path Resolve took to pick an instance. It exists for
+// observability: "provisioning works" and "every volume is silently landing on
+// the default because no topology ever matched" look identical without it, and
+// the second one quietly defeats the whole point of multi-zone dispatch.
+type Decision string
+
+const (
+	DecisionPreferred      Decision = "preferred"       // matched the scheduler's preferred topology
+	DecisionRequisite      Decision = "requisite"       // matched a requisite zone
+	DecisionDefault        Decision = "default"         // fell back to the configured default instance
+	DecisionSingleInstance Decision = "single_instance" // unambiguous: the backend has exactly one
+)
+
 // Resolution is the outcome of dispatching a request.
 type Resolution struct {
-	Backend  string // backend type
-	Instance string // concrete instance id
-	Zone     string // zone the instance serves (for AccessibleTopology)
+	Backend  string   // backend type
+	Instance string   // concrete instance id
+	Zone     string   // zone the instance serves (for AccessibleTopology)
+	Decision Decision // how the instance was chosen
 }
 
 // Resolve picks a backend instance for a CreateVolume request.
@@ -83,23 +97,30 @@ func (d *Dispatcher) Resolve(params map[string]string, preferred, requisite []st
 		return Resolution{}, fmt.Errorf("no instances configured for backend %q", bt)
 	}
 
-	// Prefer the scheduler's preferred topology, then any requisite zone.
-	for _, zone := range append(append([]string{}, preferred...), requisite...) {
+	// Prefer the scheduler's preferred topology, then any requisite zone. These
+	// are walked separately (rather than as one concatenated slice) only so the
+	// Decision can tell them apart; the order and outcome are unchanged.
+	for _, zone := range preferred {
 		if inst, ok := zi[zone]; ok {
-			return Resolution{Backend: bt, Instance: inst, Zone: zone}, nil
+			return Resolution{Backend: bt, Instance: inst, Zone: zone, Decision: DecisionPreferred}, nil
+		}
+	}
+	for _, zone := range requisite {
+		if inst, ok := zi[zone]; ok {
+			return Resolution{Backend: bt, Instance: inst, Zone: zone, Decision: DecisionRequisite}, nil
 		}
 	}
 
 	// No usable topology: fall back to the configured default.
 	if inst := d.cfg.Defaults[bt]; inst != "" {
 		zone := d.cfg.Instances[bt][inst]
-		return Resolution{Backend: bt, Instance: inst, Zone: zone}, nil
+		return Resolution{Backend: bt, Instance: inst, Zone: zone, Decision: DecisionDefault}, nil
 	}
 
 	// As a last resort with a single instance, the choice is unambiguous.
 	if len(zi) == 1 {
 		for zone, inst := range zi {
-			return Resolution{Backend: bt, Instance: inst, Zone: zone}, nil
+			return Resolution{Backend: bt, Instance: inst, Zone: zone, Decision: DecisionSingleInstance}, nil
 		}
 	}
 
