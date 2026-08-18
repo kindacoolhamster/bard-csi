@@ -1,0 +1,329 @@
+# Merge this overlay into the operator's kube-prometheus-stack values.
+# It is not a standalone values file for the Bard CSI chart.
+#
+# CSIStorageCapacity is a built-in Kubernetes API type, not a CRD.  The
+# kube-state-metrics CustomResourceState feature deliberately does not watch
+# built-in types, so the capacity metric below is produced by the small,
+# read-only exporter in extraManifests instead.
+
+# The exporter polls the built-in CSIStorageCapacity list through the in-cluster
+# API, retaining the last successful snapshot between scrapes.  The image is
+# version-pinned; replace it with an approved digest in restricted environments.
+extraManifests:
+  - |
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: bard-csi-capacity-exporter
+      namespace: {{ .Release.Namespace | quote }}
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    data:
+      exporter.py: |
+        #!/usr/bin/env python3
+        import json
+        import os
+        import re
+        import ssl
+        import sys
+        import threading
+        import time
+        from decimal import Decimal, InvalidOperation
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import quote
+        from urllib.request import Request, urlopen
+
+        METRIC = "kube_customresource_csistoragecapacity_capacity_bytes"
+        API_HOST = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+        API_PORT = os.environ.get("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+        TOKEN_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        CA_FILE = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        LIST_INTERVAL = 30
+        QUANTITY_RE = re.compile(
+            r"^([+-]?(?:[0-9]+(?:[.][0-9]*)?|[.][0-9]+)(?:[eE][+-]?[0-9]+)?)([A-Za-z]*)$"
+        )
+        SUFFIXES = {
+            "": Decimal("1"),
+            "m": Decimal("0.001"),
+            "k": Decimal("1000"),
+            "K": Decimal("1000"),
+            "M": Decimal("1000000"),
+            "G": Decimal("1000000000"),
+            "T": Decimal("1000000000000"),
+            "P": Decimal("1000000000000000"),
+            "E": Decimal("1000000000000000000"),
+            "Ki": Decimal(1024),
+            "Mi": Decimal(1024**2),
+            "Gi": Decimal(1024**3),
+            "Ti": Decimal(1024**4),
+            "Pi": Decimal(1024**5),
+            "Ei": Decimal(1024**6),
+        }
+        lock = threading.Lock()
+        payload = (
+            "# HELP " + METRIC + " Provisionable capacity published by the CSI driver" + chr(10)
+            + "# TYPE " + METRIC + " gauge" + chr(10)
+        )
+        ready = False
+
+        def quantity_bytes(raw):
+            if raw is None:
+                return None
+            text = str(raw).strip()
+            match = QUANTITY_RE.fullmatch(text)
+            if not match or match.group(2) not in SUFFIXES:
+                raise ValueError("unsupported Kubernetes quantity: " + text)
+            try:
+                value = Decimal(match.group(1)) * SUFFIXES[match.group(2)]
+            except InvalidOperation as exc:
+                raise ValueError("invalid Kubernetes quantity: " + text) from exc
+            rendered = format(value, "f")
+            if "." in rendered:
+                rendered = rendered.rstrip("0").rstrip(".")
+            return rendered or "0"
+
+        def escape_label(value):
+            slash = chr(92)
+            return str(value).replace(slash, slash + slash).replace(chr(10), slash + "n").replace('"', slash + '"')
+
+        def list_capacities():
+            items = []
+            continuation = None
+            context = ssl.create_default_context(cafile=CA_FILE)
+            while True:
+                url = (
+                    "https://" + API_HOST + ":" + API_PORT
+                    + "/apis/storage.k8s.io/v1/csistoragecapacities?limit=500"
+                )
+                if continuation:
+                    url += "&continue=" + quote(continuation, safe="")
+                with open(TOKEN_FILE, "r", encoding="utf-8") as token_file:
+                    token = token_file.read().strip()
+                request = Request(url, headers={"Authorization": "Bearer " + token})
+                with urlopen(request, context=context, timeout=10) as response:
+                    document = json.load(response)
+                items.extend(document.get("items", []))
+                continuation = (document.get("metadata") or {}).get("continue")
+                if not continuation:
+                    return items
+
+        def render(items):
+            lines = [
+                "# HELP " + METRIC + " Provisionable capacity published by the CSI driver",
+                "# TYPE " + METRIC + " gauge",
+            ]
+            for item in items:
+                metadata = item.get("metadata") or {}
+                value = quantity_bytes(item.get("capacity"))
+                if value is None:
+                    continue
+                topology = item.get("nodeTopology") or {}
+                match_labels = topology.get("matchLabels") or {}
+                labels = {
+                    "storageclass": item.get("storageClassName", ""),
+                    "namespace": metadata.get("namespace", ""),
+                    "object": metadata.get("name", ""),
+                    "zone": match_labels.get("topology.csi.bard.io/zone", ""),
+                }
+                label_text = ",".join(
+                    name + '=\"' + escape_label(labels[name]) + '\"'
+                    for name in ("storageclass", "namespace", "object", "zone")
+                )
+                lines.append(METRIC + "{" + label_text + "} " + value)
+            return "\n".join(lines) + "\n"
+
+        def refresh_loop():
+            global payload, ready
+            while True:
+                try:
+                    new_payload = render(list_capacities())
+                    with lock:
+                        payload = new_payload
+                        ready = True
+                except Exception as exc:
+                    print("capacity list failed: " + str(exc), file=sys.stderr, flush=True)
+                time.sleep(LIST_INTERVAL)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/healthz":
+                    self.send_body(200, "ok\n", "text/plain; version=0.0.4")
+                    return
+                if path == "/readyz":
+                    with lock:
+                        is_ready = ready
+                    self.send_body(200 if is_ready else 503, "ready\n" if is_ready else "warming up\n", "text/plain; version=0.0.4")
+                    return
+                if path == "/metrics":
+                    with lock:
+                        body = payload
+                    self.send_body(200, body, "text/plain; version=0.0.4; charset=utf-8")
+                    return
+                self.send_body(404, "not found\n", "text/plain; version=0.0.4")
+
+            def send_body(self, status, body, content_type):
+                encoded = body.encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def log_message(self, _format, *_args):
+                return
+
+        if __name__ == "__main__":
+            threading.Thread(target=refresh_loop, daemon=True).start()
+            ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    ---
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: bard-csi-capacity-exporter
+      namespace: {{ .Release.Namespace | quote }}
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    automountServiceAccountToken: true
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRole
+    metadata:
+      name: bard-csi-capacity-exporter
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    rules:
+      - apiGroups: ["storage.k8s.io"]
+        resources: ["csistoragecapacities"]
+        verbs: ["list"]
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    metadata:
+      name: bard-csi-capacity-exporter
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: bard-csi-capacity-exporter
+    subjects:
+      - kind: ServiceAccount
+        name: bard-csi-capacity-exporter
+        namespace: {{ .Release.Namespace | quote }}
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: bard-csi-capacity-exporter
+      namespace: {{ .Release.Namespace | quote }}
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: bard-csi-capacity-exporter
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: bard-csi-capacity-exporter
+            app.kubernetes.io/part-of: bard-observability
+        spec:
+          serviceAccountName: bard-csi-capacity-exporter
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: exporter
+              image: python:3.13.7-alpine3.22
+              imagePullPolicy: IfNotPresent
+              command: ["python3", "/opt/exporter/exporter.py"]
+              env:
+                - name: PYTHONDONTWRITEBYTECODE
+                  value: "1"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              ports:
+                - name: metrics
+                  containerPort: 8080
+              readinessProbe:
+                httpGet:
+                  path: /readyz
+                  port: metrics
+                periodSeconds: 10
+                timeoutSeconds: 3
+              livenessProbe:
+                httpGet:
+                  path: /healthz
+                  port: metrics
+                periodSeconds: 30
+                timeoutSeconds: 3
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: exporter-script
+                  mountPath: /opt/exporter
+                  readOnly: true
+          volumes:
+            - name: exporter-script
+              configMap:
+                name: bard-csi-capacity-exporter
+                defaultMode: 0444
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: bard-csi-capacity-exporter
+      namespace: {{ .Release.Namespace | quote }}
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+    spec:
+      type: ClusterIP
+      selector:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+      ports:
+        - name: metrics
+          port: 8080
+          targetPort: metrics
+    ---
+    apiVersion: monitoring.coreos.com/v1
+    kind: ServiceMonitor
+    metadata:
+      name: bard-csi-capacity-exporter
+      namespace: {{ .Release.Namespace | quote }}
+      labels:
+        app.kubernetes.io/name: bard-csi-capacity-exporter
+        app.kubernetes.io/part-of: bard-observability
+        release: {{ .Release.Name | quote }}
+    spec:
+      namespaceSelector:
+        matchNames:
+          - {{ .Release.Namespace | quote }}
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: bard-csi-capacity-exporter
+      endpoints:
+        - port: metrics
+          path: /metrics
+          interval: 30s
+          scrapeTimeout: 10s

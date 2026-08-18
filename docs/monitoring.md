@@ -108,16 +108,28 @@ return anything.
 
 ## Volume usage comes from kubelet, not Bard
 
-Bard implements `NodeGetVolumeStats` with `VolumeCondition`, so kubelet already
-exports per-PVC usage without any Bard-side metric:
+Bard's node core advertises the CSI `VOLUME_CONDITION` capability and implements
+`NodeGetVolumeStats` with `VolumeCondition`, so kubelet can export per-PVC usage
+and health without any Bard-side metric:
 
 - `kubelet_volume_stats_used_bytes` / `_capacity_bytes` / `_available_bytes`
 - `kubelet_volume_stats_inodes_used` / `_inodes_free`
 - `kubelet_volume_stats_health_status_abnormal` — driven by the `VolumeCondition`
   Bard returns
 
-The dashboard's "fullest volumes" and "abnormal volume conditions" panels use
-these directly. Duplicating them in the driver would be strictly worse.
+Kubernetes 1.36 still treats the kubelet `CSIVolumeHealth` feature gate as alpha
+and defaults it to false. Confirm it on every kubelet with
+`kubernetes_feature_enabled{name="CSIVolumeHealth"}`: a value of `0` explains an
+absent health series. Once the gate is enabled, healthy supported volumes export
+`_health_status_abnormal` with value `0`, while abnormal volumes export `1`. An
+absent health series means health telemetry is unavailable (or no volume has
+been sampled), never that every volume is healthy.
+
+The dashboard's "fullest volumes" and "volume health condition" panels use
+these directly. The usage table normalizes the `exported_namespace` label that
+some Kubernetes distributions add, de-duplicates by namespace and PVC, and
+shows used bytes, capacity bytes, and their ratio. Duplicating these metrics in
+the driver would be strictly worse.
 
 **These are cluster-wide, not Bard-only.** Kubelet does not label volume stats by
 CSI driver, so those two panels show every driver's volumes. Narrowing them needs a
@@ -152,42 +164,29 @@ that with worse semantics — in particular it could not honour a StorageClass t
 overrides `pool`, and would cheerfully report a healthy default pool while every
 provision through that class failed.
 
-The dashboard's capacity panel therefore reads
-`kube_customresource_csistoragecapacity_capacity_bytes`, which requires
-kube-state-metrics configured with a
+The dashboard's capacity panel reads
+`kube_customresource_csistoragecapacity_capacity_bytes`. `CSIStorageCapacity` is
+a built-in `storage.k8s.io` API type, not a CRD, so kube-state-metrics'
 [CustomResourceState](https://github.com/kubernetes/kube-state-metrics/blob/main/docs/metrics/extend/customresourcestate-metrics.md)
-for `CSIStorageCapacity`. Without it the panel is simply empty; everything else on
-the dashboard works.
+collector cannot produce this series for it. The example
+[`kube-prometheus-stack-values.yaml`](../deploy/examples/observability/kube-prometheus-stack-values.yaml)
+therefore adds a small, non-root exporter through `extraManifests`. It polls the
+in-cluster API every 30 seconds with a ServiceAccount allowed only to list
+`csistoragecapacities`, and exposes the exact metric through a ClusterIP Service
+and ServiceMonitor. If that overlay is not installed, the capacity panel is
+simply empty; everything else on the dashboard works.
 
-The panel groups by **StorageClass, not backend instance**. A `CSIStorageCapacity`
-object identifies its scope with a node-topology *selector*, which has no bounded
-label form, so the exporter config below emits `storageclass` only. A starting
-point (**adapt to your kube-state-metrics version — this has not been exercised in
-this repo's test tiers**):
+The panel groups by **StorageClass and Bard zone, not backend instance**. A
+`CSIStorageCapacity` object identifies its scope with a node-topology selector,
+so the exporter preserves the useful StorageClass, namespace, object, and Bard
+zone labels. It emits one gauge per object; the dashboard's `max by
+(storageclass, zone)` avoids double-counting multiple objects in one zone.
 
-```yaml
-kind: CustomResourceStateMetrics
-spec:
-  resources:
-    - groupVersionKind:
-        group: storage.k8s.io
-        version: v1
-        kind: CSIStorageCapacity
-      metricNamePrefix: kube_customresource
-      metrics:
-        - name: csistoragecapacity_capacity_bytes
-          help: Provisionable capacity published by the CSI driver
-          each:
-            type: Gauge
-            gauge:
-              path: [capacity]
-          labelsFromPath:
-            storageclass: [storageClassName]
-            namespace: [metadata, namespace]
-```
-
-Without kube-state-metrics, `kubectl get csistoragecapacity -A` shows the same
-data directly.
+Without the capacity exporter, `kubectl get csistoragecapacity -A` shows the
+same data directly. When a backend cannot report capacity, Bard returns
+`math.MaxInt64` (`9223372036854775807`) as an effectively-unlimited sentinel;
+the dashboard maps values `>=9e18` to `Unreported` instead of displaying an
+exabyte-sized capacity.
 
 ## Drift metrics are not exported (yet)
 
@@ -204,7 +203,9 @@ material. It is deliberately **not** wired to metrics yet:
   inside the availability-critical provisioning path is not something to add
   casually.
 
-Run it on demand instead. Exporting it properly is tracked as follow-up work.
+Run it on demand instead. Exporting it safely is tracked in the repository as
+[Safe drift-metrics exporter](../STATUS.md#safe-drift-metrics-exporter); it is not
+implemented yet.
 
 ## Caveats
 

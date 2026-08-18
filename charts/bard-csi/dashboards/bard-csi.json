@@ -243,7 +243,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "p99 handler latency per CSI method.",
+      "description": "p99 handler latency per active CSI method. Capability, plugin-info, and node-info calls are startup/discovery traffic; their p99 is intentionally absent when the selected rate window has no observations, never a fabricated zero.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -284,7 +284,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (method, le) (rate(bard_csi_grpc_request_duration_seconds_bucket{namespace=~\"$namespace\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (method, le) (rate(bard_csi_grpc_request_duration_seconds_bucket{namespace=~\"$namespace\"}[$__rate_interval]))) and on (method) (sum by (method) (rate(bard_csi_grpc_request_duration_seconds_count{namespace=~\"$namespace\"}[$__rate_interval])) > 0)",
           "legendFormat": "{{method}}",
           "range": true,
           "refId": "A"
@@ -540,7 +540,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 33 },
       "id": 11,
       "options": {
         "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "right", "showLegend": true },
@@ -561,48 +561,95 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Fullest volumes from kubelet's own stats (Bard implements NodeGetVolumeStats, so this needs no Bard-side metric). NOTE: kubelet does not label these by CSI driver, so this is CLUSTER-WIDE across every driver, not Bard-only. docs/monitoring.md has the kube-state-metrics join that narrows it to Bard PVs.",
+      "description": "Human-readable top-20 volume usage from kubelet's own stats (Bard implements NodeGetVolumeStats, so this needs no Bard-side metric). Namespace and PVC identify each row; Used and Capacity are kubelet-reported IEC bytes, and Usage is the ratio. Kubelet does not label these by CSI driver, so this remains CLUSTER-WIDE across every driver. localpath reports backing-filesystem usage, not the requested PVC quota.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "gauge" },
-            "inspect": false
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Namespace" },
+            "properties": [{ "id": "custom.width", "value": 210 }]
           },
-          "mappings": [],
-          "max": 1,
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 0.8 },
-              { "color": "red", "value": 0.9 }
+          {
+            "matcher": { "id": "byName", "options": "PVC" },
+            "properties": [{ "id": "custom.width", "value": 230 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Used" },
+            "properties": [
+              { "id": "custom.width", "value": 140 },
+              { "id": "unit", "value": "bytes" }
             ]
           },
-          "unit": "percentunit"
-        },
-        "overrides": []
+          {
+            "matcher": { "id": "byName", "options": "Capacity" },
+            "properties": [
+              { "id": "custom.width", "value": 160 },
+              { "id": "unit", "value": "bytes" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Usage" },
+            "properties": [
+              { "id": "custom.width", "value": 200 },
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              { "id": "max", "value": 1 },
+              { "id": "min", "value": 0 },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.8 }, { "color": "red", "value": 0.9 }] } },
+              { "id": "unit", "value": "percentunit" }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 41 },
       "id": 12,
       "options": {
         "cellHeight": "sm",
         "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
         "showHeader": true,
-        "sortBy": [{ "desc": true, "displayName": "Value" }]
+        "sortBy": [{ "desc": true, "displayName": "Usage" }]
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "topk(20, kubelet_volume_stats_used_bytes / clamp_min(kubelet_volume_stats_capacity_bytes, 1))",
+          "expr": "label_join(topk(20, max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_used_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")) / clamp_min(max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_capacity_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")), 1)), \"volume\", \"/\", \"namespace\", \"persistentvolumeclaim\")",
           "format": "table",
           "instant": true,
-          "legendFormat": "{{persistentvolumeclaim}}",
           "range": false,
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (volume) (label_join((max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_used_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")) and on (namespace, persistentvolumeclaim) topk(20, max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_used_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")) / clamp_min(max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_capacity_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")), 1))), \"volume\", \"/\", \"namespace\", \"persistentvolumeclaim\"))",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "editorMode": "code",
+          "expr": "max by (volume) (label_join((max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_capacity_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")) and on (namespace, persistentvolumeclaim) topk(20, max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_used_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")) / clamp_min(max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_capacity_bytes, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\")), 1))), \"volume\", \"/\", \"namespace\", \"persistentvolumeclaim\"))",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "C"
+        }
+      ],
+      "transformations": [
+        { "id": "joinByField", "options": { "byField": "volume", "mode": "outerTabular" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "volume": true },
+            "indexByName": { "namespace": 0, "persistentvolumeclaim": 1, "Value #B": 2, "Value #C": 3, "Value #A": 4 },
+            "renameByName": { "namespace": "Namespace", "persistentvolumeclaim": "PVC", "Value #A": "Usage", "Value #B": "Used", "Value #C": "Capacity" }
+          }
         }
       ],
       "title": "Fullest volumes, all drivers (top 20)",
@@ -610,7 +657,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Volumes kubelet reports as abnormal via the CSI VolumeCondition a driver returns from NodeGetVolumeStats. Cluster-wide across every CSI driver -- kubelet does not label these by driver.",
+      "description": "Kubelet-reported CSI VolumeCondition values, including healthy zeroes. Requires the Kubernetes CSIVolumeHealth feature (alpha and disabled by default as of Kubernetes 1.36); true no data means health telemetry is unavailable or no volume has been sampled, not that all volumes are healthy. Cluster-wide across every CSI driver.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -641,7 +688,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
       "id": 13,
       "options": {
         "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -651,66 +698,75 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "kubelet_volume_stats_health_status_abnormal > 0",
+          "expr": "max by (namespace, persistentvolumeclaim) (label_replace(kubelet_volume_stats_health_status_abnormal, \"namespace\", \"$1\", \"exported_namespace\", \"(.+)\"))",
           "legendFormat": "{{namespace}}/{{persistentvolumeclaim}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Abnormal volume conditions, all drivers",
+      "title": "Volume health condition, all drivers (0 = healthy)",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Provisionable capacity per StorageClass, from the CSIStorageCapacity objects the external-provisioner publishes (storageCapacity: true, on by default). NOT per backend instance: CSIStorageCapacity identifies its scope by a node-topology selector, which has no bounded label form, so the exporter config in docs/monitoring.md emits storageclass only. REQUIRES kube-state-metrics with that CustomResourceState config; empty otherwise. Bard emits no capacity metric of its own.",
+      "description": "Provisionable capacity by StorageClass and Bard zone, from CSIStorageCapacity objects published by external-provisioner (storageCapacity: true, on by default). Requires the CSIStorageCapacity exporter configured by deploy/examples/observability/kube-prometheus-stack-values.yaml; empty otherwise. Bard's math.MaxInt64 sentinel means capacity is unreported (for example localpath), not 8 EiB of physical space.",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "bytes"
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "inspect": false },
+          "mappings": []
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "StorageClass" },
+            "properties": [{ "id": "custom.width", "value": 220 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Zone" },
+            "properties": [{ "id": "custom.width", "value": 100 }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Capacity" },
+            "properties": [
+              { "id": "mappings", "value": [{ "options": { "from": 9000000000000000000, "result": { "text": "Unreported" }, "to": 9223372036854775807 }, "type": "range" }] },
+              { "id": "custom.width", "value": 140 },
+              { "id": "unit", "value": "bytes" }
+            ]
+          }
+        ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
       "id": 14,
       "options": {
-        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "right", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "cellHeight": "sm",
+        "footer": { "countRows": false, "fields": "", "reducer": ["sum"], "show": false },
+        "showHeader": true,
+        "sortBy": [{ "desc": true, "displayName": "Capacity" }]
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "editorMode": "code",
-          "expr": "sum by (storageclass) (kube_customresource_csistoragecapacity_capacity_bytes)",
-          "legendFormat": "{{storageclass}}",
-          "range": true,
+          "expr": "max by (storageclass, zone) (kube_customresource_csistoragecapacity_capacity_bytes)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{storageclass}} / {{zone}}",
+          "range": false,
           "refId": "A"
         }
       ],
-      "title": "Provisionable capacity by StorageClass (needs kube-state-metrics)",
-      "type": "timeseries"
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true },
+            "indexByName": { "storageclass": 0, "zone": 1, "Value": 2 },
+            "renameByName": { "storageclass": "StorageClass", "zone": "Zone", "Value": "Capacity" }
+          }
+        }
+      ],
+      "title": "Provisionable capacity by StorageClass / zone",
+      "type": "table"
     }
   ],
   "preload": false,
