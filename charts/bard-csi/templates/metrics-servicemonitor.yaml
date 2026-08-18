@@ -40,6 +40,7 @@ spec:
     - port: {{ $port }}
       path: /metrics
       interval: {{ $sm.interval }}
+      honorLabels: true
       {{- with $sm.scrapeTimeout }}
       scrapeTimeout: {{ . }}
       {{- end }}

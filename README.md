@@ -189,7 +189,8 @@ looking like healthy provisioning. See [docs/monitoring.md](docs/monitoring.md).
 
 ```sh
 helm upgrade --install bard-csi ... --set metrics.enabled=true \
-  --set metrics.serviceMonitor.enabled=true --set metrics.dashboard.enabled=true
+  --set metrics.serviceMonitor.enabled=true --set metrics.podMonitor.enabled=true \
+  --set metrics.dashboard.enabled=true
 ```
 
 ## Status

@@ -88,6 +88,81 @@ jobs:
           echo "$node" | grep -q -- "--metrics-addr=:9815" || { echo "node core has no --metrics-addr"; exit 1; }
           echo "$node" | grep -q "containerPort: 9815" || { echo "node core declares no metrics containerPort"; exit 1; }
 
+          # Disabling the liveness sidecar must also remove the core's healthz
+          # declaration and probe. Metrics remain independently renderable, even
+          # when they intentionally use the former healthz port.
+          no_liveness=$(helm template bard charts/bard-csi \
+            --set metrics.enabled=true --set metrics.port=9808 \
+            --set sidecars.livenessProbe.enabled=false \
+            --show-only templates/controller.yaml)
+          echo "$no_liveness" | grep -q -- "--metrics-addr=:9808" \
+            || { echo "metrics did not render with liveness disabled"; exit 1; }
+          echo "$no_liveness" | grep -qE '^[[:space:]]+- name: metrics$' \
+            || { echo "metrics containerPort is missing with liveness disabled"; exit 1; }
+          echo "$no_liveness" | grep -q "containerPort: 9808" \
+            || { echo "metrics containerPort has the wrong value with liveness disabled"; exit 1; }
+          if echo "$no_liveness" | grep -q "name: liveness-probe"; then
+            echo "liveness-probe sidecar rendered while disabled"; exit 1
+          fi
+          if echo "$no_liveness" | grep -q "name: healthz"; then
+            echo "healthz containerPort rendered while liveness is disabled"; exit 1
+          fi
+          if echo "$no_liveness" | grep -q "path: /healthz"; then
+            echo "Kubernetes healthz probe rendered while liveness is disabled"; exit 1
+          fi
+
+          # The controller and node Pods have separate network namespaces by
+          # default, so each cross-plane csi-addons port is safe to reuse.
+          helm template bard charts/bard-csi --set metrics.enabled=true \
+            --set sidecars.csiAddons.enabled=true --set metrics.port=9070 >/dev/null
+          helm template bard charts/bard-csi --set metrics.enabled=true \
+            --set sidecars.csiAddons.enabled=true --set metrics.nodePort=9071 >/dev/null
+          # A node-only hostNetwork profile (Ceph RBD) still leaves the controller
+          # Pod isolated, so it must not turn a safe cross-plane reuse into a failure.
+          helm template bard charts/bard-csi --set metrics.enabled=true \
+            --set sidecars.csiAddons.enabled=true --set metrics.nodePort=9071 \
+            --set plugins.ceph-rbd.enabled=true \
+            --set-json 'plugins.ceph-rbd.instances={"galileo":{"monitors":["192.0.2.1:3300"],"pool":"k8s-csi-test","user":"k8s-csi-test","default":true}}' >/dev/null
+
+          # Metrics listeners also must not take fixed same-Pod ports. These
+          # checks assert the actionable reason, not just that Helm rejected the
+          # render, because a generic failure could be an unrelated chart bug.
+          expect_reserved_collision() {
+            local label="$1"
+            local needle="$2"
+            shift 2
+            local err
+            if err=$(helm template bard charts/bard-csi "$@" 2>&1 >/dev/null); then
+              echo "${label}: reserved-port guard did not fire"; exit 1
+            fi
+            echo "$err" | grep -Fq "$needle" || {
+              echo "${label}: reserved-port guard named the wrong reason:"; echo "$err"; exit 1;
+            }
+          }
+
+          expect_reserved_collision "metrics.port vs liveness" \
+            "sidecars.livenessProbe health port" \
+            --set metrics.enabled=true --set sidecars.livenessProbe.enabled=true --set metrics.port=9808
+          expect_reserved_collision "metrics.port vs csi-addons controller" \
+            "sidecars.csiAddons controller port" \
+            --set metrics.enabled=true --set sidecars.csiAddons.enabled=true --set metrics.port=9071
+          expect_reserved_collision "metrics.nodePort vs csi-addons node" \
+            "sidecars.csiAddons node controller port" \
+            --set metrics.enabled=true --set sidecars.csiAddons.enabled=true --set metrics.nodePort=9070
+
+          # iSCSI puts both planes on hostNetwork, so the same cross-plane
+          # values must fail with the fixed listener named in the error.
+          expect_reserved_collision "hostNetwork metrics.port vs csi-addons node" \
+            "sidecars.csiAddons node controller port across hostNetwork planes" \
+            --set metrics.enabled=true --set sidecars.csiAddons.enabled=true --set metrics.port=9070 \
+            --set attach.enabled=true --set plugins.iscsi.enabled=true \
+            --set-json 'plugins.iscsi.instances={"galileo":{"vg":"bard-vg","portal":"192.0.2.1:3260","thinPool":"bard-thin","chapAuth":true}}'
+          expect_reserved_collision "hostNetwork metrics.nodePort vs csi-addons controller" \
+            "sidecars.csiAddons controller port across hostNetwork planes" \
+            --set metrics.enabled=true --set sidecars.csiAddons.enabled=true --set metrics.nodePort=9071 \
+            --set attach.enabled=true --set plugins.iscsi.enabled=true \
+            --set-json 'plugins.iscsi.instances={"galileo":{"vg":"bard-vg","portal":"192.0.2.1:3260","thinPool":"bard-thin","chapAuth":true}}'
+
           # The node port must not equal the controller port: a hostNetwork
           # profile (iscsi sets it on BOTH planes) puts them in the same host
           # netns, and the loser silently fails to bind.
@@ -114,6 +189,23 @@ jobs:
           sm=$(helm template bard charts/bard-csi "${on[@]}" --show-only templates/metrics-servicemonitor.yaml \
                | grep -oE "^    - port: metrics[a-z-]*" | awk '{print $3}' | sort)
           [ "$svc" = "$sm" ] || { echo "Service ports and ServiceMonitor endpoints disagree:"; diff <(echo "$svc") <(echo "$sm") || true; exit 1; }
+
+          # Prometheus must preserve Bard's instance/endpoint labels. Assert the
+          # six default controller endpoints and the node endpoint all opt into
+          # honorLabels; a missing one must fail independently of the others.
+          sm_render=$(helm template bard charts/bard-csi "${on[@]}" \
+            --show-only templates/metrics-servicemonitor.yaml)
+          sm_endpoints=$(echo "$sm_render" | grep -cE '^    - port: metrics[a-z-]*$' || true)
+          sm_honor=$(echo "$sm_render" | grep -cE '^      honorLabels: true$' || true)
+          [ "$sm_endpoints" = "6" ] || { echo "expected 6 ServiceMonitor endpoints, got $sm_endpoints"; exit 1; }
+          [ "$sm_honor" = "$sm_endpoints" ] || { echo "every ServiceMonitor endpoint must set honorLabels: true (got $sm_honor/$sm_endpoints)"; exit 1; }
+
+          pm_render=$(helm template bard charts/bard-csi "${on[@]}" \
+            --show-only templates/metrics-podmonitor.yaml)
+          pm_endpoints=$(echo "$pm_render" | grep -cE '^    - port: metrics$' || true)
+          pm_honor=$(echo "$pm_render" | grep -cE '^      honorLabels: true$' || true)
+          [ "$pm_endpoints" = "1" ] || { echo "expected 1 PodMonitor endpoint, got $pm_endpoints"; exit 1; }
+          [ "$pm_honor" = "$pm_endpoints" ] || { echo "PodMonitor endpoint must set honorLabels: true (got $pm_honor/$pm_endpoints)"; exit 1; }
 
           # Metrics off must stay entirely off. Written as `if` rather than
           # `grep -q ... && exit 1`, which under `set -e` aborts the script on the

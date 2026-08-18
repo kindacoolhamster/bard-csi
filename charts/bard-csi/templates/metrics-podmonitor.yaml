@@ -24,6 +24,7 @@ spec:
     - port: metrics
       path: /metrics
       interval: {{ $pm.interval }}
+      honorLabels: true
       relabelings:
         # Carry the node name onto every node-plane series; without it the only
         # identity is a pod name that changes on every DaemonSet roll, which makes

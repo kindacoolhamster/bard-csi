@@ -155,3 +155,12 @@ provisioner retries), and its `export_create` hardcodes the shared target's TPG
 `authentication` attribute to `"0"` with no API to override it, so CHAP
 credentials are never actually enforced; access control on a targetd instance is
 IQN-based ACLs only. Local (targetcli) management supports all three.
+
+## Follow-ups
+
+### Safe drift-metrics exporter
+
+Build a separate, read-only exporter for inspect-derived drift (ghost PVs,
+orphaned backend volumes, topology breakage, and stale attachments), with
+isolated credentials/RBAC, bounded labels, and paginated scans. Keep it outside
+the availability-critical provisioning path. Not implemented.

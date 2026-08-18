@@ -280,19 +280,25 @@ spec:
             - "--metrics-addr=:{{ .Values.metrics.port }}"
             {{- end }}
             - "--v=2"
+          {{- if or .Values.sidecars.livenessProbe.enabled .Values.metrics.enabled }}
           ports:
+            {{- if .Values.sidecars.livenessProbe.enabled }}
             - name: healthz
               containerPort: 9808
+            {{- end }}
             {{- if .Values.metrics.enabled }}
             - name: metrics
               containerPort: {{ .Values.metrics.port }}
             {{- end }}
+          {{- end }}
+          {{- if .Values.sidecars.livenessProbe.enabled }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: healthz
             initialDelaySeconds: 10
             periodSeconds: 60
+          {{- end }}
           {{- with .Values.controller.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

@@ -1,0 +1,329 @@
+# Bard observability dogfood scenarios. These resources deliberately combine
+# healthy CSI traffic with bounded failures and synthetic inspect findings.
+# Use hack/observability-scenarios.sh so waits and cleanup stay deterministic.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bard-observability-scenarios
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    app.kubernetes.io/part-of: bard-csi
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-observability-localpath
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    app.kubernetes.io/part-of: bard-csi
+provisioner: csi.bard.io
+parameters:
+  backend: localpath
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+# CreateVolume reaches Bard but fails dispatch before touching a plugin.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: bard-observability-dispatch-error
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    app.kubernetes.io/part-of: bard-csi
+provisioner: csi.bard.io
+parameters:
+  backend: observability-missing
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bard-observability-steady
+  namespace: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: healthy
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: bard-observability-localpath
+  resources:
+    requests:
+      storage: 64Mi
+---
+# A long-lived mount gives the kubelet volume-stat panels a stable series while
+# writing only a tiny bounded heartbeat file.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bard-observability-steady
+  namespace: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: healthy
+spec:
+  restartPolicy: Always
+  securityContext:
+    fsGroup: 65534
+  containers:
+    - name: heartbeat
+      image: busybox:1.37
+      imagePullPolicy: IfNotPresent
+      command:
+        - /bin/sh
+        - -ceu
+        - |
+          while true; do
+            date -u +%FT%TZ >> /data/heartbeat.log
+            tail -n 64 /data/heartbeat.log > /data/heartbeat.next
+            mv /data/heartbeat.next /data/heartbeat.log
+            sync
+            sleep 30
+          done
+      resources:
+        requests: { cpu: 5m, memory: 8Mi }
+        limits: { cpu: 50m, memory: 32Mi }
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: bard-observability-steady
+---
+# Every run gets a generic ephemeral PVC. Its create/mount/write/unmount/delete
+# lifecycle keeps the placement, CSI RPC, plugin, and sidecar rate panels alive.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bard-observability-churn
+  namespace: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: healthy-churn
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 45
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 180
+      activeDeadlineSeconds: 50
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: bard-observability-scenarios
+            observability.bard.io/scenario: healthy-churn
+        spec:
+          restartPolicy: Never
+          securityContext:
+            fsGroup: 65534
+          containers:
+            - name: io
+              image: busybox:1.37
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -ceu
+                - |
+                  dd if=/dev/zero of=/data/payload bs=1M count=1 conv=fsync
+                  cksum /data/payload
+              resources:
+                requests: { cpu: 5m, memory: 8Mi }
+                limits: { cpu: 50m, memory: 32Mi }
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              ephemeral:
+                volumeClaimTemplate:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/name: bard-observability-scenarios
+                      observability.bard.io/scenario: healthy-churn
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: bard-observability-localpath
+                    resources:
+                      requests:
+                        storage: 32Mi
+---
+# Localpath deliberately rejects volume cloning. A fresh generic ephemeral PVC
+# retries the real failure each minute, so Prometheus sees counter increments
+# rather than one pre-scrape sample that never produces a rate.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bard-observability-unsupported-clone
+  namespace: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: plugin-invalid-argument
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 45
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 40
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 75
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: bard-observability-scenarios
+            observability.bard.io/scenario: plugin-invalid-argument
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: consumer
+              image: busybox:1.37
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c", "sleep 5"]
+              resources:
+                requests: { cpu: 1m, memory: 4Mi }
+                limits: { cpu: 20m, memory: 16Mi }
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              ephemeral:
+                volumeClaimTemplate:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/name: bard-observability-scenarios
+                      observability.bard.io/scenario: plugin-invalid-argument
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: bard-observability-localpath
+                    dataSource:
+                      kind: PersistentVolumeClaim
+                      name: bard-observability-steady
+                    resources:
+                      requests:
+                        storage: 64Mi
+---
+# A fresh generic ephemeral PVC reaches Bard each minute and fails dispatch
+# before any plugin or backend storage is touched.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: bard-observability-dispatch-error
+  namespace: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: dispatch-error
+spec:
+  schedule: "* * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 45
+  successfulJobsHistoryLimit: 0
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 40
+      backoffLimit: 0
+      ttlSecondsAfterFinished: 75
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: bard-observability-scenarios
+            observability.bard.io/scenario: dispatch-error
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: consumer
+              image: busybox:1.37
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "-c", "sleep 5"]
+              resources:
+                requests: { cpu: 1m, memory: 4Mi }
+                limits: { cpu: 20m, memory: 16Mi }
+              volumeMounts:
+                - name: data
+                  mountPath: /data
+          volumes:
+            - name: data
+              ephemeral:
+                volumeClaimTemplate:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/name: bard-observability-scenarios
+                      observability.bard.io/scenario: dispatch-error
+                  spec:
+                    accessModes: ["ReadWriteOnce"]
+                    storageClassName: bard-observability-dispatch-error
+                    resources:
+                      requests:
+                        storage: 32Mi
+---
+# Synthetic inspect fixtures are unclaimed and Retain. Deleting these API
+# objects never asks Bard or localpath to delete backend data.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: bard-observability-unknown-instance
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: inspect-unknown-instance
+spec:
+  capacity:
+    storage: 1Mi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bard-observability-inspect-fixture
+  csi:
+    driver: csi.bard.io
+    volumeHandle: "swsk|1|localpath|observability-retired|demo|missing-volume"
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: bard-observability-malformed-handle
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: inspect-malformed-handle
+spec:
+  capacity:
+    storage: 1Mi
+  accessModes: ["ReadWriteOnce"]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: bard-observability-inspect-fixture
+  csi:
+    driver: csi.bard.io
+    volumeHandle: observability-not-a-bard-handle
+---
+# No external-attacher is installed for localpath, so this inert API object is
+# only consumed by the read-only consistency scanner.
+apiVersion: storage.k8s.io/v1
+kind: VolumeAttachment
+metadata:
+  name: bard-observability-stale-attachment
+  annotations:
+    observability.bard.io/managed-by: bard-observability-scenarios
+  labels:
+    app.kubernetes.io/name: bard-observability-scenarios
+    observability.bard.io/scenario: inspect-stale-attachment
+spec:
+  attacher: csi.bard.io
+  nodeName: bard-observability-retired-node
+  source:
+    persistentVolumeName: bard-observability-retired-pv
