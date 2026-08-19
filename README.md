@@ -156,10 +156,13 @@ Manifests: `00-csidriver`, `05-crd-backendcluster` (the `BackendCluster` CRD),
 `10-rbac`, `20-config` (BackendCluster CRs + the plugin's ConfigMap/Secret),
 `30-controller` (Deployment + provisioner/snapshotter/resizer sidecars),
 `40-node` (DaemonSet + node-driver-registrar), `50-storageclass`
-(StorageClass + VolumeSnapshotClass + VolumeGroupSnapshotClass +
-VolumeAttributesClass). Core reads its backends from the
-BackendCluster CRs at startup (`--config-source=crd`); `--config-source=file`
-keeps the old ConfigMap path for out-of-cluster runs.
+(StorageClass + VolumeSnapshotClass + VolumeAttributesClass). Core reads its
+backends from the BackendCluster CRs at startup (`--config-source=crd`);
+`--config-source=file` keeps the old ConfigMap path for out-of-cluster runs.
+
+Upgrade caveat: operators must delete or clean up CSI group snapshots created by
+the retired implementation before upgrading. The non-conformant GroupController
+service has been withdrawn, with no automated post-upgrade cleanup path.
 
 ## Day-2: the consistency scanner
 

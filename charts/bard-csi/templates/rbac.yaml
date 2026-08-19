@@ -90,18 +90,6 @@ rules:
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshotcontents/status", "volumesnapshots/status"]
     verbs: ["update", "patch"]
-  {{- if .Values.sidecars.snapshotter.groupSnapshots }}
-  # VolumeGroupSnapshot (external-snapshotter v8)
-  - apiGroups: ["groupsnapshot.storage.k8s.io"]
-    resources: ["volumegroupsnapshotclasses"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: ["groupsnapshot.storage.k8s.io"]
-    resources: ["volumegroupsnapshotcontents"]
-    verbs: ["get", "list", "watch", "update", "patch"]
-  - apiGroups: ["groupsnapshot.storage.k8s.io"]
-    resources: ["volumegroupsnapshotcontents/status"]
-    verbs: ["update", "patch"]
-  {{- end }}
   {{- end }}
   # Cross-namespace volume data sources: the provisioner authorizes a PVC's
   # cross-namespace dataSourceRef against Gateway API ReferenceGrants (needs the

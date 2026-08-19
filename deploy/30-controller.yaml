@@ -62,14 +62,11 @@ spec:
             - name: socket-dir
               mountPath: /csi
 
-        # v8 adds VolumeGroupSnapshot support (the group-snapshot feature gate);
-        # it drives the driver's GroupController CreateVolumeGroupSnapshot.
         - name: csi-snapshotter
           image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
-            - "--feature-gates=CSIVolumeGroupSnapshot=true"
             - "--v=2"
           env:
             - name: ADDRESS

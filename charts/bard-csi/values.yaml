@@ -148,10 +148,6 @@ sidecars:
   snapshotter:
     enabled: true
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
-    # -- Enable VolumeGroupSnapshot (adds --feature-gates=CSIVolumeGroupSnapshot
-    # to the sidecar + RBAC). REQUIRES a matching external-snapshotter install:
-    # the group CRDs + a snapshot-controller v8.2.0 with the same gate. See README.
-    groupSnapshots: true
     extraArgs: []
   healthMonitor:
     enabled: true
@@ -347,10 +343,6 @@ storageClasses: []
 
 volumeSnapshotClasses: []
   # - name: bard-rbd-snapshot
-  #   deletionPolicy: Delete
-
-volumeGroupSnapshotClasses: []
-  # - name: bard-rbd-group-snapshot
   #   deletionPolicy: Delete
 
 volumeAttributesClasses: []

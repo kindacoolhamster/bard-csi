@@ -91,8 +91,7 @@ const (
 	// ceph-csi parity. Carried to the node in the volume context.
 	paramMkfsOptions = "mkfsOptions"
 	// paramSnapshotNamePrefix overrides the default "csi-snap-" prefix of the backend
-	// rbd snapshot name (a VolumeSnapshotClass parameter; also honoured on a
-	// VolumeGroupSnapshotClass for group-snapshot members). The snapshot name is
+	// rbd snapshot name (a VolumeSnapshotClass parameter). The snapshot name is
 	// recorded in the snapshot handle, so it threads delete/restore. ceph-csi parity.
 	paramSnapshotNamePrefix = "snapshotNamePrefix"
 	// paramCephLogDir / paramCephLogStrategy control the rbd-nbd client log file
