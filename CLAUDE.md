@@ -595,13 +595,31 @@ leaves the StatefulSet running as the standing workload.
   fscrypt ioctl path is live-only (can't run under the fake runner), like RBD fscrypt.
   Chart: the cephfs profile in `_profiles.tpl` now defines `encryptionMount`/`kmsMount`
   so `plugins.cephfs.encryption`/`kms` wire `--encryption-key-dir`/`--kms-config`.
-- **CSI VolumeGroupSnapshot is withdrawn.** CSI v1.12 requires
-  write-order consistency across every member. Bard's retired implementation
-  composed sequential, independently restorable member snapshots and could not
-  guarantee that contract, so core does not register GroupController. Operators
-  must delete or clean up group snapshots created by the retired implementation
-  before upgrading. This is separate from the supported csi-addons VolumeGroup
-  operations.
+- **CSI VolumeGroupSnapshot is withdrawn -- and the original design traded away
+  the wrong half of the contract.** CSI v1.12 (`spec.md`, CreateVolumeGroupSnapshot)
+  says the group "MUST give a write-order consistency guarantee or fail if that's
+  not possible"; individual member restorability is only a MAY ("any individual
+  snapshot from the group MAY be used as a source"). Bard's retired implementation
+  snapshotted members sequentially (across instances, even) to keep them
+  individually restorable -- i.e. it gave up the MUST to buy the MAY. The honest
+  reading is that BOTH were needed: the MAY is a practical requirement in
+  Kubernetes, since external-snapshotter materialises a member VolumeSnapshot per
+  volume and the ecosystem expects those to restore, but needing it never licensed
+  breaking write-order consistency. "Both, or fail" was the only correct answer, so
+  core no longer registers GroupController.
+  The blocker that drove the original choice is GONE: the old note here said rbd
+  group snapshots are "NOT independently clonable", which was true of
+  `rbd clone <pool>/<img>@<snap>` but stopped being true in **Ceph Squid v19.2.0**
+  -- "Support for cloning from non-user type snapshots is added [...] exposed via
+  the new `--snap-id` option for `rbd clone`". So `rbd group snap create` +
+  `rbd clone --snap-id` satisfies both halves on the Ceph v20 clients/clusters this
+  repo already targets. Costs: single-instance only (no cross-cluster group can
+  have one write-order cut without an external quiesce protocol), plus a
+  min-version gate, group/member journaling, and rollback on partial failure.
+  Cleanup for existing group snapshots is manual because the CO SHALL NOT delete a
+  member via ordinary DeleteSnapshot (`spec.md`, DeleteSnapshot) -- see
+  `docs/upgrade-group-snapshots.md`. Separate from the supported csi-addons
+  VolumeGroup operations.
 - **`profile rbd` grants `osd blocklist add` but NOT `blocklist rm`.** Verified:
   `ceph ... osd blocklist add 1.2.3.4:0/0` succeeds, `... rm` returns EACCES. So
   the single-writer fence path (NodeStage blocklists a stale watcher of an

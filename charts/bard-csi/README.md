@@ -39,6 +39,10 @@ backend instances/zones.
 #        kubectl apply -f "$B/client/config/crd/$c.yaml"; done
 #      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
 #      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
+#      # upstream's manifest pins the controller IMAGE to v8.0.1 even under the
+#      # v8.2.0 tag, so force it to match the sidecar:
+#      kubectl -n kube-system set image deploy/snapshot-controller \
+#        snapshot-controller=registry.k8s.io/sig-storage/snapshot-controller:$V
 #    (from a source checkout, hack/install-snapshotter.sh does exactly this.)
 
 # 2. create the credentials Secret (one cephx key per instance id)
