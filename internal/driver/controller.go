@@ -100,6 +100,9 @@ func (s *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if err != nil {
 		return nil, err
 	}
+	if err := validateContentSourceTarget(res, srcSnap, srcVol); err != nil {
+		return nil, err
+	}
 
 	out, err := be.CreateVolume(ctx, &backend.CreateVolumeRequest{
 		Name:           req.GetName(),
@@ -670,4 +673,32 @@ func contentSource(cs *csi.VolumeContentSource) (snap, vol *volumeid.Handle, err
 		vol = &h
 	}
 	return snap, vol, nil
+}
+
+// validateContentSourceTarget prevents a clone or restore from sending a
+// source handle to a different backend instance than the one selected for the
+// new volume. Backend-native content-source operations use the target
+// connection, so accepting a source from another cluster could address the
+// wrong object or fail after making unsafe assumptions about shared state.
+// Location is intentionally not compared: a backend may validly clone across
+// pools or other backend-defined locations within one instance.
+func validateContentSourceTarget(res dispatch.Resolution, snap, vol *volumeid.Handle) error {
+	check := func(kind string, src *volumeid.Handle) error {
+		if src == nil {
+			return nil
+		}
+		if src.Backend != res.Backend {
+			return status.Errorf(codes.InvalidArgument,
+				"source %s backend %q does not match target backend %q", kind, src.Backend, res.Backend)
+		}
+		if src.Instance != res.Instance {
+			return status.Errorf(codes.InvalidArgument,
+				"source %s instance %q does not match target instance %q", kind, src.Instance, res.Instance)
+		}
+		return nil
+	}
+	if err := check("snapshot", snap); err != nil {
+		return err
+	}
+	return check("volume", vol)
 }
