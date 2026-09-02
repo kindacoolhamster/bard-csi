@@ -120,9 +120,6 @@ spec:
           args:
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
-            {{- if .Values.sidecars.snapshotter.groupSnapshots }}
-            - "--feature-gates=CSIVolumeGroupSnapshot=true"
-            {{- end }}
             {{- range .Values.sidecars.snapshotter.extraArgs }}
             - {{ . | quote }}
             {{- end }}

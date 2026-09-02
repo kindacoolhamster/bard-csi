@@ -134,8 +134,6 @@ func (d *Driver) Run(ctx context.Context, endpoint, csiAddonsEndpoint string) er
 	csi.RegisterIdentityServer(d.srv, &identityServer{driver: d})
 	if d.mode.Controller {
 		csi.RegisterControllerServer(d.srv, &controllerServer{driver: d})
-		// VolumeGroupSnapshot lives in the separate GroupController service.
-		csi.RegisterGroupControllerServer(d.srv, &groupControllerServer{driver: d})
 	}
 	if d.mode.Node {
 		csi.RegisterNodeServer(d.srv, &nodeServer{driver: d})

@@ -253,13 +253,11 @@ persists), force-delete the pod + VolumeAttachment, reschedule to `k3s-server`, 
 the server's NodeStage **blocklists the stale agent watcher** (the exact
 `<agent-ip>:0/<nonce>` shows up in `ceph osd blocklist ls`) before taking over,
 data intact. The blocklist entry auto-expires (~1h); `profile rbd` can't `rm` it.
-**`hack/install-snapshotter.sh`** installs the snap + group CRDs and a
+**`hack/install-snapshotter.sh`** installs the ordinary VolumeSnapshot CRDs and a
 version-matched snapshot-controller, and re-pins the controller image to the
-version arg (default `v8.2.0`) -- upstream's own `setup-snapshot-controller.yaml`
-mispins it to `v8.0.1`, and because Bard's csi-snapshotter sidecar runs the
-group-snapshot gate, that stale controller stalls *plain* snapshots too (the
-VolumeSnapshot sits at `readyToUse: false` until the group CRDs exist AND the
-controller is the matched version).
+version arg (default `v8.2.0`). The upstream v8.2.0
+`setup-snapshot-controller.yaml` pins the image to `v8.0.1`, so the explicit pin
+keeps Bard's snapshotter sidecar and the cluster controller coherent.
 
 **Real-workload RBD resiliency demo (PostgreSQL).** `hack/demo-postgres.yaml` is
 a single-instance Postgres 16 StatefulSet with its data dir on a `bard-rbd` PVC --
@@ -406,8 +404,7 @@ leaves the StatefulSet running as the standing workload.
   plugin does not protect snapshots. Pass `--rbd-default-clone-format 2`: v2 needs
   no protect step and lets the parent snapshot be deleted while clones exist. This
   broke restore-from-snapshot on Ceph 20.2 and hid behind the fake runner (which
-  doesn't model protect) until a live restore surfaced it. The same clone path
-  backs volume-group-snapshot restore.
+  doesn't model protect) until a live restore surfaced it.
 - **Encrypted clone/restore must inherit the source's key.** A clone (`rbd clone`
   from a snapshot, or `rbd cp`) copies the source's LUKS header byte-for-byte, so
   the clone is encrypted under the *source's* passphrase -- but `rbd clone/cp`
@@ -598,31 +595,31 @@ leaves the StatefulSet running as the standing workload.
   fscrypt ioctl path is live-only (can't run under the fake runner), like RBD fscrypt.
   Chart: the cephfs profile in `_profiles.tpl` now defines `encryptionMount`/`kmsMount`
   so `plugins.cephfs.encryption`/`kms` wire `--encryption-key-dir`/`--kms-config`.
-- **rbd group snapshots are not the basis for VolumeGroupSnapshot here.** Verified:
-  `rbd group snap create` makes crash-consistent per-image snapshots in the
-  `group` namespace (`.group.2_...`), but those are NOT independently clonable
-  (`rbd clone` can't find them) -- they're for whole-group rollback. CSI needs each
-  member individually restorable, so Bard's VolumeGroupSnapshot instead snapshots
-  each source volume with the normal CreateSnapshot and bundles them (core's
-  GroupController). Upside: a group can span multiple instances/clusters. Downside:
-  members are sequential, so per-volume crash consistent, not atomic across the
-  group.
-- **VolumeGroupSnapshot needs external-snapshotter v8.2.0, version-matched.** The
-  group CRDs (`groupsnapshot.storage.k8s.io`), the snapshot-controller, and the
-  csi-snapshotter sidecar must all agree on the API version, or nothing is
-  processed (the VGS just sits with empty status, no content created). Gotchas hit
-  live: (1) the v8.2.0 `setup-snapshot-controller.yaml` pins the **v8.0.1** image,
-  which speaks the OLD `v1alpha1` group API and the OLD flag
-  `--enable-volume-group-snapshots` -- it crashloops against the v8.2.0
-  (`v1beta1`) CRDs ("could not find v1alpha1 volumegroupsnapshots"). Bump the
-  snapshot-controller image to **v8.2.0**, whose flag is
-  `--feature-gates=CSIVolumeGroupSnapshot=true` (BETA, default off) -- same gate
-  as the csi-snapshotter sidecar (already set in deploy/30-controller.yaml). (2) A
-  stale OLD-version snapshot-controller pod can keep holding the leader lease after
-  the upgrade and silently ignore group snapshots; make sure only the new pods
-  run. The driver advertises GROUP_CONTROLLER_SERVICE (Identity) + the
-  GroupController service. Live-proven: a 2-PVC group snapshot -> 2 ready member
-  VolumeSnapshots -> each restored to its own PVC with the correct distinct data.
+- **CSI VolumeGroupSnapshot is withdrawn -- and the original design traded away
+  the wrong half of the contract.** CSI v1.12 (`spec.md`, CreateVolumeGroupSnapshot)
+  says the group "MUST give a write-order consistency guarantee or fail if that's
+  not possible"; individual member restorability is only a MAY ("any individual
+  snapshot from the group MAY be used as a source"). Bard's retired implementation
+  snapshotted members sequentially (across instances, even) to keep them
+  individually restorable -- i.e. it gave up the MUST to buy the MAY. The honest
+  reading is that BOTH were needed: the MAY is a practical requirement in
+  Kubernetes, since external-snapshotter materialises a member VolumeSnapshot per
+  volume and the ecosystem expects those to restore, but needing it never licensed
+  breaking write-order consistency. "Both, or fail" was the only correct answer, so
+  core no longer registers GroupController.
+  The blocker that drove the original choice is GONE: the old note here said rbd
+  group snapshots are "NOT independently clonable", which was true of
+  `rbd clone <pool>/<img>@<snap>` but stopped being true in **Ceph Squid v19.2.0**
+  -- "Support for cloning from non-user type snapshots is added [...] exposed via
+  the new `--snap-id` option for `rbd clone`". So `rbd group snap create` +
+  `rbd clone --snap-id` satisfies both halves on the Ceph v20 clients/clusters this
+  repo already targets. Costs: single-instance only (no cross-cluster group can
+  have one write-order cut without an external quiesce protocol), plus a
+  min-version gate, group/member journaling, and rollback on partial failure.
+  Cleanup for existing group snapshots is manual because the CO SHALL NOT delete a
+  member via ordinary DeleteSnapshot (`spec.md`, DeleteSnapshot) -- see
+  `docs/upgrade-group-snapshots.md`. Separate from the supported csi-addons
+  VolumeGroup operations.
 - **`profile rbd` grants `osd blocklist add` but NOT `blocklist rm`.** Verified:
   `ceph ... osd blocklist add 1.2.3.4:0/0` succeeds, `... rm` returns EACCES. So
   the single-writer fence path (NodeStage blocklists a stale watcher of an

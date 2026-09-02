@@ -156,10 +156,17 @@ Manifests: `00-csidriver`, `05-crd-backendcluster` (the `BackendCluster` CRD),
 `10-rbac`, `20-config` (BackendCluster CRs + the plugin's ConfigMap/Secret),
 `30-controller` (Deployment + provisioner/snapshotter/resizer sidecars),
 `40-node` (DaemonSet + node-driver-registrar), `50-storageclass`
-(StorageClass + VolumeSnapshotClass + VolumeGroupSnapshotClass +
-VolumeAttributesClass). Core reads its backends from the
-BackendCluster CRs at startup (`--config-source=crd`); `--config-source=file`
-keeps the old ConfigMap path for out-of-cluster runs.
+(StorageClass + VolumeSnapshotClass + VolumeAttributesClass). Core reads its
+backends from the BackendCluster CRs at startup (`--config-source=crd`);
+`--config-source=file` keeps the old ConfigMap path for out-of-cluster runs.
+
+Upgrade caveat: the non-conformant CSI `VolumeGroupSnapshot` GroupController has
+been withdrawn. If you created CSI group snapshots, clean them up **before**
+upgrading — once the service is gone there is no automated path, and group
+members cannot be reclaimed through the ordinary snapshot API. See
+[docs/upgrade-group-snapshots.md](docs/upgrade-group-snapshots.md), which also
+covers recovery if you have already upgraded and how to find members leaked by a
+group create that failed partway.
 
 ## Day-2: the consistency scanner
 
