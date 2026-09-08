@@ -9,6 +9,20 @@ Call: (include "bard-csi.validate" .) -- pass the ROOT context.
 {{- if and $iscsi.enabled (gt (len (keys ($iscsi.instances | default dict))) 0) (not .Values.attach.enabled) -}}
 {{- fail "plugins.iscsi requires attach.enabled=true (iSCSI is an attach-style backend). NOTE CSIDriver.attachRequired is immutable: on an existing install, kubectl delete csidriver csi.bard.io before upgrading. See charts/bard-csi/README.md." -}}
 {{- end -}}
+{{- /* CSI VolumeGroupSnapshot needs a backend that can cut one write-order-
+     consistent snapshot across volumes. Only the ceph-rbd plugin can (rbd group
+     snap create); the driver itself refuses to advertise the GroupController
+     service without such a backend, so rendering the gate + group RBAC without
+     one would deploy a feature nothing can serve. */ -}}
+{{- if .Values.sidecars.snapshotter.groupSnapshots -}}
+{{- if not .Values.sidecars.snapshotter.enabled -}}
+{{- fail "sidecars.snapshotter.groupSnapshots requires sidecars.snapshotter.enabled=true (the csi-snapshotter sidecar is what drives group snapshots)." -}}
+{{- end -}}
+{{- $cephRbd := index .Values.plugins "ceph-rbd" | default dict -}}
+{{- if not $cephRbd.enabled -}}
+{{- fail "sidecars.snapshotter.groupSnapshots requires a backend that can give a write-order consistency guarantee across volumes; today that is plugins.ceph-rbd (rbd group snap create). Enable it, or set groupSnapshots: false. It also needs Ceph Squid v19.2.0+ and the external-snapshotter group CRDs + a snapshot-controller run with --feature-gates=CSIVolumeGroupSnapshot=true -- see hack/install-snapshotter.sh." -}}
+{{- end -}}
+{{- end -}}
 {{- /* A hostNetwork controller plugin (e.g. iscsi's profile) binds host ports
      (targetcli/LIO portals) and is pinned to one node via controller.nodeSelector,
      so a 2nd replica would either fail to schedule (same host, same ports) or -- on

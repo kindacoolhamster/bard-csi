@@ -148,6 +148,21 @@ sidecars:
   snapshotter:
     enabled: true
     image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+    # -- Enable CSI VolumeGroupSnapshot: snapshot a set of volumes at ONE point in
+    # the write stream (adds --feature-gates=CSIVolumeGroupSnapshot to the sidecar,
+    # the group RBAC, and the volumeGroupSnapshotClasses below). Default OFF, and
+    # it has three prerequisites the chart cannot check for you:
+    #   1. a backend that can honour the write-order guarantee -- today only
+    #      ceph-rbd (`rbd group snap create`); the chart fails the render if no
+    #      such plugin is enabled, and the driver only advertises the
+    #      GroupController service when one is actually registered.
+    #   2. Ceph Squid v19.2.0 or newer on that cluster, so an individual member
+    #      can be restored (`rbd clone --snap-id`). The driver probes for this per
+    #      instance and refuses the group snapshot outright if it is missing.
+    #   3. external-snapshotter installed WITH the group CRDs and a
+    #      snapshot-controller run with the same feature gate (this chart does not
+    #      install the cluster singleton -- see hack/install-snapshotter.sh).
+    groupSnapshots: false
     extraArgs: []
   healthMonitor:
     enabled: true
@@ -343,6 +358,12 @@ storageClasses: []
 
 volumeSnapshotClasses: []
   # - name: bard-rbd-snapshot
+  #   deletionPolicy: Delete
+
+# Rendered only when sidecars.snapshotter.groupSnapshots is enabled (the CRD does
+# not exist otherwise).
+volumeGroupSnapshotClasses: []
+  # - name: bard-rbd-group-snapshot
   #   deletionPolicy: Delete
 
 volumeAttributesClasses: []

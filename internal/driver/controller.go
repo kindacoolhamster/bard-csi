@@ -31,6 +31,8 @@ func toStatus(err error, op string) error {
 		return status.Errorf(codes.InvalidArgument, "%s: %v", op, err)
 	case errors.Is(err, backend.ErrUnsupported):
 		return status.Errorf(codes.Unimplemented, "%s: %v", op, err)
+	case errors.Is(err, backend.ErrFailedPrecondition):
+		return status.Errorf(codes.FailedPrecondition, "%s: %v", op, err)
 	default:
 		return status.Errorf(codes.Internal, "%s: %v", op, err)
 	}

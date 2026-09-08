@@ -39,6 +39,17 @@ type Runner struct {
 	// (live-verified on Ceph 20.2: "image has snapshots with linked clones").
 	trashedSnaps map[string]bool // "spec@snap"
 	nextDev      int
+
+	// rbd consistency groups, and the group snapshots taken over them. An image
+	// belongs to at most one group, which is what makes overlapping member sets a
+	// real constraint rather than a modelling choice.
+	groups     map[string]map[string]bool // "pool/group" -> set of member "pool[/ns]/image"
+	groupSnaps map[string][]string        // "pool/group" -> group snapshot names, in order
+	// memberSnaps records the per-image snapshot each group snapshot cut, keyed
+	// "pool/group@gsnap\x00pool[/ns]/image" -> snap id. A group member snapshot has
+	// no stable name in Ceph, only this numeric id.
+	memberSnaps map[string]int64
+	nextSnapID  int64
 }
 
 // New returns an empty fake runner.
@@ -57,6 +68,10 @@ func New() *Runner {
 		parents:    map[string]string{},
 
 		trashedSnaps: map[string]bool{},
+		groups:       map[string]map[string]bool{},
+		groupSnaps:   map[string][]string{},
+		memberSnaps:  map[string]int64{},
+		nextSnapID:   1,
 	}
 }
 
@@ -129,6 +144,27 @@ func (r *Runner) rbd(args []string) (string, error) {
 		r.images[pos[1]] = flagValueMiB(args, "--size")
 		return "", nil
 	case "clone", "cp":
+		// The flags form addresses a snapshot by NUMERIC ID, which is the only way
+		// to clone a group-member snapshot (Ceph Squid v19.2.0's `rbd clone
+		// --snap-id`); the positional "pool/image@snap" form cannot name one. This
+		// fake models a cluster new enough to support it.
+		if id := flagValue(args, "--snap-id"); id != "" {
+			src := joinSpec(flagValue(args, "--pool"), flagValue(args, "--namespace"), flagValue(args, "--image"))
+			dst := joinSpec(flagValue(args, "--dest-pool"), flagValue(args, "--dest-namespace"), flagValue(args, "--dest"))
+			if _, ok := r.images[src]; !ok {
+				return "", fmt.Errorf("rbd: error opening image %s: (2) No such file or directory", src)
+			}
+			snapID, _ := strconv.ParseInt(id, 10, 64)
+			if !r.hasMemberSnapID(src, snapID) {
+				return "", fmt.Errorf("rbd: error opening snapshot id %s: (2) No such file or directory", id)
+			}
+			if _, ok := r.images[dst]; ok {
+				return "", fmt.Errorf("rbd: image %s already exists", dst)
+			}
+			r.images[dst] = r.images[src]
+			r.parents[dst] = src
+			return "", nil
+		}
 		// clone/cp <parent[@snap]> <dest>: inherit the parent's size. A `clone` is a
 		// COW child (records the parent for clone-depth tracking, inheriting the
 		// parent's own parent depth); a `cp` is an independent full copy (no parent).
@@ -286,10 +322,22 @@ func (r *Runner) rbd(args []string) (string, error) {
 			}
 		case "ls":
 			// ls <pool/image>: JSON array of {name,size} for that image's snaps.
+			// With --all it also lists non-user snapshots -- for a group member,
+			// Ceph's synthetic ".group.*" name plus the namespace that identifies
+			// which group snapshot cut it, and the numeric id (its only stable
+			// identity, since `group snap rm` renames it into the trash namespace).
 			img := pos[2]
+			type nsJSON struct {
+				Type      string `json:"type"`
+				Pool      string `json:"pool"`
+				Group     string `json:"group"`
+				GroupSnap string `json:"group snap"` // real rbd emits a literal space in this key, not an underscore -- verified live vs Ceph Tentacle v20.2.0
+			}
 			type snapJSON struct {
-				Name string `json:"name"`
-				Size int64  `json:"size"`
+				ID        int64   `json:"id,omitempty"`
+				Name      string  `json:"name"`
+				Size      int64   `json:"size"`
+				Namespace *nsJSON `json:"namespace,omitempty"`
 			}
 			var out []snapJSON
 			for spec := range r.snaps {
@@ -297,14 +345,216 @@ func (r *Runner) rbd(args []string) (string, error) {
 					out = append(out, snapJSON{Name: snap, Size: r.images[img] * (1 << 20)})
 				}
 			}
+			if contains(args, "--all") {
+				for key, id := range r.memberSnaps {
+					gsnap, member, ok := strings.Cut(key, "\x00")
+					if !ok || member != img {
+						continue
+					}
+					groupSpec, name, ok := strings.Cut(gsnap, "@")
+					if !ok {
+						continue
+					}
+					pool, _, group := splitSpec(groupSpec)
+					out = append(out, snapJSON{
+						ID:        id,
+						Name:      fmt.Sprintf(".group.%s_%d", group, id),
+						Size:      r.images[img] * (1 << 20),
+						Namespace: &nsJSON{Type: "group", Pool: pool, Group: group, GroupSnap: name},
+					})
+				}
+			}
 			sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 			b, _ := json.Marshal(out)
 			return string(b), nil
 		}
 		return "", nil
+	case "group":
+		return r.group(pos)
 	default:
 		return "", fmt.Errorf("fakerun: rbd: unhandled subcommand %q", pos[0])
 	}
+}
+
+// group models `rbd group ...`: consistency groups, their membership, and the
+// group snapshots taken over them. pos is the positional argument list, so
+// pos[0] is always "group".
+func (r *Runner) group(pos []string) (string, error) {
+	if len(pos) < 2 {
+		return "", fmt.Errorf("fakerun: rbd group: no subcommand")
+	}
+	switch pos[1] {
+	case "create": // group create <pool/group>
+		if _, ok := r.groups[pos[2]]; ok {
+			return "", fmt.Errorf("rbd: group %s already exists", pos[2])
+		}
+		r.groups[pos[2]] = map[string]bool{}
+		return "", nil
+	case "remove": // group remove <pool/group>
+		if _, ok := r.groups[pos[2]]; !ok {
+			return "", fmt.Errorf("rbd: error opening group %s: (2) No such file or directory", pos[2])
+		}
+		// Disbanding a group leaves its member images alone.
+		delete(r.groups, pos[2])
+		delete(r.groupSnaps, pos[2])
+		return "", nil
+	case "list": // group list <pool>
+		names := []string{}
+		for g := range r.groups {
+			if pool, _, name := splitSpec(g); pool == pos[2] {
+				names = append(names, name)
+			}
+		}
+		sort.Strings(names)
+		out, _ := json.Marshal(names)
+		return string(out), nil
+	case "image":
+		return r.groupImage(pos)
+	case "snap":
+		return r.groupSnap(pos)
+	}
+	return "", fmt.Errorf("fakerun: rbd group: unhandled subcommand %q", pos[1])
+}
+
+// groupImage models `rbd group image add|rm|list`.
+func (r *Runner) groupImage(pos []string) (string, error) {
+	if len(pos) < 4 {
+		return "", fmt.Errorf("fakerun: rbd group image: missing arguments")
+	}
+	switch pos[2] {
+	case "add": // group image add <pool/group> <pool/image>
+		g, img := pos[3], pos[4]
+		if _, ok := r.groups[g]; !ok {
+			return "", fmt.Errorf("rbd: error opening group %s: (2) No such file or directory", g)
+		}
+		// An image belongs to at most ONE group, and rbd reports both "already in
+		// THIS group" and "already in ANOTHER group" as the same EEXIST. That
+		// ambiguity is why the plugin verifies membership after adding rather than
+		// trusting an already-exists error to mean success.
+		for other, members := range r.groups {
+			if members[img] {
+				_ = other
+				return "", fmt.Errorf("rbd: add image error: (17) File exists")
+			}
+		}
+		r.groups[g][img] = true
+		return "", nil
+	case "rm": // group image rm <pool/group> <pool/image>
+		g, img := pos[3], pos[4]
+		if !r.groups[g][img] {
+			return "", fmt.Errorf("rbd: remove image error: (2) No such file or directory")
+		}
+		delete(r.groups[g], img)
+		return "", nil
+	case "list": // group image list <pool/group>
+		g := pos[3]
+		if _, ok := r.groups[g]; !ok {
+			return "", fmt.Errorf("rbd: error opening group %s: (2) No such file or directory", g)
+		}
+		type ent struct {
+			Pool      string `json:"pool"`
+			Namespace string `json:"namespace"`
+			Image     string `json:"image"`
+		}
+		out := []ent{}
+		for img := range r.groups[g] {
+			pool, ns, name := splitSpec(img)
+			out = append(out, ent{Pool: pool, Namespace: ns, Image: name})
+		}
+		sort.Slice(out, func(i, j int) bool { return out[i].Image < out[j].Image })
+		b, _ := json.Marshal(out)
+		return string(b), nil
+	}
+	return "", fmt.Errorf("fakerun: rbd group image: unhandled subcommand %q", pos[2])
+}
+
+// groupSnap models `rbd group snap create|rm|list`. A create cuts one snapshot of
+// every member atomically -- the whole point of the primitive -- so it mints a
+// member snapshot for each image in the group in a single step.
+func (r *Runner) groupSnap(pos []string) (string, error) {
+	if len(pos) < 4 {
+		return "", fmt.Errorf("fakerun: rbd group snap: missing arguments")
+	}
+	switch pos[2] {
+	case "create": // group snap create <pool/group@snap>
+		groupSpec, name, ok := strings.Cut(pos[3], "@")
+		if !ok {
+			return "", fmt.Errorf("rbd: invalid group snapshot spec %s", pos[3])
+		}
+		members, ok := r.groups[groupSpec]
+		if !ok {
+			return "", fmt.Errorf("rbd: error opening group %s: (2) No such file or directory", groupSpec)
+		}
+		for _, s := range r.groupSnaps[groupSpec] {
+			if s == name {
+				return "", fmt.Errorf("rbd: group snapshot %s already exists", pos[3])
+			}
+		}
+		r.groupSnaps[groupSpec] = append(r.groupSnaps[groupSpec], name)
+		for img := range members {
+			r.memberSnaps[pos[3]+"\x00"+img] = r.nextSnapID
+			r.nextSnapID++
+		}
+		return "", nil
+	case "rm": // group snap rm <pool/group@snap>
+		groupSpec, name, ok := strings.Cut(pos[3], "@")
+		if !ok {
+			return "", fmt.Errorf("rbd: invalid group snapshot spec %s", pos[3])
+		}
+		kept := r.groupSnaps[groupSpec][:0]
+		found := false
+		for _, s := range r.groupSnaps[groupSpec] {
+			if s == name {
+				found = true
+				continue
+			}
+			kept = append(kept, s)
+		}
+		if !found {
+			return "", fmt.Errorf("rbd: group snapshot %s does not exist", pos[3])
+		}
+		r.groupSnaps[groupSpec] = kept
+		for key := range r.memberSnaps {
+			if gsnap, _, ok := strings.Cut(key, "\x00"); ok && gsnap == pos[3] {
+				delete(r.memberSnaps, key)
+			}
+		}
+		return "", nil
+	case "list": // group snap list <pool/group>
+		groupSpec := pos[3]
+		if _, ok := r.groups[groupSpec]; !ok {
+			return "", fmt.Errorf("rbd: error opening group %s: (2) No such file or directory", groupSpec)
+		}
+		type ent struct {
+			Name  string `json:"name"`
+			State string `json:"state"`
+		}
+		out := []ent{}
+		for _, s := range r.groupSnaps[groupSpec] {
+			out = append(out, ent{Name: s, State: "ok"})
+		}
+		b, _ := json.Marshal(out)
+		return string(b), nil
+	}
+	return "", fmt.Errorf("fakerun: rbd group snap: unhandled subcommand %q", pos[2])
+}
+
+// hasMemberSnapID reports whether img has a group-member snapshot with this id.
+func (r *Runner) hasMemberSnapID(img string, id int64) bool {
+	for key, got := range r.memberSnaps {
+		if _, member, ok := strings.Cut(key, "\x00"); ok && member == img && got == id {
+			return true
+		}
+	}
+	return false
+}
+
+// joinSpec is the inverse of splitSpec: "pool[/namespace]/image".
+func joinSpec(pool, namespace, image string) string {
+	if namespace == "" {
+		return pool + "/" + image
+	}
+	return pool + "/" + namespace + "/" + image
 }
 
 // hasCloneChildren reports whether any clone still references img as its parent.
@@ -442,7 +692,11 @@ func positional(args []string) []string {
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch a {
-		case "-c", "--conf", "-m", "--id", "--keyfile", "--key-file", "--type", "-t", "-o", "--size", "--namespace":
+		case "-c", "--conf", "-m", "--id", "--keyfile", "--key-file", "--type", "-t", "-o", "--size", "--namespace",
+			// `rbd clone --snap-id`'s flag form addresses source and destination
+			// entirely through flags, so their values must not be mistaken for
+			// positional arguments.
+			"--pool", "--image", "--snap-id", "--dest-pool", "--dest-namespace", "--dest", "--rbd-default-clone-format":
 			i++ // skip this flag's value
 			continue
 		}

@@ -1,7 +1,17 @@
 # Upgrading past the CSI VolumeGroupSnapshot withdrawal
 
-Bard used to implement CSI `VolumeGroupSnapshot`. It no longer does, and the
-driver no longer advertises `GROUP_CONTROLLER_SERVICE`.
+> **This page is about the RETIRED implementation.** Bard serves CSI
+> `VolumeGroupSnapshot` again, on a completely different mechanism (one atomic
+> `rbd group snap create` cut instead of a loop of per-volume snapshots) — see
+> [docs/group-snapshots.md](group-snapshots.md). The two share no backend
+> objects: group snapshots created by the retired implementation are ordinary
+> per-volume rbd snapshots, and the current driver cannot reclaim them, so the
+> manual cleanup below still applies to anything you created before the
+> withdrawal. Nothing here is needed for group snapshots taken by the current
+> implementation.
+
+Bard's first implementation of CSI `VolumeGroupSnapshot` was withdrawn, and for
+one release the driver did not advertise `GROUP_CONTROLLER_SERVICE` at all.
 
 The reason is a hard spec requirement. CSI v1.12 (`spec.md`, `CreateVolumeGroupSnapshot`):
 
@@ -20,7 +30,8 @@ different API and remain supported.
 
 **This page only matters if you actually created CSI group snapshots.** The
 feature was beta and gated off by default: the `csi-snapshotter` sidecar needed
-`--feature-gates=CSIVolumeGroupSnapshot=true` (Bard's chart set this) *and* the
+`--feature-gates=CSIVolumeGroupSnapshot=true` (Bard's chart set this by default
+at the time; today it is opt-in) *and* the
 cluster-singleton `snapshot-controller` needed the same gate, which
 `hack/install-snapshotter.sh` never set for you. If you never hand-added the
 gate to the cluster controller, you have no group snapshots and nothing to do.
@@ -63,13 +74,24 @@ Wait for the contents to disappear, then run Path C's orphan scan, then upgrade.
 
 ## Path B — you already upgraded
 
-`VolumeGroupSnapshotContent` objects with `deletionPolicy: Delete` will hang on
-their finalizer indefinitely. The per-driver `csi-snapshotter` sidecar is what
-issues `DeleteVolumeGroupSnapshot`, and it no longer runs the group controller;
-the cluster `snapshot-controller` handles binding and lifecycle but cannot
-substitute for it. Re-adding the gate via `sidecars.snapshotter.extraArgs` will
-not help either — the group RBAC and the driver's `GroupController` registration
-are both gone.
+What happens to a leftover `VolumeGroupSnapshotContent` with `deletionPolicy:
+Delete` depends on which release you are on:
+
+- **On the release with no GroupController at all**, it hangs on its finalizer
+  indefinitely: the per-driver `csi-snapshotter` sidecar is what issues
+  `DeleteVolumeGroupSnapshot`, and there was nothing serving it.
+- **On a release with the current implementation** (and the group feature gate
+  on), the delete **succeeds as a no-op and the Kubernetes object goes away**.
+  That is not the driver reclaiming anything: the retired implementation minted
+  ids of the form `swskgs|1|<name>`, which is not a Bard handle, so the current
+  `GroupController` correctly treats it as an id it never issued — and the
+  members it would have to reclaim are ordinary rbd snapshots that were never in
+  an rbd group. CSI requires `0 OK` for an id that does not exist, so this is
+  conformant, but it means **the backend snapshots are silently orphaned** and
+  the object that named them is gone.
+
+Either way the reclaim is yours to do, and in the second case the record
+disappears when you delete the object — so **do step 1 first**.
 
 1. Record the member handles before deleting anything. Each is an ordinary Bard
    snapshot handle (`swsk|1|<backend>|<instance>|<location>|<name>@<snap>`):
@@ -95,13 +117,15 @@ are both gone.
    A group can span instances, so you may need credentials for more than one
    cluster. Deleting a member does not affect other members or their sources.
 
-3. Drop the stuck objects. Do this **after** step 2 — removing the finalizer is
-   what strands the backend snapshot if you skip ahead:
+3. Drop the leftover objects. Do this **after** step 2 — deleting them is what
+   strands the backend snapshot if you skip ahead, whether they vanish on the
+   driver's no-op delete or need the finalizer removed by hand:
 
    ```sh
+   kubectl delete volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io <name>
+   # only if it hangs (the release with no GroupController):
    kubectl patch volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io <name> \
      --type=merge -p '{"metadata":{"finalizers":null}}'
-   kubectl delete volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io <name>
    ```
 
    The namespaced `VolumeGroupSnapshot` objects may need the same treatment.
