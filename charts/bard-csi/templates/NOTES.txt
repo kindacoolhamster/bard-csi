@@ -43,3 +43,12 @@ NEXT STEPS (owned by you, not this chart):
        plugin: { endpoint: /var/lib/bard/plugins/ceph-rbd.sock }
 
 3. Label your nodes per zone:  kubectl label node <n> {{ .Values.zoneLabel }}=<zone>
+{{- if .Values.sidecars.snapshotter.groupSnapshots }}
+
+4. VolumeGroupSnapshot is enabled. It needs external-snapshotter installed with
+   the GROUP CRDs and a snapshot-controller v8.2.0 run with
+   --feature-gates=CSIVolumeGroupSnapshot=true (this chart does not install the
+   cluster-singleton snapshot-controller), and Ceph Squid v19.2.0 or newer on
+   every ceph-rbd instance you group-snapshot -- the driver probes each instance
+   and refuses the group snapshot if its members could not be restored.
+{{- end }}

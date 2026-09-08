@@ -239,6 +239,23 @@ deletionPolicy: Delete
 # parameters:
 #   snapshotNamePrefix: "team-snap-"
 ---
+# VolumeGroupSnapshot: snapshot a set of volumes (selected by label) as ONE
+# write-order-consistent cut -- every member is taken at the same point in the
+# write stream (`rbd group snap create`), and each member can still be restored
+# on its own into a new PVC. Constraints: ceph-rbd only, all members in ONE
+# backend instance (no cross-cluster group), and Ceph Squid v19.2.0 or newer (the
+# driver probes each instance and refuses the request otherwise). Because an rbd
+# image belongs to at most one group, two group snapshots whose member sets
+# OVERLAP but differ cannot be live at once -- see docs/group-snapshots.md.
+# Needs external-snapshotter v8+ with the group CRDs and the CSIVolumeGroupSnapshot
+# feature gate on BOTH the csi-snapshotter sidecar and the cluster controller.
+apiVersion: groupsnapshot.storage.k8s.io/v1beta1
+kind: VolumeGroupSnapshotClass
+metadata:
+  name: bard-rbd-group-snapshot
+driver: csi.bard.io
+deletionPolicy: Delete
+---
 # Runtime-mutable parameters: set `volumeAttributesClassName: bard-rbd-qos` on a
 # PVC (or change it) and the external-resizer calls ControllerModifyVolume, which
 # applies these as rbd QoS throttles on the live image (no remount). Supported

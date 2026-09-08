@@ -31,12 +31,16 @@ type fakeBackend struct {
 	fenced          [][]string                                  // recorded {op, instance, cidr...}
 	group           func(op string) error                       // also enables VolumeGroup cap
 	grouped         [][]string                                  // recorded {op, ...}
-	replicate       func(op string, h volumeid.Handle) error    // also enables Replication cap
-	replicated      []string                                    // recorded "op:<volume-id>"
-	rotateKey       func(h volumeid.Handle, path string) error  // also enables EncryptionKeyRotation cap
-	rotated         []string                                    // recorded "<volume-id>@<path>"
-	unpublished     []string                                    // nodeIDs passed to ControllerUnpublish
-	deletedSnaps    []string
+	// groupSnap also enables the GroupSnapshot cap. It answers create/get; a nil
+	// GroupSnapshot from get means "no longer exists" (backend.ErrNotFound).
+	groupSnap    func(op string, g volumeid.Handle) (*backend.GroupSnapshot, error)
+	groupSnapped []string                                   // recorded "<op>:<handle>"
+	replicate    func(op string, h volumeid.Handle) error   // also enables Replication cap
+	replicated   []string                                   // recorded "op:<volume-id>"
+	rotateKey    func(h volumeid.Handle, path string) error // also enables EncryptionKeyRotation cap
+	rotated      []string                                   // recorded "<volume-id>@<path>"
+	unpublished  []string                                   // nodeIDs passed to ControllerUnpublish
+	deletedSnaps []string
 }
 
 func (f *fakeBackend) Type() string { return "ceph-rbd" }
@@ -50,6 +54,7 @@ func (f *fakeBackend) Capabilities() backend.Capabilities {
 		Replication:               f.replicate != nil,
 		EncryptionKeyRotation:     f.rotateKey != nil,
 		VolumeGroup:               f.group != nil,
+		GroupSnapshot:             f.groupSnap != nil,
 	}
 }
 
@@ -172,6 +177,28 @@ func (f *fakeBackend) GetVolumeGroup(_ context.Context, g volumeid.Handle, _ map
 func (f *fakeBackend) ListVolumeGroups(_ context.Context, _ map[string]string) ([]backend.VolumeGroup, error) {
 	f.grouped = append(f.grouped, []string{"list"})
 	return []backend.VolumeGroup{{Group: volumeid.Handle{Backend: "ceph-rbd", Instance: "east", Location: "p", Name: "csi-group-x"}}}, f.group("list")
+}
+
+// GroupSnapshotter (optional): records each op; the cap is gated on f.groupSnap.
+func (f *fakeBackend) CreateVolumeGroupSnapshot(_ context.Context, req *backend.CreateGroupSnapshotRequest) (*backend.GroupSnapshot, error) {
+	f.groupSnapped = append(f.groupSnapped, "create:"+req.Name)
+	return f.groupSnap("create", volumeid.Handle{})
+}
+func (f *fakeBackend) DeleteVolumeGroupSnapshot(_ context.Context, g volumeid.Handle, _ map[string]string) error {
+	f.groupSnapped = append(f.groupSnapped, "delete:"+g.String())
+	_, err := f.groupSnap("delete", g)
+	return err
+}
+func (f *fakeBackend) GetVolumeGroupSnapshot(_ context.Context, g volumeid.Handle, _ map[string]string) (*backend.GroupSnapshot, error) {
+	f.groupSnapped = append(f.groupSnapped, "get:"+g.String())
+	gs, err := f.groupSnap("get", g)
+	if err != nil {
+		return nil, err
+	}
+	if gs == nil {
+		return nil, backend.ErrNotFound
+	}
+	return gs, nil
 }
 
 // VolumeReplicator (optional): records each op; the cap is gated on f.replicate.

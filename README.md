@@ -160,13 +160,18 @@ Manifests: `00-csidriver`, `05-crd-backendcluster` (the `BackendCluster` CRD),
 backends from the BackendCluster CRs at startup (`--config-source=crd`);
 `--config-source=file` keeps the old ConfigMap path for out-of-cluster runs.
 
-Upgrade caveat: the non-conformant CSI `VolumeGroupSnapshot` GroupController has
-been withdrawn. If you created CSI group snapshots, clean them up **before**
-upgrading — once the service is gone there is no automated path, and group
-members cannot be reclaimed through the ordinary snapshot API. See
+CSI `VolumeGroupSnapshot` snapshots a set of PVCs as one write-order-consistent
+cut (`rbd group snap create`), with each member still individually restorable
+(`rbd clone --snap-id`, Ceph Squid v19.2.0+). ceph-rbd only, one backend instance
+per group, off by default — see [docs/group-snapshots.md](docs/group-snapshots.md).
+
+Upgrade caveat: an EARLIER, non-conformant group-snapshot implementation was
+withdrawn, and the current one shares no backend objects with it. Group snapshots
+created by the old implementation must be cleaned up by hand — the current driver
+treats their ids as ones it never issued, so deleting the Kubernetes object
+succeeds while the backend snapshots leak. See
 [docs/upgrade-group-snapshots.md](docs/upgrade-group-snapshots.md), which also
-covers recovery if you have already upgraded and how to find members leaked by a
-group create that failed partway.
+covers how to find members leaked by an old group create that failed partway.
 
 ## Day-2: the consistency scanner
 

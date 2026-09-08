@@ -595,29 +595,60 @@ leaves the StatefulSet running as the standing workload.
   fscrypt ioctl path is live-only (can't run under the fake runner), like RBD fscrypt.
   Chart: the cephfs profile in `_profiles.tpl` now defines `encryptionMount`/`kmsMount`
   so `plugins.cephfs.encryption`/`kms` wire `--encryption-key-dir`/`--kms-config`.
-- **CSI VolumeGroupSnapshot is withdrawn -- and the original design traded away
-  the wrong half of the contract.** CSI v1.12 (`spec.md`, CreateVolumeGroupSnapshot)
-  says the group "MUST give a write-order consistency guarantee or fail if that's
-  not possible"; individual member restorability is only a MAY ("any individual
-  snapshot from the group MAY be used as a source"). Bard's retired implementation
-  snapshotted members sequentially (across instances, even) to keep them
-  individually restorable -- i.e. it gave up the MUST to buy the MAY. The honest
-  reading is that BOTH were needed: the MAY is a practical requirement in
-  Kubernetes, since external-snapshotter materialises a member VolumeSnapshot per
-  volume and the ecosystem expects those to restore, but needing it never licensed
-  breaking write-order consistency. "Both, or fail" was the only correct answer, so
-  core no longer registers GroupController.
-  The blocker that drove the original choice is GONE: the old note here said rbd
-  group snapshots are "NOT independently clonable", which was true of
-  `rbd clone <pool>/<img>@<snap>` but stopped being true in **Ceph Squid v19.2.0**
-  -- "Support for cloning from non-user type snapshots is added [...] exposed via
-  the new `--snap-id` option for `rbd clone`". So `rbd group snap create` +
-  `rbd clone --snap-id` satisfies both halves on the Ceph v20 clients/clusters this
-  repo already targets. Costs: single-instance only (no cross-cluster group can
-  have one write-order cut without an external quiesce protocol), plus a
-  min-version gate, group/member journaling, and rollback on partial failure.
-  Cleanup for existing group snapshots is manual because the CO SHALL NOT delete a
-  member via ordinary DeleteSnapshot (`spec.md`, DeleteSnapshot) -- see
+- **CSI VolumeGroupSnapshot: both halves of the contract, or fail.** CSI v1.12
+  (`spec.md`, CreateVolumeGroupSnapshot) says the group "MUST give a write-order
+  consistency guarantee or fail if that's not possible"; individual member
+  restorability is only a MAY. Bard's FIRST implementation snapshotted members
+  sequentially (across instances, even) to keep them restorable -- it gave up the
+  MUST to buy the MAY -- and was withdrawn rather than patched, because no
+  arrangement of independent per-volume snapshots can provide the guarantee. Both
+  halves were always needed: the MAY is a practical requirement in Kubernetes
+  (external-snapshotter materialises a member VolumeSnapshot per volume and the
+  ecosystem expects those to restore), but needing it never licensed breaking
+  write-order consistency.
+  The current implementation (`internal/cephplugin/groupsnapshot.go`,
+  `internal/driver/groupsnapshot.go`) gets both from one primitive pair:
+  `rbd group snap create` for the atomic quiesced cut, and `rbd clone --snap-id`
+  for restoring one member -- cloning from non-user-type snapshots landed in
+  **Ceph Squid v19.2.0**, which is exactly the blocker the original design
+  worked around. Design notes and live validation:
+  `docs/superpowers/specs/2026-09-02-group-snapshot-conformant-design.md`; the
+  operator-facing page is `docs/group-snapshots.md`. Things worth knowing before
+  touching it:
+  - **The rbd group is keyed on a hash of the MEMBER SET, never on the CO's group
+    snapshot name.** An image belongs to at most one group, while
+    `CreateVolumeGroupSnapshotRequest.Name` is a per-call idempotency key -- an
+    hourly backup of the same PVCs would otherwise collide with itself on the
+    second run. One group holds many group snapshots over its life.
+  - **`isAlreadyExists()` cannot be trusted for `rbd group image add`.** An image
+    already in a DIFFERENT group fails with `(17) File exists` -- indistinguishable
+    from the idempotent case -- so the create verifies membership with
+    `groupImageList` after adding, and fails the whole request if it does not match.
+    Without that check a group snapshot would silently omit a requested volume.
+  - **A member snapshot's handle carries the numeric snap id (`image@#<id>`), not
+    a name.** Ceph's synthetic `.group.*` name is renamed into a trash namespace by
+    `rbd group snap rm` while the id survives. `provision()` and `DeleteSnapshot`
+    both branch on that sigil.
+  - **The version gate is a real functional probe per instance, not a version
+    string.** `rbd help`/the client binary ships inside our own image (a build-time
+    constant, useless as a cluster check) and `ceph versions` is a proxy that
+    vendor backports falsify and that needs mon caps `profile rbd` may lack. The
+    probe runs the whole chain on a throwaway 4MiB image and is the only check
+    that exercises the OSD-side `cls_rbd` piece.
+  - **Delete/Get's `snapshot_ids` check must be conditional on the group snapshot
+    still existing.** CSI retries delete with the same ids after a missed
+    response; an unconditional mismatch check permanently rejects that retry and
+    wedges the VolumeGroupSnapshotContent.
+  - Costs, all rejected explicitly rather than served wrongly: ceph-rbd only,
+    single-instance only, and no two live group snapshots over OVERLAPPING but
+    different member sets.
+  - **NOT yet proven cross-node**: the write-order guarantee was validated with
+    both members mapped by krbd on ONE host (including with `-o noshare` to force
+    independent rados clients). The two-node krbd regression is a required gate
+    before calling this GA -- see the spec's "Residual risk" section.
+  Group snapshots made by the RETIRED implementation are not reclaimable by this
+  one (their ids are not Bard handles): the delete succeeds as a no-op and the
+  backend snapshots leak, so they need manual cleanup --
   `docs/upgrade-group-snapshots.md`. Separate from the supported csi-addons
   VolumeGroup operations.
 - **`profile rbd` grants `osd blocklist add` but NOT `blocklist rm`.** Verified:
@@ -787,7 +818,10 @@ Record your cluster's actual addresses in `CLAUDE.local.md`.
   OWN per-instance config (e.g. `bard-ceph-config`) at *its* startup -- so adding
   a brand-new instance also needs the plugin sidecar to reload to learn the new
   mon/pool/user. (Re-pointing zones / changing the default / removing an instance
-  of an already-known backend is fully live.)
+  of an already-known backend is fully live.) Same shape for plugin
+  CAPABILITIES: they are read once from `/info` at dial time, so a backend that
+  gains one (group snapshots, say) does not start advertising it -- and the CSI
+  services gated on it are not registered -- until the sidecar and core restart.
 - **Multi-zone dispatch: DONE** and proven end to end (`hack/demo-multicluster.yaml`
   + `hack/test-multicluster.yaml`): one `bard-rbd` StorageClass, a pod per zone,
   each volume provisioned into a different Ceph instance/pool via that cluster's

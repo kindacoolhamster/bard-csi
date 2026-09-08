@@ -50,6 +50,9 @@
 //	POST /volumegroup/delete   DeleteVolumeGroupRequest     -> {}                        (optional)
 //	POST /volumegroup/get      GetVolumeGroupRequest        -> VolumeGroupResponse       (optional)
 //	POST /volumegroup/list     ListVolumeGroupsRequest      -> ListVolumeGroupsResponse  (optional)
+//	POST /groupsnapshot/create CreateVolumeGroupSnapshotRequest -> VolumeGroupSnapshotResponse (optional)
+//	POST /groupsnapshot/delete DeleteVolumeGroupSnapshotRequest -> {}                          (optional)
+//	POST /groupsnapshot/get    GetVolumeGroupSnapshotRequest    -> VolumeGroupSnapshotResponse (optional)
 //
 // # Contract version and compatibility
 //
@@ -78,6 +81,8 @@
 // reverse does not hold, because a minor may add vocabulary to an existing
 // route (1.1 added the Unsupported error code) that an older Bard would
 // silently mistranslate. Pair a newer plugin with a Bard that speaks its minor.
+// (1.2 added the FailedPrecondition error code alongside the group-snapshot
+// routes, so it is exactly such a vocabulary bump.)
 //
 // A MAJOR bump is a breaking change: rare, announced in release notes ahead of
 // time, and shipped with a transition period during which Bard accepts both
@@ -98,7 +103,7 @@ import (
 // ContractVersion is the wire-contract version this package defines, as
 // "MAJOR.MINOR". The SDK reports it from /info when a Backend's Info does not
 // set ContractVersion explicitly.
-const ContractVersion = "1.1"
+const ContractVersion = "1.2"
 
 // ContractMajor is the contract MAJOR version this Bard supports. Core
 // refuses a plugin that reports a different major.
@@ -113,7 +118,7 @@ const ContractMajor = 1
 // that meets an unknown value degrades it to a generic Internal error, turning
 // a terminal failure into an indefinitely reconciled one. Failing fast at
 // startup with a clear message beats mistranslating at runtime.
-const ContractMinor = 1
+const ContractMinor = 2
 
 // ParseContractVersion parses an Info.ContractVersion of the form
 // "MAJOR.MINOR". The empty string is the pre-versioning contract and parses
@@ -173,6 +178,10 @@ const (
 	PathDeleteVolumeGroup     = "/volumegroup/delete"
 	PathGetVolumeGroup        = "/volumegroup/get"
 	PathListVolumeGroups      = "/volumegroup/list"
+
+	PathCreateGroupSnapshot = "/groupsnapshot/create"
+	PathDeleteGroupSnapshot = "/groupsnapshot/delete"
+	PathGetGroupSnapshot    = "/groupsnapshot/get"
 )
 
 // ErrorCode lets a plugin signal CSI-relevant outcomes; Bard maps these to gRPC
@@ -190,6 +199,13 @@ const (
 	// non-retried CSI failure -- unlike CodeInvalidArg this is not about a bad
 	// request, but a capability the plugin will never grant on retry.
 	CodeUnsupported ErrorCode = "Unsupported"
+	// CodeFailedPrecondition signals a well-formed request the backend cannot
+	// serve in its current state, where the caller must change something -- the
+	// cluster's configuration, or which objects it asks about -- before a retry
+	// can succeed. Distinct from CodeInvalidArg (the request itself is fine) and
+	// from CodeUnsupported (the backend will never do this at all). Bard maps it
+	// to codes.FailedPrecondition. Added in contract 1.2.
+	CodeFailedPrecondition ErrorCode = "FailedPrecondition"
 )
 
 // Error is the JSON body returned with a non-200 status.
@@ -248,10 +264,13 @@ type Capabilities struct {
 	// EncryptionKeyRotation operation.
 	EncryptionKeyRotation bool `json:"encryptionKeyRotation,omitempty"`
 	// VolumeGroup is true when the plugin implements VolumeGrouper (the /volumegroup/*
-	// routes). Bard then advertises the csi-addons VolumeGroup operation. Keep this LAST
-	// to match backend.Capabilities field order (the plugin.Client converts between the
-	// two structs positionally).
+	// routes). Bard then advertises the csi-addons VolumeGroup operation.
 	VolumeGroup bool `json:"volumeGroup,omitempty"`
+	// GroupSnapshot is true when the plugin implements GroupSnapshotter (the
+	// /groupsnapshot/* routes). Bard then serves the CSI GroupController service
+	// (VolumeGroupSnapshot). Keep this LAST to match backend.Capabilities field order
+	// (the plugin.Client converts between the two structs positionally).
+	GroupSnapshot bool `json:"groupSnapshot,omitempty"`
 }
 
 // Info is returned from /info and declares the backend's identity + capabilities.
@@ -854,6 +873,78 @@ type VolumeGrouper interface {
 	DeleteVolumeGroup(ctx context.Context, req *DeleteVolumeGroupRequest) error
 	GetVolumeGroup(ctx context.Context, req *GetVolumeGroupRequest) (*VolumeGroupResponse, error)
 	ListVolumeGroups(ctx context.Context, req *ListVolumeGroupsRequest) (*ListVolumeGroupsResponse, error)
+}
+
+// Group snapshot requests implement CSI VolumeGroupSnapshot: ONE snapshot of
+// several volumes taken at a single point in the write stream. CSI requires that
+// write-order consistency guarantee or a failure, so a plugin must back this with
+// a real atomic primitive (ceph-rbd: `rbd group snap create`) -- never a loop over
+// per-volume snapshots. Bard only ever asks a plugin to group volumes that share
+// one instance, since no plugin can cut one consistent snapshot across clusters.
+
+// CreateVolumeGroupSnapshotRequest asks the plugin to snapshot SourceVolumes
+// together. Name is the CO's idempotency key: a retry with the same name and the
+// same member set must return the same group snapshot rather than cut a second
+// one. Members that cannot be grouped (e.g. a volume already held in another
+// consistency group) must fail the whole request with CodeFailedPrecondition,
+// leaving no partial snapshot behind.
+type CreateVolumeGroupSnapshotRequest struct {
+	Name          string            `json:"name"`
+	SourceVolumes []VolumeRef       `json:"sourceVolumes"`
+	Parameters    map[string]string `json:"parameters,omitempty"`
+	Secrets       map[string]string `json:"secrets,omitempty"`
+}
+
+// GroupSnapshotMember is one volume's snapshot within a group snapshot. Snapshot
+// is the member snapshot's own ref, which Bard encodes into a CSI snapshot id and
+// hands back on restore -- so it must address something the plugin can clone from
+// (ceph-rbd encodes the member's numeric snap id, its only stable identity).
+type GroupSnapshotMember struct {
+	Snapshot         VolumeRef `json:"snapshot"`
+	SourceVolume     VolumeRef `json:"sourceVolume"`
+	SizeBytes        int64     `json:"sizeBytes,omitempty"`
+	CreationTimeUnix int64     `json:"creationTimeUnix,omitempty"`
+	ReadyToUse       bool      `json:"readyToUse"`
+}
+
+// VolumeGroupSnapshotResponse describes a group snapshot: its own ref plus the
+// member snapshots cut with it. Returned by create and get.
+type VolumeGroupSnapshotResponse struct {
+	GroupSnapshot    VolumeRef             `json:"groupSnapshot"`
+	Snapshots        []GroupSnapshotMember `json:"snapshots,omitempty"`
+	CreationTimeUnix int64                 `json:"creationTimeUnix,omitempty"`
+	ReadyToUse       bool                  `json:"readyToUse"`
+}
+
+// DeleteVolumeGroupSnapshotRequest removes a group snapshot and every member
+// snapshot in it. Must be idempotent: an already-deleted group snapshot succeeds,
+// and any leftover cleanup (disbanding an emptied backend group) still runs.
+type DeleteVolumeGroupSnapshotRequest struct {
+	GroupSnapshot VolumeRef         `json:"groupSnapshot"`
+	Secrets       map[string]string `json:"secrets,omitempty"`
+}
+
+// GetVolumeGroupSnapshotRequest reads a group snapshot and its current members.
+// A group snapshot that no longer exists must be reported with CodeNotFound --
+// Bard's CSI layer depends on that to distinguish "gone" (idempotent success on
+// delete, NOT_FOUND on get) from "exists with different members".
+type GetVolumeGroupSnapshotRequest struct {
+	GroupSnapshot VolumeRef         `json:"groupSnapshot"`
+	Secrets       map[string]string `json:"secrets,omitempty"`
+}
+
+// GroupSnapshotter is an OPTIONAL interface a Backend may implement to answer the
+// /groupsnapshot/* routes (CSI VolumeGroupSnapshot). Implementing it sets
+// Capabilities.GroupSnapshot and makes Bard serve the CSI GroupController service.
+// Control-plane (controller-side) only.
+//
+// Bard's CSI layer owns the spec's `snapshot_ids` verification and the delete/get
+// idempotency carve-outs; it can, because it owns CSI id encoding and a plugin
+// never sees a CSI id. A plugin only has to report the truth about what it holds.
+type GroupSnapshotter interface {
+	CreateVolumeGroupSnapshot(ctx context.Context, req *CreateVolumeGroupSnapshotRequest) (*VolumeGroupSnapshotResponse, error)
+	DeleteVolumeGroupSnapshot(ctx context.Context, req *DeleteVolumeGroupSnapshotRequest) error
+	GetVolumeGroupSnapshot(ctx context.Context, req *GetVolumeGroupSnapshotRequest) (*VolumeGroupSnapshotResponse, error)
 }
 
 // RotateEncryptionKeyRequest asks the plugin to rotate an encrypted volume's key

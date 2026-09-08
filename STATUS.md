@@ -138,32 +138,33 @@ proven under live I/O. Management is local targetcli/configfs by default, or
 `management: targetd` to drive a **remote** LIO host over targetd's JSON-RPC
 API, so the controller no longer has to run on the target host.
 
+**CSI `VolumeGroupSnapshot`** snapshots a set of PVCs as ONE
+write-order-consistent cut, on ceph-rbd, within a single backend instance. It is
+built on `rbd group snap create` (an atomic, quiesced cross-image cut) plus `rbd
+clone --snap-id` (Ceph Squid v19.2.0's cloning from non-user-type snapshots), so
+it satisfies both halves of the contract: the guarantee CSI makes mandatory AND
+individually restorable members. Ceph support is checked per instance by running
+the real primitive chain on a throwaway image -- not a version string, which is a
+poor proxy for a backported feature and says nothing about the OSD side. Off by
+default (`sidecars.snapshotter.groupSnapshots`); the driver advertises the
+GroupController service only when a registered backend can honour the guarantee.
+See [docs/group-snapshots.md](docs/group-snapshots.md).
+
+This REPLACES a withdrawn implementation that snapshotted members sequentially --
+it could not give the write-order guarantee, and was withdrawn rather than
+patched because no arrangement of independent per-volume snapshots can. Group
+snapshots created by that implementation are not reclaimable by this one; see
+[docs/upgrade-group-snapshots.md](docs/upgrade-group-snapshots.md). The csi-addons
+`VolumeGroup` operations are a different API and remain supported.
+
 ## Not yet
 
-CSI `VolumeGroupSnapshot` is withdrawn: CSI v1.12 requires write-order
-consistency across every member, which Bard's retired sequential per-volume
-snapshot implementation could not guarantee. The csi-addons `VolumeGroup`
-operations are separate and remain supported.
-
-A conformant re-implementation is possible for **RBD within a single instance**,
-and that is the tracked path: `rbd group snap create` takes one atomic,
-write-order-consistent cut, and Ceph Squid (v19.2.0) added cloning from
-non-user-type snapshots -- exposed as `rbd clone --snap-id` -- so each member of
-that cut can also be restored individually. It is not a small change. It needs a
-minimum-Ceph-version gate, live proof that the group-namespace snapshot ids
-clone correctly, durable group/member journaling, idempotency and rollback on
-partial failure, and explicit rejection of the cases it cannot serve.
-
-That last part is a real capability loss: a group could no longer span backend
-instances or clusters, which the retired implementation did allow. Nothing can
-provide a single write-order cut across independent Ceph clusters without an
-external distributed quiesce protocol, so multi-cluster group snapshots are out
-of scope rather than merely unbuilt.
-
-Before upgrading from a release that created CSI group snapshots, operators must
-clean them up -- see [docs/upgrade-group-snapshots.md](docs/upgrade-group-snapshots.md)
-for the pre-upgrade path, recovery if you have already upgraded, and how to find
-members leaked by a partially failed group create.
+Two limits on group snapshots are structural, not unbuilt work. A group cannot
+span backend instances or clusters -- nothing provides a single write-order cut
+across independent Ceph clusters without an external distributed quiesce
+protocol -- and, because an rbd image belongs to at most one group, two group
+snapshots whose member sets OVERLAP but differ cannot be live at once. Both are
+rejected explicitly rather than served incorrectly.
 
 On the CephFS backend, **encrypted volumes cannot be restored from a snapshot or
 cloned** -- CephFS subvolume clone does not preserve the fscrypt context (unlike RBD's

@@ -231,6 +231,12 @@ type Backend struct {
 	// still-flattening clone must not stack another `rbd flatten`.
 	flattenMu       sync.Mutex
 	flattenInFlight map[string]bool
+
+	// gsProbe caches, per instance, whether that cluster can clone from a group
+	// member snapshot (see groupsnapshot_probe.go). Per instance because separate
+	// instances can be separate clusters at separate Ceph versions.
+	gsProbeMu sync.Mutex
+	gsProbe   map[string]groupSnapProbe
 }
 
 // defaultCloneDepthLimit matches ceph-csi's soft clone-depth limit (rbd flattens
@@ -244,7 +250,7 @@ func New(clusters map[string]ClusterConfig, keyDir, stateDir string, run Runner)
 	if run == nil {
 		run = ExecRunner{}
 	}
-	b := &Backend{clusters: clusters, keyDir: keyDir, stateDir: stateDir, run: run, snapIndex: map[string]string{}, snapNames: map[string]string{}, cloneDepthLimit: defaultCloneDepthLimit, flattenAsync: true}
+	b := &Backend{clusters: clusters, keyDir: keyDir, stateDir: stateDir, run: run, snapIndex: map[string]string{}, snapNames: map[string]string{}, gsProbe: map[string]groupSnapProbe{}, cloneDepthLimit: defaultCloneDepthLimit, flattenAsync: true}
 	// The KMS registry resolves a volume's passphrase through pluggable providers; it
 	// reads the master key dir, a Ceph connection, and image metadata back from this
 	// backend (which implements cephenc.Host). Lazily uses b.encKeyDir, so WithEncryption
@@ -308,13 +314,15 @@ func shortName(prefix, csiName string) string {
 // snapshotNamePrefix, volumeGroupNamePrefix), defaulting when unset. The prefix
 // becomes part of an rbd object name (and thus a volume/snapshot handle), so it
 // must be a valid name fragment: no '/' (the pool/namespace/image separator),
-// no '@' (the image@snap separator handles encode), no whitespace.
+// no '@' (the image@snap separator handles encode), no leading '#' (which right
+// after an '@' marks a group-member snapshot id -- see groupMemberSigil), and no
+// whitespace.
 func namePrefix(param, value, def string) (string, error) {
 	if value == "" {
 		return def, nil
 	}
-	if strings.ContainsAny(value, "/@ \t\n") {
-		return "", bardplugin.Errorf(bardplugin.CodeInvalidArg, "ceph-rbd: invalid %s %q (no '/', '@', or whitespace)", param, value)
+	if strings.ContainsAny(value, "/@ \t\n") || strings.HasPrefix(value, "#") {
+		return "", bardplugin.Errorf(bardplugin.CodeInvalidArg, "ceph-rbd: invalid %s %q (no '/', '@', or whitespace, and no leading '#')", param, value)
 	}
 	return value, nil
 }
@@ -1012,12 +1020,27 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 func (b *Backend) provision(ctx context.Context, conn []string, spec string, sizeMiB int64, req *bardplugin.CreateVolumeRequest) error {
 	switch {
 	case req.SourceSnapshot != nil:
-		parent := req.SourceSnapshot.Location + "/" + req.SourceSnapshot.Name // "image@snap"
-		// Clone v2: unlike v1, it does not require the parent snapshot to be
-		// protected, and it lets the parent snapshot be deleted while clones still
-		// exist (Ceph tracks the dependency). Without this, recent Ceph rejects the
-		// clone with "parent snapshot must be protected".
-		args := appendArgs(conn, "clone", parent, spec, "--rbd-default-clone-format", "2")
+		var args []string
+		if image, snapID, isMember := parseGroupMemberSnapName(req.SourceSnapshot.Name); isMember {
+			// A group-member snapshot. The positional "pool/image@snap" spec cannot
+			// address a non-user-type snapshot at all -- which is why rbd grew
+			// --snap-id (Ceph Squid v19.2.0), and why the member handle carries the
+			// numeric id instead of a name.
+			// spec is "<location>/<image>", and a location may itself be
+			// "pool/namespace", so split off the image on the LAST separator.
+			i := strings.LastIndex(spec, "/")
+			if i < 0 {
+				return fmt.Errorf("ceph-rbd: malformed destination image spec %q", spec)
+			}
+			args = groupMemberCloneArgs(conn, req.SourceSnapshot.Location, image, snapID, spec[:i], spec[i+1:])
+		} else {
+			parent := req.SourceSnapshot.Location + "/" + req.SourceSnapshot.Name // "image@snap"
+			// Clone v2: unlike v1, it does not require the parent snapshot to be
+			// protected, and it lets the parent snapshot be deleted while clones still
+			// exist (Ceph tracks the dependency). Without this, recent Ceph rejects the
+			// clone with "parent snapshot must be protected".
+			args = appendArgs(conn, "clone", parent, spec, "--rbd-default-clone-format", "2")
+		}
 		args = append(args, dataPoolArgs(req.Parameters)...)
 		if _, err := b.run.Run(ctx, "rbd", args...); err != nil {
 			return fmt.Errorf("ceph-rbd: clone: %w", err)
@@ -1381,6 +1404,15 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 }
 
 func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnapshotRequest) error {
+	// CSI forbids the CO from deleting a group snapshot's member through this RPC
+	// (it must delete the whole group). Refuse explicitly rather than issue a
+	// nonsense `rbd snap rm pool/image@#42` -- no snapshot by that literal name
+	// exists, and the member's real name is Ceph's unstable synthetic one.
+	if isGroupMemberSnapName(req.Snapshot.Name) {
+		return bardplugin.Errorf(bardplugin.CodeFailedPrecondition,
+			"ceph-rbd: %s is a group snapshot member; delete the whole group snapshot (DeleteVolumeGroupSnapshot), not the member",
+			req.Snapshot.Name)
+	}
 	cc, err := b.cluster(req.Snapshot.Instance)
 	if err != nil {
 		return err
