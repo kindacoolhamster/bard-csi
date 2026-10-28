@@ -134,6 +134,13 @@ func (d *Driver) Run(ctx context.Context, endpoint, csiAddonsEndpoint string) er
 	csi.RegisterIdentityServer(d.srv, &identityServer{driver: d})
 	if d.mode.Controller {
 		csi.RegisterControllerServer(d.srv, &controllerServer{driver: d})
+		// VolumeGroupSnapshot lives in the separate GroupController service, and is
+		// served only when a registered backend can cut a write-order-consistent
+		// snapshot across volumes -- CSI has no way to say "this driver has a group
+		// controller but it cannot honour the guarantee".
+		if d.anyBackendCap(func(c backend.Capabilities) bool { return c.GroupSnapshot }) {
+			csi.RegisterGroupControllerServer(d.srv, &groupControllerServer{driver: d})
+		}
 	}
 	if d.mode.Node {
 		csi.RegisterNodeServer(d.srv, &nodeServer{driver: d})

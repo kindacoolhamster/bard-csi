@@ -86,7 +86,7 @@ Message schemas are defined in
 ## Contract version & compatibility promise
 
 The wire contract is versioned `MAJOR.MINOR`, independently of Bard releases;
-the current version is **1.1** (`bardplugin.ContractVersion`). Report the
+the current version is **1.2** (`bardplugin.ContractVersion`). Report the
 version you implement in `/info` as `contractVersion` (the Go SDK fills it in
 for you; an absent field means `1.0`). Bard refuses at startup a plugin whose
 MAJOR it does not support, **or whose MINOR is newer than it understands**.
@@ -94,7 +94,8 @@ MAJOR it does not support, **or whose MINOR is newer than it understands**.
 That gate is asymmetric on purpose. An older plugin is always safe: everything
 it can say, a newer Bard already understands. The reverse does not hold — a
 MINOR may add vocabulary to an *existing* route (1.1 added the `Unsupported`
-error code), and an older Bard meeting an unknown value degrades it to a
+error code, 1.2 the `FailedPrecondition` one), and an older Bard meeting an
+unknown value degrades it to a
 generic `Internal`, turning a terminal failure into one the CO reconciles
 indefinitely. Failing fast at startup beats mistranslating at runtime, so pair
 a newer plugin with a Bard that speaks its MINOR.
@@ -160,6 +161,7 @@ another language, serve the route and set the capability flag yourself.
 | `/volume/reclaimspace`, `/node/reclaimspace` | `SpaceReclaimer`, `NodeSpaceReclaimer` | csi-addons ReclaimSpace |
 | `/controller/publish`, `/controller/unpublish` | `ControllerPublisher` | control-plane attach (`ControllerPublishVolume`); needs `attach.enabled` in the deploy. See the iSCSI plugin |
 | `/volume/list`, `/snapshot/list` | `VolumeLister`, `SnapshotLister` | `ListVolumes` / `ListSnapshots` (Bard aggregates + paginates) |
+| `/groupsnapshot/create`, `/groupsnapshot/delete`, `/groupsnapshot/get` | `GroupSnapshotter` | CSI `VolumeGroupSnapshot`. Only implement it if your backend has a real atomic multi-volume primitive: CSI *mandates* write-order consistency across every member, so a loop over per-volume snapshots does not qualify. Bard checks the CSI `snapshot_ids` rules for you; your `get` just has to report `NotFound` once the group snapshot is gone |
 
 ## In Go (the SDK)
 

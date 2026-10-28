@@ -98,6 +98,9 @@ func newMux(b Backend) http.Handler {
 		if _, ok := b.(VolumeGrouper); ok {
 			info.Capabilities.VolumeGroup = true
 		}
+		if _, ok := b.(GroupSnapshotter); ok {
+			info.Capabilities.GroupSnapshot = true
+		}
 		writeJSON(w, info)
 	})
 	handle(mux, PathCreateVolume, func(ctx context.Context, req *CreateVolumeRequest) (any, error) {
@@ -228,6 +231,17 @@ func newMux(b Backend) http.Handler {
 		})
 		handle(mux, PathListVolumeGroups, func(ctx context.Context, req *ListVolumeGroupsRequest) (any, error) {
 			return vg.ListVolumeGroups(ctx, req)
+		})
+	}
+	if gs, ok := b.(GroupSnapshotter); ok {
+		handle(mux, PathCreateGroupSnapshot, func(ctx context.Context, req *CreateVolumeGroupSnapshotRequest) (any, error) {
+			return gs.CreateVolumeGroupSnapshot(ctx, req)
+		})
+		handle(mux, PathDeleteGroupSnapshot, func(ctx context.Context, req *DeleteVolumeGroupSnapshotRequest) (any, error) {
+			return empty{}, gs.DeleteVolumeGroupSnapshot(ctx, req)
+		})
+		handle(mux, PathGetGroupSnapshot, func(ctx context.Context, req *GetVolumeGroupSnapshotRequest) (any, error) {
+			return gs.GetVolumeGroupSnapshot(ctx, req)
 		})
 	}
 	return mux

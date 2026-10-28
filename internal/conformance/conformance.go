@@ -660,6 +660,7 @@ func (r *runner) run(ctx context.Context) error {
 		{"networkfence", caps.NetworkFence},
 		{"replication", caps.Replication},
 		{"volumegroup", caps.VolumeGroup},
+		{"groupsnapshot", caps.GroupSnapshot},
 		{"node/rotate-key", caps.EncryptionKeyRotation},
 		{"node/reclaimspace", caps.NodeReclaimSpace && !r.cfg.Node},
 	} {

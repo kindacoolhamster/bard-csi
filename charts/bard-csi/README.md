@@ -8,7 +8,7 @@ node), the CSI sidecars, and the backend **plugin sidecars** you enable.
 **The chart owns** the driver runtime: core, CSI sidecars (provisioner, resizer,
 snapshotter, health-monitor, registrar, liveness-probe), plugin sidecar wiring,
 RBAC, the `BackendCluster` CRD, the `CSIDriver` object, and (optional) the
-StorageClass / VolumeSnapshotClass / VolumeAttributesClass.
+StorageClass / VolumeSnapshotClass / VolumeAttributesClass / VolumeGroupSnapshotClass.
 
 For a **first-party backend with a native profile** (ceph-rbd, cephfs, iscsi) you
 describe it in its own terms (mons, pool/fsName, user, zone — or for iscsi, its VG
@@ -43,6 +43,10 @@ backend instances/zones.
 #      # v8.2.0 tag, so force it to match the sidecar:
 #      kubectl -n kube-system set image deploy/snapshot-controller \
 #        snapshot-controller=registry.k8s.io/sig-storage/snapshot-controller:$V
+#    For CSI VolumeGroupSnapshot (sidecars.snapshotter.groupSnapshots, default
+#    off) also install the group CRDs and run the controller with the same gate:
+#      for c in groupsnapshot.storage.k8s.io_volumegroupsnapshot{classes,contents,s}; do
+#        kubectl apply -f "$B/client/config/crd/$c.yaml"; done
 #    (from a source checkout, hack/install-snapshotter.sh does exactly this.)
 
 # 2. create the credentials Secret (one cephx key per instance id)
@@ -227,6 +231,7 @@ across all enabled node plugins, since they are pod-wide.
 | `storageCapacity` | `true` | CSIStorageCapacity (CSIDriver + provisioner + RBAC) |
 | `zoneLabel` | `topology.kubernetes.io/zone` | node label the driver reads for topology |
 | `sidecars.*.enabled` / `.image` | on / pinned | RBAC tracks what's enabled |
+| `sidecars.snapshotter.groupSnapshots` | `false` | CSI VolumeGroupSnapshot: adds the sidecar feature gate + group RBAC + `volumeGroupSnapshotClasses`. Requires `plugins.ceph-rbd` (the render fails otherwise), Ceph Squid v19.2.0+, and the group CRDs + a gated snapshot-controller |
 | `sidecars.csiAddons.enabled` | `false` | csi-addons ops: ReclaimSpace, NetworkFence, VolumeReplication (mirroring/DR), VolumeGroup, EncryptionKeyRotation (sidecar + endpoint + RBAC); needs the csi-addons controller installed separately |
 | `attach.enabled` | `false` | control-plane attach: flips the CSIDriver's `attachRequired` (immutable) + adds the external-attacher + RBAC. **Required by `plugins.iscsi`** (the chart fails the render otherwise); node-mapped backends no-op it |
 | `node.kubeletDir` | `/var/lib/kubelet` | override for non-standard distros |

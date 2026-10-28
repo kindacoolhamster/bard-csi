@@ -64,11 +64,16 @@ const (
 	ResultAlreadyExists = "already_exists"
 	ResultInvalidArg    = "invalid_argument"
 	ResultUnsupported   = "unsupported"
-	ResultPluginError   = "plugin_error"
-	ResultTransport     = "transport_error"
-	ResultTimeout       = "timeout"
-	ResultCanceled      = "canceled"
-	ResultDecodeError   = "decode_error"
+	// ResultFailedPrecondition is a well-formed request the backend refused
+	// because of cluster state the operator must change (e.g. a Ceph too old for
+	// group-member restore). Split out because, unlike plugin_error, retrying it
+	// unchanged will never succeed.
+	ResultFailedPrecondition = "failed_precondition"
+	ResultPluginError        = "plugin_error"
+	ResultTransport          = "transport_error"
+	ResultTimeout            = "timeout"
+	ResultCanceled           = "canceled"
+	ResultDecodeError        = "decode_error"
 )
 
 // InstanceAll is the instance label for calls that are genuinely cross-instance

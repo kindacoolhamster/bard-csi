@@ -175,6 +175,8 @@ func classify(err error) string {
 		return metrics.ResultInvalidArg
 	case errors.Is(err, backend.ErrUnsupported):
 		return metrics.ResultUnsupported
+	case errors.Is(err, backend.ErrFailedPrecondition):
+		return metrics.ResultFailedPrecondition
 	}
 	return metrics.ResultPluginError
 }
@@ -199,6 +201,8 @@ func mapError(body []byte, status int) error {
 		// the same terminal treatment as a plugin that never implemented the
 		// call at all.
 		return fmt.Errorf("%w: %s", backend.ErrUnsupported, e.Message)
+	case bardplugin.CodeFailedPrecondition:
+		return fmt.Errorf("%w: %s", backend.ErrFailedPrecondition, e.Message)
 	default:
 		return fmt.Errorf("plugin error: %s", e.Message)
 	}
@@ -606,6 +610,82 @@ func (c *Client) ListVolumeGroups(ctx context.Context, secrets map[string]string
 		out = append(out, c.group(g))
 	}
 	return out, nil
+}
+
+// GroupSnapshot (CSI VolumeGroupSnapshot): snapshot several volumes at one point
+// in the write stream. Controller-side; core has already checked that every
+// source shares one instance.
+
+// groupSnapshot decodes a VolumeGroupSnapshotResponse into typed handles, tagging
+// each ref with the plugin's backend type (the wire form omits it).
+func (c *Client) groupSnapshot(r bardplugin.VolumeGroupSnapshotResponse) (*backend.GroupSnapshot, error) {
+	g := &backend.GroupSnapshot{
+		Handle:       c.handle(r.GroupSnapshot),
+		CreationTime: time.Unix(r.CreationTimeUnix, 0),
+		ReadyToUse:   r.ReadyToUse,
+	}
+	if err := g.Handle.Validate(); err != nil {
+		return nil, fmt.Errorf("group snapshot handle: %w", err)
+	}
+	for _, m := range r.Snapshots {
+		snap, src := c.handle(m.Snapshot), c.handle(m.SourceVolume)
+		// A member id the CO cannot hand back is worse than a failed create: it
+		// would leave a group snapshot whose members can never be restored or
+		// verified, so refuse the whole response rather than drop the member.
+		if err := snap.Validate(); err != nil {
+			return nil, fmt.Errorf("group snapshot member handle: %w", err)
+		}
+		if err := src.Validate(); err != nil {
+			return nil, fmt.Errorf("group snapshot member source handle: %w", err)
+		}
+		g.Members = append(g.Members, backend.GroupSnapshotMember{
+			Handle:       snap,
+			SourceVolume: src,
+			SizeBytes:    m.SizeBytes,
+			CreationTime: time.Unix(m.CreationTimeUnix, 0),
+			ReadyToUse:   m.ReadyToUse,
+		})
+	}
+	return g, nil
+}
+
+func (c *Client) CreateVolumeGroupSnapshot(ctx context.Context, req *backend.CreateGroupSnapshotRequest) (*backend.GroupSnapshot, error) {
+	if !c.caps.GroupSnapshot {
+		return nil, backend.ErrUnsupported
+	}
+	instance := ""
+	if len(req.SourceVolumes) > 0 {
+		instance = req.SourceVolumes[0].Instance
+	}
+	var resp bardplugin.VolumeGroupSnapshotResponse
+	if err := c.call(ctx, bardplugin.PathCreateGroupSnapshot, instance, bardplugin.CreateVolumeGroupSnapshotRequest{
+		Name: req.Name, SourceVolumes: refs(req.SourceVolumes), Parameters: req.Parameters, Secrets: req.Secrets,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	return c.groupSnapshot(resp)
+}
+
+func (c *Client) DeleteVolumeGroupSnapshot(ctx context.Context, g volumeid.Handle, secrets map[string]string) error {
+	if !c.caps.GroupSnapshot {
+		return backend.ErrUnsupported
+	}
+	return c.call(ctx, bardplugin.PathDeleteGroupSnapshot, g.Instance, bardplugin.DeleteVolumeGroupSnapshotRequest{
+		GroupSnapshot: ref(g), Secrets: secrets,
+	}, nil)
+}
+
+func (c *Client) GetVolumeGroupSnapshot(ctx context.Context, g volumeid.Handle, secrets map[string]string) (*backend.GroupSnapshot, error) {
+	if !c.caps.GroupSnapshot {
+		return nil, backend.ErrUnsupported
+	}
+	var resp bardplugin.VolumeGroupSnapshotResponse
+	if err := c.call(ctx, bardplugin.PathGetGroupSnapshot, g.Instance, bardplugin.GetVolumeGroupSnapshotRequest{
+		GroupSnapshot: ref(g), Secrets: secrets,
+	}, &resp); err != nil {
+		return nil, err
+	}
+	return c.groupSnapshot(resp)
 }
 
 // ---- node plane ----------------------------------------------------------

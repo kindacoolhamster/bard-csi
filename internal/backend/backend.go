@@ -34,6 +34,12 @@ var (
 	// mutable parameter key the backend does not support). Maps to
 	// codes.InvalidArgument.
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrFailedPrecondition means the request is well-formed but the system is
+	// not in a state that permits it, and the caller must change something
+	// before retrying. Maps to codes.FailedPrecondition. Group snapshots use it
+	// for a cluster too old to restore group members and for a volume already
+	// held in a different consistency group.
+	ErrFailedPrecondition = errors.New("failed precondition")
 )
 
 // Capabilities describes what a backend can do and how the CSI layer must
@@ -90,9 +96,14 @@ type Capabilities struct {
 	EncryptionKeyRotation bool
 	// VolumeGroup is true when the backend can manage volume groups (the plugin
 	// implements VolumeGrouper, e.g. ceph-rbd consistency groups); Bard then serves the
-	// csi-addons VolumeGroup operation. Keep this last to match the
-	// bardplugin.Capabilities field order (struct conversion).
+	// csi-addons VolumeGroup operation.
 	VolumeGroup bool
+	// GroupSnapshot is true when the backend can take a write-order-consistent
+	// snapshot of several volumes at once (the plugin implements GroupSnapshotter,
+	// e.g. ceph-rbd `rbd group snap create`); Bard then serves the CSI
+	// GroupController service. Keep this last to match the bardplugin.Capabilities
+	// field order (struct conversion).
+	GroupSnapshot bool
 }
 
 // CreateVolumeRequest is the backend-facing form of CSI CreateVolume. The CSI
@@ -329,4 +340,57 @@ type VolumeGrouper interface {
 	DeleteVolumeGroup(ctx context.Context, group volumeid.Handle, secrets map[string]string) error
 	GetVolumeGroup(ctx context.Context, group volumeid.Handle, secrets map[string]string) (VolumeGroup, error)
 	ListVolumeGroups(ctx context.Context, secrets map[string]string) ([]VolumeGroup, error)
+}
+
+// CreateGroupSnapshotRequest is the backend-facing form of CSI
+// CreateVolumeGroupSnapshot. Core has already verified that every source volume
+// lives in the same backend type and instance -- no backend can cut one
+// write-order-consistent snapshot across two storage clusters.
+type CreateGroupSnapshotRequest struct {
+	Name          string            // CO-supplied group snapshot name (its idempotency key)
+	SourceVolumes []volumeid.Handle // the volumes to snapshot together
+	Parameters    map[string]string // VolumeGroupSnapshotClass parameters
+	Secrets       map[string]string
+}
+
+// GroupSnapshotMember is one volume's snapshot inside a group snapshot. Handle
+// addresses the member snapshot itself (for ceph-rbd, "image@#<snap-id>": a
+// group-member snapshot has no stable name, only a stable numeric id).
+type GroupSnapshotMember struct {
+	Handle       volumeid.Handle
+	SourceVolume volumeid.Handle
+	SizeBytes    int64
+	CreationTime time.Time
+	ReadyToUse   bool
+}
+
+// GroupSnapshot is a backend group snapshot: its own handle plus the member
+// snapshots cut by the same atomic operation.
+type GroupSnapshot struct {
+	Handle       volumeid.Handle
+	Members      []GroupSnapshotMember
+	CreationTime time.Time
+	ReadyToUse   bool
+}
+
+// GroupSnapshotter is an OPTIONAL interface a Backend may also implement when it
+// can snapshot several volumes at one point in the write stream (CSI
+// GroupController, e.g. Ceph `rbd group snap create`). The CSI layer type-asserts
+// for this and serves the GroupController service only when a registered backend
+// implements it (Capabilities.GroupSnapshot).
+//
+// CSI requires the group snapshot to give a write-order consistency guarantee or
+// fail, so a backend must not implement this by snapshotting members in sequence.
+//
+// The CSI-level `snapshot_ids` verification and the Delete/Get idempotency
+// carve-outs live in core, not here: a backend may be an out-of-tree plugin,
+// which never sees CSI ids (core owns volume-id encoding). A backend therefore
+// only reports what it actually holds, and both mutators are idempotent:
+//   - Get returns ErrNotFound when the group snapshot no longer exists.
+//   - Delete succeeds on an already-deleted group snapshot, and still runs any
+//     leftover garbage collection (e.g. disbanding a now-empty rbd group).
+type GroupSnapshotter interface {
+	CreateVolumeGroupSnapshot(ctx context.Context, req *CreateGroupSnapshotRequest) (*GroupSnapshot, error)
+	DeleteVolumeGroupSnapshot(ctx context.Context, groupSnapshot volumeid.Handle, secrets map[string]string) error
+	GetVolumeGroupSnapshot(ctx context.Context, groupSnapshot volumeid.Handle, secrets map[string]string) (*GroupSnapshot, error)
 }

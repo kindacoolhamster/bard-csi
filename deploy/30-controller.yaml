@@ -62,11 +62,18 @@ spec:
             - name: socket-dir
               mountPath: /csi
 
+        # v8 adds VolumeGroupSnapshot: with this gate the sidecar drives the
+        # driver's GroupController, which Bard serves only for a backend that can
+        # cut one write-order-consistent snapshot across volumes (ceph-rbd, on
+        # Ceph Squid v19.2.0+). It also needs the group CRDs and a cluster
+        # snapshot-controller run with the SAME gate -- see
+        # hack/install-snapshotter.sh. Drop this line to leave the feature off.
         - name: csi-snapshotter
           image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--leader-election"
+            - "--feature-gates=CSIVolumeGroupSnapshot=true"
             - "--v=2"
           env:
             - name: ADDRESS
