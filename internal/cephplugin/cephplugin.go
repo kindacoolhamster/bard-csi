@@ -278,8 +278,8 @@ func (b *Backend) ConnFor(conn []string, instance string, secrets map[string]str
 	return b.connArgs(cc, instance, secrets)
 }
 
-func (b *Backend) MetaGet(ctx context.Context, conn []string, spec, key string) string {
-	return b.imageMetaGet(ctx, conn, spec, key)
+func (b *Backend) MetaGet(ctx context.Context, conn []string, spec, key string) (string, error) {
+	return b.imageMetaGetChecked(ctx, conn, spec, key)
 }
 
 func (b *Backend) MetaSet(ctx context.Context, conn []string, spec, key, value string) error {
@@ -504,7 +504,8 @@ func (b *Backend) imageMetaGet(ctx context.Context, conn []string, spec, key str
 // imageMetaGetChecked reads an image-meta value, distinguishing "absent" (the key
 // or the image does not exist -> "", nil) from a read that FAILED (mon down,
 // auth). Decisions that must not proceed on a misread -- DeleteVolume's static
-// guard and KMS-id lookup -- use this form and surface the error for a retry.
+// guard, the KMS-id lookup, and every read the KMS providers or encrypted-clone
+// inheritance act on -- use this form and surface the error for a retry.
 func (b *Backend) imageMetaGetChecked(ctx context.Context, conn []string, spec, key string) (string, error) {
 	out, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "get", spec, key)...)
 	if err != nil {
@@ -977,7 +978,13 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 	// source provisioned before this descriptor existed, whose derived passphrase
 	// used its pool/image). Persisted on the clone so a clone chain keeps deriving
 	// the one root identity.
-	keyID := b.imageMetaGet(ctx, conn, sourceSpec, imgMetaKeyID)
+	// Every source read is checked: a misread would give the clone the wrong (or no)
+	// descriptor, and its first stage would then mint a key that can never open the
+	// copied LUKS header.
+	keyID, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaKeyID)
+	if err != nil {
+		return "", err
+	}
 	if keyID == "" {
 		keyID = sourceSpec
 	}
@@ -987,13 +994,20 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 	// Carry the provider selection (so DeleteVolume cleans up the right KMS) and any
 	// wrapped DEK (so a secrets-metadata clone unwraps the same key from its own
 	// metadata) down to the clone.
-	kmsID := b.imageMetaGet(ctx, conn, sourceSpec, imgMetaKMSID)
+	kmsID, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaKMSID)
+	if err != nil {
+		return "", err
+	}
 	if kmsID != "" {
 		if err := b.imageMetaSet(ctx, conn, cloneSpec, imgMetaKMSID, kmsID); err != nil {
 			return "", err
 		}
 	}
-	if dek := b.imageMetaGet(ctx, conn, sourceSpec, imgMetaWrappedDEK); dek != "" {
+	dek, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaWrappedDEK)
+	if err != nil {
+		return "", err
+	}
+	if dek != "" {
 		if err := b.imageMetaSet(ctx, conn, cloneSpec, imgMetaWrappedDEK, dek); err != nil {
 			return "", err
 		}

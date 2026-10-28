@@ -13,6 +13,7 @@ import (
 type fakeHost struct {
 	keyDir string
 	meta   map[string]string // "spec|key" -> value
+	getErr error             // when set, every MetaGet fails (a transient Ceph read error)
 }
 
 func (h *fakeHost) MasterKeyDir() string { return h.keyDir }
@@ -21,8 +22,11 @@ func (h *fakeHost) ConnFor(conn []string, _ string, _ map[string]string) ([]stri
 	return conn, func() {}, nil
 }
 
-func (h *fakeHost) MetaGet(_ context.Context, _ []string, spec, key string) string {
-	return h.meta[spec+"|"+key]
+func (h *fakeHost) MetaGet(_ context.Context, _ []string, spec, key string) (string, error) {
+	if h.getErr != nil {
+		return "", h.getErr
+	}
+	return h.meta[spec+"|"+key], nil
 }
 
 func (h *fakeHost) MetaSet(_ context.Context, _ []string, spec, key, value string) error {

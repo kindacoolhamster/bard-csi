@@ -2,6 +2,7 @@ package cephenc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -97,5 +98,25 @@ func TestSecretPassphraseOverride(t *testing.T) {
 		map[string]string{SecretPassphrase: "explicit"})
 	if err != nil || got != "explicit" {
 		t.Fatalf("explicit secret must win without resolving a provider: got %q err %v", got, err)
+	}
+}
+
+// A failed metadata read is not "absent": secrets-metadata must fail the stage rather
+// than mint and overwrite the stored wrapped DEK (which would make the data
+// unrecoverable).
+func TestSecretsMetadataFailsClosedOnReadError(t *testing.T) {
+	host := newTestHost(t)
+	reg := NewRegistry(host, map[string]KMSConfig{"k8s": {Type: "secrets-metadata"}})
+	ctx := context.Background()
+	if _, err := reg.Passphrase(ctx, nil, "east", "k8s", "replicapool/img", "replicapool/img", nil); err != nil {
+		t.Fatal(err)
+	}
+	stored := host.meta["replicapool/img|"+MetaWrappedDEK]
+	host.getErr = errors.New("transient read failure")
+	if _, err := reg.Passphrase(ctx, nil, "east", "k8s", "replicapool/img", "replicapool/img", nil); err == nil {
+		t.Fatal("a failed read must fail the stage")
+	}
+	if host.meta["replicapool/img|"+MetaWrappedDEK] != stored {
+		t.Fatal("the stored wrapped DEK was overwritten on a read error")
 	}
 }

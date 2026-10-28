@@ -81,18 +81,22 @@ func splitMetaSpec(spec string) (fs, group, sub string, ok bool) {
 	}
 }
 
-// MetaGet reads a subvolume-metadata value, returning "" when the key (or subvolume) is
-// absent -- the same "unset" semantics the RBD plugin's image-meta get has.
-func (b *Backend) MetaGet(ctx context.Context, conn []string, spec, key string) string {
+// MetaGet reads a subvolume-metadata value, returning ("", nil) when the key (or
+// subvolume) is absent -- the same "unset" semantics the RBD plugin's image-meta get
+// has -- and an error when the read itself failed, which must not be read as absent.
+func (b *Backend) MetaGet(ctx context.Context, conn []string, spec, key string) (string, error) {
 	fs, group, sub, ok := splitMetaSpec(spec)
 	if !ok {
-		return ""
+		return "", fmt.Errorf("cephfs: malformed metadata spec %q", spec)
 	}
 	out, err := b.run.Run(ctx, "ceph", withGroup(append(append([]string{}, conn...), "fs", "subvolume", "metadata", "get", fs, sub, key), group)...)
 	if err != nil {
-		return ""
+		if isNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("cephfs: subvolume metadata get %s/%s %s: %w", fs, sub, key, err)
 	}
-	return strings.TrimSpace(out)
+	return strings.TrimSpace(out), nil
 }
 
 // MetaSet records a key/value on a subvolume.
@@ -176,7 +180,10 @@ func (b *Backend) volumePassphrase(ctx context.Context, conn []string, req *bard
 // read back from the subvolume metadata). A no-op for unencrypted volumes / the derived
 // provider. Idempotent so a retried delete converges.
 func (b *Backend) deleteEncryptionKey(ctx context.Context, conn []string, instance, spec string) error {
-	kmsID := b.MetaGet(ctx, conn, spec, cephenc.MetaKMSID)
+	kmsID, err := b.MetaGet(ctx, conn, spec, cephenc.MetaKMSID)
+	if err != nil {
+		return err // a misread must not skip cleanup: the subvolume rm would orphan the key
+	}
 	if kmsID == "" {
 		return nil
 	}

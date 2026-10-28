@@ -11,7 +11,8 @@ import (
 // are unit-tested in internal/cephenc against a fakeHost; here they are exercised
 // through the real Backend (which implements cephenc.Host).
 type metaRunner struct {
-	meta map[string]string
+	meta   map[string]string
+	getErr error // when set, every image-meta get fails (a transient Ceph read error)
 }
 
 func (r *metaRunner) Run(_ context.Context, name string, args ...string) (string, error) {
@@ -24,6 +25,9 @@ func (r *metaRunner) Run(_ context.Context, name string, args ...string) (string
 			r.meta[mk] = args[i+4]
 			return "", nil
 		case "get":
+			if r.getErr != nil {
+				return "", r.getErr
+			}
 			if v, ok := r.meta[mk]; ok {
 				return v + "\n", nil
 			}
