@@ -233,6 +233,13 @@ func (r *Runner) rbd(args []string) (string, error) {
 				return "", fmt.Errorf("rbd: failed to get metadata %s of image : (2) No such file or directory", pos[3])
 			}
 			return v, nil
+		case "remove":
+			k := pos[2] + "\x00" + pos[3]
+			if _, ok := r.imageMeta[k]; !ok {
+				return "", fmt.Errorf("rbd: removing metadata failed: (2) No such file or directory")
+			}
+			delete(r.imageMeta, k)
+			return "", nil
 		}
 		return "", nil
 	case "ls":

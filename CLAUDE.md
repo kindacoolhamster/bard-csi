@@ -440,9 +440,16 @@ leaves the StatefulSet running as the standing workload.
   re-derives from it, secrets-metadata/Vault use the clone's own copied slot. Two
   caveats: (1) **restore to a compatible (same-KMS) StorageClass** -- the ciphertext
   is bound to the source's provider, so restoring under a different `encryptionKMSID`
-  fails to open; (2) the descriptor is read from the **source image at restore
-  time**, so deleting the source image before restoring its snapshot (clone-v2
-  allows this) loses the descriptor -- the data is intact but unopenable. Unit-proven
+  fails to open; (2) **a snapshot owns its own key copy, taken at CreateSnapshot**
+  (2026-10-28): its descriptor lives on the source image under snapshot-qualified
+  meta keys (`<key>@<snap>`, rbd snapshots carry no meta), external providers get a
+  snapshot-owned entry, and a restore inherits from THAT, not the source's current
+  key. Before this, a key rotation made every pre-rotation snapshot permanently
+  unrestorable (live-proven: the restored LUKS header opened only with the destroyed
+  old key) -- and a snapshot taken BEFORE this fix still has no copy, so it falls
+  back to the source's current key and breaks if the source is rotated. KMIP marks
+  object ownership (`bard.encryptionKMIPOwner`) because librbd copies a parent's
+  UID onto its clones. DeleteSnapshot reaps the copy. Unit-proven
   for all three providers (`encryption_clone_test.go`: clone opens with the source
   key, clone-delete preserves the source, derived chains to the root identity).
   **Live-proven on the k3s krbd tier (2026-06-20)** for both deployed providers

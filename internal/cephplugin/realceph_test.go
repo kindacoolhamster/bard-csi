@@ -334,6 +334,9 @@ func TestRealCephEncryptedRestoreRetry(t *testing.T) {
 				if err := be.imageMetaSet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID, srcUID); err != nil {
 					t.Fatal(err)
 				}
+				if err := be.imageMetaRemove(ctx, conn, cloneSpec, cephenc.MetaKMIPOwner); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			r2, err := be.CreateVolume(ctx, restore)
@@ -351,7 +354,7 @@ func TestRealCephEncryptedRestoreRetry(t *testing.T) {
 			if kmsID == "kmip" {
 				srcUID, _ := be.MetaGet(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
 				cloneUID, _ := be.MetaGet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID)
-				if cloneUID == srcUID || f.count() != 2 {
+				if cloneUID == srcUID || f.count() != 3 { // source + snapshot + clone
 					t.Fatalf("clone must own its KMIP object (clone %q src %q, %d objects)", cloneUID, srcUID, f.count())
 				}
 			}

@@ -80,8 +80,8 @@ func TestEncryptedRestoreRetryKeepsInheritedKey(t *testing.T) {
 				if err := b.kms.DeleteKey(ctx, conn, "east", "vault", cloneSpec); err != nil {
 					t.Fatal(err)
 				}
-				if len(fv.store) != 1 {
-					t.Fatalf("rewind: only the source's Vault entry should remain, have %d", len(fv.store))
+				if len(fv.store) != 2 {
+					t.Fatalf("rewind: only the source's and the snapshot's Vault entries should remain, have %d", len(fv.store))
 				}
 			case "kmip":
 				srcUID, _ := b.imageMetaGetChecked(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
@@ -92,7 +92,12 @@ func TestEncryptedRestoreRetryKeepsInheritedKey(t *testing.T) {
 				if f.has(ownUID) || !f.has(srcUID) {
 					t.Fatal("rewind: the clone's own object should be gone, the source's kept")
 				}
+				// What librbd's meta copy leaves: the source's UID, and no owner marker
+				// naming the clone.
 				if err := b.imageMetaSet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID, srcUID); err != nil {
+					t.Fatal(err)
+				}
+				if err := b.imageMetaRemove(ctx, conn, cloneSpec, cephenc.MetaKMIPOwner); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -126,8 +131,8 @@ func TestEncryptedRestoreRetryKeepsInheritedKey(t *testing.T) {
 				if cloneUID == srcUID {
 					t.Fatal("the retry must give the clone its own KMIP object, not the copied source UID")
 				}
-				if f.count() != 2 {
-					t.Fatalf("want exactly 2 KMIP objects (source + clone), have %d", f.count())
+				if f.count() != 3 {
+					t.Fatalf("want exactly 3 KMIP objects (source + snapshot + clone), have %d", f.count())
 				}
 			}
 			if err := b.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: bardplugin.VolumeRef{Instance: "east", Location: r2.Location, Name: r2.Name}}); err != nil {
