@@ -289,6 +289,19 @@ leaves the StatefulSet running as the standing workload.
   mount?" idempotency check (it always reports mounted and skips the real mount).
   Use `findmnt --mountpoint`. The fake runner models `--mountpoint` semantics, so
   this bug hid behind green tests until a real-VG run surfaced it.
+- **Never `RemoveAll` a temp mountpoint, and never clean up on the request ctx.**
+  The NFS controller mounts the export at a temp dir per op; its cleanup used to
+  run `umount` on the request ctx (error ignored) and then `os.RemoveAll(tmp)`.
+  When the request is cancelled (the CO's sidecar `--timeout` firing during a
+  slow snapshot `tar` cancels core's plugin call, so `r.Context()` is done),
+  `exec.CommandContext` never starts the umount and RemoveAll recursed through the
+  live export -- **live-reproduced 2026-10-27: the whole export was wiped.** Now:
+  umount on `context.WithoutCancel` + timeout with the error checked, and
+  `os.Remove` (fails safe on a still-mounted dir). Fake runners can't model a
+  real mount, so the regression is a live harness: `sudo bash
+  hack/nfs-export-wipe-regression.sh <plugin-bin> <server> <export>
+  <export-dir>` against a dedicated EMPTY export (it cancels a 2G snapshot
+  mid-tar; a vulnerable binary destroys the export).
 - **CSI topology labels are immutable per node.** The node plugin reports its zone
   under `topology.csi.bard.io/zone` (sourced from the node's
   `topology.kubernetes.io/zone` label, read via the API -- `--zone-label`). The

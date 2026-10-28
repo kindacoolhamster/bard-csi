@@ -144,6 +144,10 @@ func (b *Backend) mounted(ctx context.Context, path string) bool {
 	return strings.TrimSpace(out) != ""
 }
 
+// umountTimeout bounds the export unmount, which runs detached from the request
+// context (see withExportMounted).
+const umountTimeout = time.Minute
+
 // withExportMounted mounts the instance's export at a temp dir, runs fn against
 // it, and unmounts -- used by the controller to create/delete subdirectories.
 func (b *Backend) withExportMounted(ctx context.Context, ic InstanceConfig, fn func(mnt string) error) error {
@@ -151,12 +155,31 @@ func (b *Backend) withExportMounted(ctx context.Context, ic InstanceConfig, fn f
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	// Never remove tmp recursively: it is the export's mountpoint, and a recursive
+	// delete through a mount that failed to detach destroys every volume and
+	// snapshot on the export. os.Remove succeeds only on an empty, unmounted dir;
+	// anything else leaks the temp dir, which is the safe failure.
+	defer func() {
+		if rerr := os.Remove(tmp); rerr != nil {
+			fmt.Fprintf(os.Stderr, "nfs: leaving export temp dir %s in place: %v\n", tmp, rerr)
+		}
+	}()
 	if _, err := b.run.Run(ctx, "mount", "-t", "nfs", "-o", "vers=4.1", ic.Server+":"+ic.Export, tmp); err != nil {
 		return bardplugin.Errorf(bardplugin.CodeInternal, "nfs: mount export: %v", err)
 	}
-	defer func() { _, _ = b.run.Run(ctx, "umount", tmp) }()
-	return fn(tmp)
+	ferr := fn(tmp)
+	// Unmount on a context detached from the request's: a cancelled ctx (deadline,
+	// client disconnect, plugin shutdown) is often why fn failed, and a umount run
+	// on it would never start.
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), umountTimeout)
+	defer cancel()
+	if _, uerr := b.run.Run(uctx, "umount", tmp); uerr != nil {
+		if ferr != nil {
+			return fmt.Errorf("%w (and unmount of %s failed: %v)", ferr, tmp, uerr)
+		}
+		return bardplugin.Errorf(bardplugin.CodeInternal, "nfs: unmount export at %s: %v", tmp, uerr)
+	}
+	return ferr
 }
 
 // ---- control plane -------------------------------------------------------
