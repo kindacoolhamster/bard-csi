@@ -2,11 +2,13 @@ package cephplugin
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/kindacoolhamster/bard-csi/internal/cephenc"
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
 )
 
@@ -223,5 +225,137 @@ func TestRealCephKMSFailClosed(t *testing.T) {
 	p2, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, secrets)
 	if err != nil || p2 != p1 {
 		t.Fatalf("restage must resolve the original key (err %v, same=%v)", err, p2 == p1)
+	}
+}
+
+// TestRealCephEncryptedRestoreRetry drives a retried encrypted restore through real
+// `rbd` (whose clone copies the parent's image-meta onto the child): the retry must
+// advertise the same inherited key identity and resolve the SOURCE's passphrase, and
+// for KMIP the clone must end up with its own HSM object, not the copied source UID.
+// KMS servers are in-process fakes; the rbd side is real. Same env gate as TestRealCeph.
+func TestRealCephEncryptedRestoreRetry(t *testing.T) {
+	if os.Getenv("BARD_CEPH_TEST") != "1" {
+		t.Skip("set BARD_CEPH_TEST=1 (and CEPH_MON/POOL/USER/KEY) to run against real Ceph")
+	}
+	mon, pool, user, key := os.Getenv("CEPH_MON"), os.Getenv("CEPH_POOL"), os.Getenv("CEPH_USER"), os.Getenv("CEPH_KEY")
+	if mon == "" || pool == "" || user == "" || key == "" {
+		t.Fatal("CEPH_MON, CEPH_POOL, CEPH_USER and CEPH_KEY must all be set")
+	}
+	const instance = "real"
+	for _, kmsID := range []string{"" /*derived*/, "vault", "kmip"} {
+		t.Run("kms="+orDefault(kmsID, "derived"), func(t *testing.T) {
+			keyDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(keyDir, instance), []byte("real-ceph-test-master-key"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fv := newFakeVault()
+			srv := httptest.NewServer(fv.handler())
+			defer srv.Close()
+			f := startFakeKMIP(t)
+			be := New(map[string]ClusterConfig{instance: {Monitors: []string{mon}, Pool: pool, UserID: user}}, "", "", nil).
+				WithEncryption(keyDir).
+				WithKMS(map[string]KMSConfig{
+					"vault": {Type: "vault", Address: srv.URL, Token: "dev-token"},
+					"kmip":  {Type: "kmip", KMIPEndpoint: f.addr, InsecureSkipVerify: true},
+				})
+			secrets := map[string]string{"userID": user, "userKey": key}
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			params := map[string]string{"pool": pool, paramEncrypted: "true"}
+			if kmsID != "" {
+				params[paramEncryptionKMSID] = kmsID
+			}
+			name := "cloneretry-" + orDefault(kmsID, "derived") + "-" + time.Now().Format("150405")
+
+			src, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{Name: name, CapacityBytes: 16 << 20, Instance: instance, Parameters: params, Secrets: secrets})
+			if err != nil {
+				t.Fatalf("CreateVolume: %v", err)
+			}
+			srcRef := bardplugin.VolumeRef{Instance: instance, Location: src.Location, Name: src.Name}
+			srcSpec := src.Location + "/" + src.Name
+			srcPass, err := be.encryptionPassphrase(ctx, instance, kmsID, srcSpec, secrets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := be.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: name + "-snap", SourceVolume: srcRef, Secrets: secrets})
+			if err != nil {
+				t.Fatalf("CreateSnapshot: %v", err)
+			}
+			snapRef := bardplugin.VolumeRef{Instance: instance, Location: snap.Location, Name: snap.Name}
+			restore := &bardplugin.CreateVolumeRequest{
+				Name: name + "-restore", CapacityBytes: 16 << 20, Instance: instance, Parameters: params,
+				Secrets: secrets, SourceSnapshot: &snapRef,
+			}
+			r1, err := be.CreateVolume(ctx, restore)
+			if err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			cloneRef := bardplugin.VolumeRef{Instance: instance, Location: r1.Location, Name: r1.Name}
+			cloneSpec := r1.Location + "/" + r1.Name
+			// Teardown in dependency order: restore, snapshot, source.
+			defer func() {
+				for _, step := range []func() error{
+					func() error {
+						return be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: cloneRef, Secrets: secrets})
+					},
+					func() error {
+						return be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets})
+					},
+					func() error {
+						return be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: srcRef, Secrets: secrets})
+					},
+				} {
+					if err := step(); err != nil {
+						t.Errorf("teardown: %v", err)
+					}
+				}
+			}()
+			conn, connCleanup, err := be.connArgs(be.clusters[instance], instance, secrets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connCleanup()
+
+			// Rewind the clone to "provisioned, key never cloned": it keeps only what
+			// real rbd clone copied from the parent.
+			switch kmsID {
+			case "vault":
+				if err := be.kms.DeleteKey(ctx, conn, instance, "vault", cloneSpec); err != nil {
+					t.Fatal(err)
+				}
+			case "kmip":
+				srcUID, err := be.MetaGet(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := be.kms.DeleteKey(ctx, conn, instance, "kmip", cloneSpec); err != nil {
+					t.Fatal(err)
+				}
+				if err := be.imageMetaSet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID, srcUID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r2, err := be.CreateVolume(ctx, restore)
+			if err != nil {
+				t.Fatalf("retried restore: %v", err)
+			}
+			k1, k2 := r1.Context[ctxEncryptionKeyID], r2.Context[ctxEncryptionKeyID]
+			if k1 == "" || k1 != k2 {
+				t.Fatalf("retry must advertise the same key identity: %q vs %q", k1, k2)
+			}
+			clonePass, err := be.encryptionPassphraseFor(ctx, nil, instance, kmsID, cloneSpec, k2, secrets)
+			if err != nil || clonePass != srcPass {
+				t.Fatalf("retried restore must resolve the source's passphrase (err %v)", err)
+			}
+			if kmsID == "kmip" {
+				srcUID, _ := be.MetaGet(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
+				cloneUID, _ := be.MetaGet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID)
+				if cloneUID == srcUID || f.count() != 2 {
+					t.Fatalf("clone must own its KMIP object (clone %q src %q, %d objects)", cloneUID, srcUID, f.count())
+				}
+			}
+			t.Logf("retry advertised %s and opened with the source key", k2)
+		})
 	}
 }
