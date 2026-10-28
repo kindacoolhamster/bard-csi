@@ -100,11 +100,11 @@ kubectl -n kube-system patch deployment bard-csi-controller --type=strategic \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"csi-addons","$patch":"delete"}]}}}}' || true
 kubectl -n kube-system patch daemonset bard-csi-node --type=strategic \
   -p '{"spec":{"template":{"spec":{"containers":[{"name":"csi-addons","$patch":"delete"}]}}}}' || true
-# external-snapshotter cluster singleton (CRDs + version-matched controller) so
-# snapshots/group-snapshots work out of the box on this dev tier. The Helm chart
-# leaves this to the admin (it is one-per-cluster); here we install it directly.
+# external-snapshotter cluster singleton (ordinary snapshot CRDs + a
+# version-matched controller) so snapshots work out of the box on this dev tier.
+# The Helm chart leaves this to the admin; here we install it directly.
 bash "$REPO/hack/install-snapshotter.sh"
-# Now the snapshot/group classes in 50-storageclass.yaml have their CRDs present.
+# Now the VolumeSnapshotClass in 50-storageclass.yaml has its CRDs present.
 kubectl apply -f "$REPO/deploy/50-storageclass.yaml"
 kubectl label node "$SERVER" "$AGENT" topology.kubernetes.io/zone=galileo --overwrite
 

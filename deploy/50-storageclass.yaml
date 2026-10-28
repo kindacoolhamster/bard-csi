@@ -235,22 +235,9 @@ metadata:
 driver: csi.bard.io
 deletionPolicy: Delete
 # Optional: custom prefix for the backend rbd snapshot name (default "csi-snap-"),
-# recorded in the snapshot handle so delete/restore follow it. Also honoured on a
-# VolumeGroupSnapshotClass for group-snapshot members. ceph-csi parity.
+# recorded in the snapshot handle so delete/restore follow it. ceph-csi parity.
 # parameters:
 #   snapshotNamePrefix: "team-snap-"
----
-# VolumeGroupSnapshot: snapshot a set of volumes (selected by label) as one
-# group. Bard snapshots each member individually and returns them together, so a
-# group can even span multiple Ceph clusters/instances -- but members are taken
-# in sequence, so the group is per-volume crash consistent, not atomic across
-# volumes. Needs external-snapshotter v8+ and the group-snapshot CRDs.
-apiVersion: groupsnapshot.storage.k8s.io/v1beta1
-kind: VolumeGroupSnapshotClass
-metadata:
-  name: bard-rbd-group-snapshot
-driver: csi.bard.io
-deletionPolicy: Delete
 ---
 # Runtime-mutable parameters: set `volumeAttributesClassName: bard-rbd-qos` on a
 # PVC (or change it) and the external-resizer calls ControllerModifyVolume, which

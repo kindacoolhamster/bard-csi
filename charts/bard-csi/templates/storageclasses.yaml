@@ -48,21 +48,6 @@ parameters:
   {{- toYaml . | nindent 2 }}
 {{- end }}
 {{- end }}
-{{- range .Values.volumeGroupSnapshotClasses }}
----
-apiVersion: groupsnapshot.storage.k8s.io/v1beta1
-kind: VolumeGroupSnapshotClass
-metadata:
-  name: {{ .name }}
-  labels:
-    {{- include "bard-csi.labels" $ | nindent 4 }}
-driver: csi.bard.io
-deletionPolicy: {{ .deletionPolicy | default "Delete" }}
-{{- with .parameters }}
-parameters:
-  {{- toYaml . | nindent 2 }}
-{{- end }}
-{{- end }}
 {{- range .Values.volumeAttributesClasses }}
 ---
 apiVersion: storage.k8s.io/v1

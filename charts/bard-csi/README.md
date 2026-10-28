@@ -8,7 +8,7 @@ node), the CSI sidecars, and the backend **plugin sidecars** you enable.
 **The chart owns** the driver runtime: core, CSI sidecars (provisioner, resizer,
 snapshotter, health-monitor, registrar, liveness-probe), plugin sidecar wiring,
 RBAC, the `BackendCluster` CRD, the `CSIDriver` object, and (optional) the
-StorageClass / VolumeSnapshotClass / VolumeAttributesClass / VolumeGroupSnapshotClass.
+StorageClass / VolumeSnapshotClass / VolumeAttributesClass.
 
 For a **first-party backend with a native profile** (ceph-rbd, cephfs, iscsi) you
 describe it in its own terms (mons, pool/fsName, user, zone — or for iscsi, its VG
@@ -35,13 +35,12 @@ backend instances/zones.
 #    singleton this chart deliberately does NOT bundle; install its CRDs + a
 #    snapshot-controller pinned to the SAME version the sidecar uses (v8.2.0):
 #      V=v8.2.0; B=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/$V
-#      for c in snapshot.storage.k8s.io_volumesnapshot{classes,contents,s} \
-#               groupsnapshot.storage.k8s.io_volumegroupsnapshot{classes,contents,s}; do
+#      for c in snapshot.storage.k8s.io_volumesnapshot{classes,contents,s}; do
 #        kubectl apply -f "$B/client/config/crd/$c.yaml"; done
 #      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
 #      kubectl apply -f "$B/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
-#      # upstream's manifest MISPINS the controller image to v8.0.1, which — with the
-#      # group-snapshot gate the sidecar sets — stalls even PLAIN snapshots; force it:
+#      # upstream's manifest pins the controller IMAGE to v8.0.1 even under the
+#      # v8.2.0 tag, so force it to match the sidecar:
 #      kubectl -n kube-system set image deploy/snapshot-controller \
 #        snapshot-controller=registry.k8s.io/sig-storage/snapshot-controller:$V
 #    (from a source checkout, hack/install-snapshotter.sh does exactly this.)
@@ -228,7 +227,6 @@ across all enabled node plugins, since they are pod-wide.
 | `storageCapacity` | `true` | CSIStorageCapacity (CSIDriver + provisioner + RBAC) |
 | `zoneLabel` | `topology.kubernetes.io/zone` | node label the driver reads for topology |
 | `sidecars.*.enabled` / `.image` | on / pinned | RBAC tracks what's enabled |
-| `sidecars.snapshotter.groupSnapshots` | `true` | adds the group-snapshot gate + RBAC |
 | `sidecars.csiAddons.enabled` | `false` | csi-addons ops: ReclaimSpace, NetworkFence, VolumeReplication (mirroring/DR), VolumeGroup, EncryptionKeyRotation (sidecar + endpoint + RBAC); needs the csi-addons controller installed separately |
 | `attach.enabled` | `false` | control-plane attach: flips the CSIDriver's `attachRequired` (immutable) + adds the external-attacher + RBAC. **Required by `plugins.iscsi`** (the chart fails the render otherwise); node-mapped backends no-op it |
 | `node.kubeletDir` | `/var/lib/kubelet` | override for non-standard distros |

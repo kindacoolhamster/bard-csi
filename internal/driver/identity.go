@@ -34,12 +34,6 @@ func (s *identityServer) GetPluginCapabilities(_ context.Context, _ *csi.GetPlug
 					Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_VOLUME_ACCESSIBILITY_CONSTRAINTS},
 				},
 			},
-			{
-				// We serve the GroupController service (VolumeGroupSnapshot).
-				Type: &csi.PluginCapability_Service_{
-					Service: &csi.PluginCapability_Service{Type: csi.PluginCapability_Service_GROUP_CONTROLLER_SERVICE},
-				},
-			},
 		},
 	}, nil
 }
