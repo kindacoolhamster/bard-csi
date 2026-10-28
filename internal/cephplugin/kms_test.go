@@ -298,3 +298,51 @@ func TestUnknownKMSType(t *testing.T) {
 		t.Fatalf("expected an unknown-KMS-type error, got %v", err)
 	}
 }
+
+// DeleteVolume of an encrypted volume that still has a live snapshot must leave the
+// volume untouched: rbd rm refuses it anyway, and the key is what a restore from
+// that snapshot copies. Deleting the key first (the old order) failed the delete AND
+// made every surviving snapshot unrestorable. Once the snapshot is gone, the delete
+// converges and reaps the key.
+func TestDeleteVolumeWithSnapshotKeepsKMSKey(t *testing.T) {
+	fv := newFakeVault()
+	srv := httptest.NewServer(fv.handler())
+	defer srv.Close()
+	b := New(map[string]ClusterConfig{"east": {Monitors: []string{"10.0.0.10:6789"}, Pool: "replicapool", UserID: "admin"}}, "", "", fakerun.New()).
+		WithKMS(map[string]KMSConfig{"vault-test": {Type: "vault", Address: srv.URL, Token: "dev-token"}})
+	ctx := context.Background()
+
+	create, err := b.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{
+		Name: "v", CapacityBytes: 1 << 30, Instance: "east",
+		Parameters: map[string]string{"pool": "replicapool", paramEncrypted: "true", paramEncryptionKMSID: "vault-test"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vol := bardplugin.VolumeRef{Instance: "east", Location: create.Location, Name: create.Name}
+	if _, err := b.encryptionPassphrase(ctx, "east", "vault-test", vol.Location+"/"+vol.Name, nil); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := b.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: "s", SourceVolume: vol})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := b.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: vol}); err == nil {
+		t.Fatal("DeleteVolume must fail while a live snapshot exists")
+	}
+	if len(fv.store) != 1 {
+		t.Fatalf("the Vault key must survive a refused delete (a restore needs it), %d entries left", len(fv.store))
+	}
+
+	snapRef := bardplugin.VolumeRef{Instance: "east", Location: snap.Location, Name: snap.Name}
+	if err := b.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef}); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: vol}); err != nil {
+		t.Fatalf("DeleteVolume after the snapshot is gone: %v", err)
+	}
+	if len(fv.store) != 0 {
+		t.Fatalf("DeleteVolume must then remove the Vault entry, %d left", len(fv.store))
+	}
+}

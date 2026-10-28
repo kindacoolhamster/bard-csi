@@ -1262,6 +1262,17 @@ func (b *Backend) DeleteVolume(ctx context.Context, req *bardplugin.DeleteVolume
 		return err
 	}
 	if kmsID != "" {
+		// rbd rm refuses an image with live snapshots, so deleting the key first would
+		// leave those snapshots unrestorable (a restore copies the SOURCE's key) while
+		// the delete fails anyway. CSI: a volume that cannot be deleted without
+		// affecting its snapshots MUST NOT be altered -- so check before the key goes.
+		snaps, err := b.listSnaps(ctx, conn, spec)
+		if err != nil {
+			return err
+		}
+		if len(snaps) > 0 {
+			return fmt.Errorf("ceph-rbd: rm %s: image has %d snapshot(s) - not removing (delete its VolumeSnapshots first)", spec, len(snaps))
+		}
 		if err := b.kms.DeleteKey(ctx, conn, req.Volume.Instance, kmsID, req.Volume.Location+"/"+req.Volume.Name); err != nil {
 			return err
 		}

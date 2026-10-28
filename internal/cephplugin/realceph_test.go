@@ -2,6 +2,7 @@ package cephplugin
 
 import (
 	"context"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -138,4 +139,99 @@ func TestRealCeph(t *testing.T) {
 		t.Fatalf("clone must survive the source delete: size %dMiB, err %v", got, err)
 	}
 	t.Log("source deleted while the clone lives; clone intact")
+}
+
+// TestRealCephDeleteWithSnapshotKeepsKey proves the DeleteVolume snapshot guard
+// against real `rbd`: an encrypted volume with a live snapshot is refused with its
+// KMS key intact, while a snapshot that was deleted but still has a linked restore
+// (clone v2 moves it to the trash namespace) does NOT block -- the key is reaped and
+// the delete converges once the restore is flattened. The KMS is an in-process fake
+// Vault; the rbd side is real. Same env gate as TestRealCeph.
+func TestRealCephDeleteWithSnapshotKeepsKey(t *testing.T) {
+	if os.Getenv("BARD_CEPH_TEST") != "1" {
+		t.Skip("set BARD_CEPH_TEST=1 (and CEPH_MON/POOL/USER/KEY) to run against real Ceph")
+	}
+	mon, pool, user, key := os.Getenv("CEPH_MON"), os.Getenv("CEPH_POOL"), os.Getenv("CEPH_USER"), os.Getenv("CEPH_KEY")
+	if mon == "" || pool == "" || user == "" || key == "" {
+		t.Fatal("CEPH_MON, CEPH_POOL, CEPH_USER and CEPH_KEY must all be set")
+	}
+	fv := newFakeVault()
+	srv := httptest.NewServer(fv.handler())
+	defer srv.Close()
+	const instance = "real"
+	be := New(map[string]ClusterConfig{instance: {Monitors: []string{mon}, Pool: pool, UserID: user}}, "", "", nil).
+		WithKMS(map[string]KMSConfig{"vault-test": {Type: "vault", Address: srv.URL, Token: "dev-token"}})
+	secrets := map[string]string{"userID": user, "userKey": key}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	params := map[string]string{"pool": pool, paramEncrypted: "true", paramEncryptionKMSID: "vault-test"}
+
+	name := "delkey-" + time.Now().Format("150405")
+	vol, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{
+		Name: name, CapacityBytes: 16 << 20, Instance: instance, Parameters: params, Secrets: secrets,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	volRef := bardplugin.VolumeRef{Instance: instance, Location: vol.Location, Name: vol.Name}
+	defer be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets})
+	if _, err := be.encryptionPassphrase(ctx, instance, "vault-test", vol.Location+"/"+vol.Name, secrets); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := be.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: name + "-snap", SourceVolume: volRef, Secrets: secrets})
+	if err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	snapRef := bardplugin.VolumeRef{Instance: instance, Location: snap.Location, Name: snap.Name}
+	defer be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets})
+
+	// 1. Live snapshot: refused, volume untouched (key still in the KMS).
+	if err := be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets}); err == nil {
+		t.Fatal("DeleteVolume must be refused while a live snapshot exists")
+	} else {
+		t.Logf("refused as expected: %v", err)
+	}
+	if len(fv.store) != 1 {
+		t.Fatalf("the source key must survive a refused delete, %d entries", len(fv.store))
+	}
+
+	// 2. Restore from the snapshot (gets its own key copy), then delete the snapshot:
+	// with a linked clone it moves to the trash namespace instead of vanishing.
+	restore, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{
+		Name: name + "-restore", CapacityBytes: 16 << 20, Instance: instance, Parameters: params,
+		Secrets: secrets, SourceSnapshot: &snapRef,
+	})
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	restoreRef := bardplugin.VolumeRef{Instance: instance, Location: restore.Location, Name: restore.Name}
+	defer be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: restoreRef, Secrets: secrets})
+	if len(fv.store) != 2 {
+		t.Fatalf("the restore must hold its own key copy, %d entries", len(fv.store))
+	}
+	if err := be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets}); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+
+	// 3. Only a trashed snapshot remains: the guard must not block. The delete may
+	// fail on the linked clone until the flatten it kicks lands; it must converge.
+	var lastErr error
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
+		if lastErr = be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets}); lastErr == nil {
+			break
+		}
+		t.Logf("delete retry: %v", lastErr)
+	}
+	if lastErr != nil {
+		t.Fatalf("DeleteVolume did not converge with only a trashed snapshot: %v", lastErr)
+	}
+	if len(fv.store) != 1 {
+		t.Fatalf("source key reaped and restore key kept: want 1 entry, have %d", len(fv.store))
+	}
+	if err := be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: restoreRef, Secrets: secrets}); err != nil {
+		t.Fatalf("DeleteVolume (restore): %v", err)
+	}
+	if len(fv.store) != 0 {
+		t.Fatalf("all keys reaped: %d entries left", len(fv.store))
+	}
 }
