@@ -487,8 +487,23 @@ func (b *Backend) setOwnerMetadata(ctx context.Context, conn []string, spec stri
 	}
 }
 
-// imageMetaSet records a key/value on an rbd image.
+// metaAddr maps a metadata target to the image and key that hold it. An rbd
+// snapshot carries no image-meta of its own, so a snapshot spec ("pool/img@snap")
+// stores its values on its image under snapshot-qualified keys ("<key>@<snap>").
+// That lets a snapshot own an encryption descriptor (see CreateSnapshot) through the
+// same Host interface a volume uses. librbd copies these keys onto every clone of
+// the image along with the rest of its meta; they are inert there (nothing reads a
+// clone's keys qualified by its source's snapshot names).
+func metaAddr(spec, key string) (string, string) {
+	if img, snap, ok := strings.Cut(spec, "@"); ok {
+		return img, key + "@" + snap
+	}
+	return spec, key
+}
+
+// imageMetaSet records a key/value on an rbd image (or snapshot, via metaAddr).
 func (b *Backend) imageMetaSet(ctx context.Context, conn []string, spec, key, value string) error {
+	spec, key = metaAddr(spec, key)
 	if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "set", spec, key, value)...); err != nil {
 		return fmt.Errorf("ceph-rbd: image-meta set %s %s: %w", spec, key, err)
 	}
@@ -507,6 +522,7 @@ func (b *Backend) imageMetaGet(ctx context.Context, conn []string, spec, key str
 // guard, the KMS-id lookup, and every read the KMS providers or encrypted-clone
 // inheritance act on -- use this form and surface the error for a retry.
 func (b *Backend) imageMetaGetChecked(ctx context.Context, conn []string, spec, key string) (string, error) {
+	spec, key = metaAddr(spec, key)
 	out, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "get", spec, key)...)
 	if err != nil {
 		if isNotFound(err) {
@@ -515,6 +531,16 @@ func (b *Backend) imageMetaGetChecked(ctx context.Context, conn []string, spec, 
 		return "", fmt.Errorf("ceph-rbd: image-meta get %s %s: %w", spec, key, err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+// imageMetaRemove deletes an image-meta key (or a snapshot's, via metaAddr); an
+// absent key or image is success.
+func (b *Backend) imageMetaRemove(ctx context.Context, conn []string, spec, key string) error {
+	spec, key = metaAddr(spec, key)
+	if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "remove", spec, key)...); err != nil && !isNotFound(err) {
+		return fmt.Errorf("ceph-rbd: image-meta remove %s %s: %w", spec, key, err)
+	}
+	return nil
 }
 
 // imageInfo queries an rbd image's size, returning errImageNotFound if absent.
@@ -853,7 +879,11 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 			// Fresh AND resumed: a retried create whose first attempt died (or whose
 			// response was lost) must still advertise the inherited key identity, or
 			// the node resolves a key that cannot open the copied LUKS header.
-			encKeyID, err = b.inheritEncryption(ctx, conn, cloneSourceImageSpec(req), spec, req.Instance, req.Secrets)
+			src, err := b.encryptionSourceSpec(ctx, conn, req)
+			if err != nil {
+				return nil, err
+			}
+			encKeyID, err = b.inheritEncryption(ctx, conn, src, spec, req.Instance, req.Secrets)
 			if err != nil {
 				return nil, err
 			}
@@ -964,6 +994,26 @@ func cloneSourceImageSpec(req *bardplugin.CreateVolumeRequest) string {
 	return req.SourceVolume.Location + "/" + req.SourceVolume.Name
 }
 
+// encryptionSourceSpec is where a clone inherits its encryption descriptor from. A
+// restore uses its snapshot's own descriptor, captured by CreateSnapshot: the
+// source volume's key may have been rotated since, and the snapshot's LUKS header
+// holds only the key that was current when it was taken. A snapshot without one
+// (taken before snapshots captured their key, or of a derived-key volume, whose key
+// never changes) falls back to the source image, as do PVC-PVC clones.
+func (b *Backend) encryptionSourceSpec(ctx context.Context, conn []string, req *bardplugin.CreateVolumeRequest) (string, error) {
+	if req.SourceSnapshot != nil {
+		snapSpec := req.SourceSnapshot.Location + "/" + req.SourceSnapshot.Name // "image@snap"
+		kmsID, err := b.imageMetaGetChecked(ctx, conn, snapSpec, imgMetaKMSID)
+		if err != nil {
+			return "", err
+		}
+		if kmsID != "" {
+			return snapSpec, nil
+		}
+	}
+	return cloneSourceImageSpec(req), nil
+}
+
 // inheritEncryption makes an encrypted clone open with its source's key. rbd
 // clone/cp copies the source's LUKS header byte-for-byte; librbd also copies its
 // image-meta, but external key material (Vault, Azure, KMIP) is not copied, and a
@@ -981,6 +1031,10 @@ func cloneSourceImageSpec(req *bardplugin.CreateVolumeRequest) string {
 // prefers the clone's own value -- librbd's clone/cp already copied the parent's
 // image-meta, and a resumed create may have written it -- and falls back to the
 // source's, so a retry stays correct even if the source has since been deleted.
+// A snapshot source is the exception: its captured descriptor is authoritative and
+// read first, because what librbd copied onto the clone is the image's CURRENT
+// meta, which a key rotation after the snapshot has made wrong for its header.
+// CreateSnapshot also calls this, with the snapshot as the "clone", to capture it.
 func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSpec, cloneSpec, instance string, secrets map[string]string) (string, error) {
 	// The source's key identity: its recorded id, else its own pool/image (covers a
 	// source provisioned before this descriptor existed, whose derived passphrase
@@ -989,11 +1043,15 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 	// Every source read is checked: a misread would give the clone the wrong (or no)
 	// descriptor, and its first stage would then mint a key that can never open the
 	// copied LUKS header.
+	first, second := cloneSpec, sourceSpec
+	if strings.Contains(sourceSpec, "@") {
+		first, second = sourceSpec, cloneSpec
+	}
 	inherited := func(key string) (string, error) {
-		if v, err := b.imageMetaGetChecked(ctx, conn, cloneSpec, key); err != nil || v != "" {
+		if v, err := b.imageMetaGetChecked(ctx, conn, first, key); err != nil || v != "" {
 			return v, err
 		}
-		return b.imageMetaGetChecked(ctx, conn, sourceSpec, key)
+		return b.imageMetaGetChecked(ctx, conn, second, key)
 	}
 	keyID, err := inherited(imgMetaKeyID)
 	if err != nil {
@@ -1390,6 +1448,22 @@ func (b *Backend) CreateSnapshot(ctx context.Context, req *bardplugin.CreateSnap
 	if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "snap", "create", snapSpec)...); err != nil && !isAlreadyExists(err) {
 		return nil, fmt.Errorf("ceph-rbd: snap create %s: %w", snapSpec, err)
 	}
+	// An encrypted volume's snapshot owns a copy of the key its LUKS header was
+	// written with, taken now: a later key rotation replaces the volume's stored key
+	// (and destroys/overwrites the old one), but leaves this header with only the
+	// old keyslot. Restores inherit from this copy (encryptionSourceSpec). Idempotent
+	// on a retried create. A derived-key volume (no KMS id) has nothing to copy.
+	// A rotation that races the snapshot can still capture the wrong key.
+	srcSpec := src.Location + "/" + src.Name
+	kmsID, err := b.imageMetaGetChecked(ctx, conn, srcSpec, imgMetaKMSID)
+	if err != nil {
+		return nil, err
+	}
+	if kmsID != "" {
+		if _, err := b.inheritEncryption(ctx, conn, srcSpec, snapSpec, src.Instance, req.Secrets); err != nil {
+			return nil, err
+		}
+	}
 	// The restore size the CO records comes from here; a transiently failed read
 	// must fail the (idempotent) create for a retry, not report size 0.
 	sizeMiB, err := b.imageInfo(ctx, conn, src.Location+"/"+src.Name)
@@ -1421,6 +1495,23 @@ func (b *Backend) DeleteSnapshot(ctx context.Context, req *bardplugin.DeleteSnap
 	spec := req.Snapshot.Location + "/" + req.Snapshot.Name // Name encodes "image@snap"
 	if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "snap", "rm", spec)...); err != nil && !isNotFound(err) {
 		return fmt.Errorf("ceph-rbd: snap rm %s: %w", spec, err)
+	}
+	// Then reap the snapshot's own key copy (CreateSnapshot). Its descriptor lives on
+	// the image, so it survives the snap rm and a failed step converges on retry.
+	// Restores already hold their own copies.
+	kmsID, err := b.imageMetaGetChecked(ctx, conn, spec, imgMetaKMSID)
+	if err != nil {
+		return err
+	}
+	if kmsID != "" {
+		if err := b.kms.DeleteKey(ctx, conn, req.Snapshot.Instance, kmsID, spec); err != nil {
+			return err
+		}
+		for _, k := range []string{imgMetaWrappedDEK, cephenc.MetaKMIPUID, cephenc.MetaKMIPOwner, imgMetaKeyID, imgMetaKMSID} {
+			if err := b.imageMetaRemove(ctx, conn, spec, k); err != nil {
+				return err
+			}
+		}
 	}
 	// Release the CSI snapshot name so it can be reused against another source.
 	b.mu.Lock()

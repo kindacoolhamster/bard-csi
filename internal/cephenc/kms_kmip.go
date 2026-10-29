@@ -150,15 +150,15 @@ func (k *kmipKeyService) cloneKey(ctx context.Context, conn []string, instance, 
 	if srcUID == "" {
 		return nil
 	}
-	// Idempotent: librbd copies the source's UID onto a fresh clone, so a clone UID
-	// that DIFFERS from the source's is the clone's own object from an earlier
-	// attempt. Registering again would leak that object; keeping the copied
-	// source UID would let the clone's delete Destroy the source's key.
-	cloneUID, err := k.host.MetaGet(ctx, conn, cloneSpec, MetaKMIPUID)
+	// Idempotent: an earlier attempt that registered the clone's own object recorded
+	// the clone as its owner. Anything else -- no UID, or a UID librbd copied from the
+	// source (whose owner marker, if any, names the source) -- is not the clone's:
+	// keeping a copied UID would let the clone's delete Destroy the source's key.
+	owner, err := k.host.MetaGet(ctx, conn, cloneSpec, MetaKMIPOwner)
 	if err != nil {
 		return err
 	}
-	if cloneUID != "" && cloneUID != srcUID {
+	if owner == cloneSpec {
 		return nil
 	}
 	pass, err := k.get(ctx, srcUID)
@@ -169,7 +169,12 @@ func (k *kmipKeyService) cloneKey(ctx context.Context, conn []string, instance, 
 	if err != nil {
 		return err
 	}
-	return k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPUID, newUID)
+	// UID before owner: a crash between them re-registers on retry (one leaked
+	// object), never marks a copied UID as owned.
+	if err := k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPUID, newUID); err != nil {
+		return err
+	}
+	return k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPOwner, cloneSpec)
 }
 
 // rotateKey Registers a NEW SecretData on the HSM, lets the node add it to the LUKS

@@ -52,6 +52,11 @@ const (
 	// MetaKMIPUID records the KMIP object UID holding the passphrase (the secret lives
 	// on the HSM, not the volume, so DeleteVolume must Destroy it explicitly).
 	MetaKMIPUID = "bard.encryptionKMIPUID"
+	// MetaKMIPOwner names the volume (or snapshot) whose own object MetaKMIPUID
+	// points at, as written by cloneKey. librbd copies a parent's meta onto a clone,
+	// so a recorded UID alone does not say whether this volume owns that object or
+	// carries a copy of its source's.
+	MetaKMIPOwner = "bard.encryptionKMIPOwner"
 )
 
 // IsEncrypted reports whether a volume context marks the volume for encryption.
