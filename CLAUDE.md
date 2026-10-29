@@ -420,10 +420,17 @@ leaves the StatefulSet running as the standing workload.
   doesn't model protect) until a live restore surfaced it.
 - **Encrypted clone/restore must inherit the source's key.** A clone (`rbd clone`
   from a snapshot, or `rbd cp`) copies the source's LUKS header byte-for-byte, so
-  the clone is encrypted under the *source's* passphrase -- but `rbd clone/cp`
-  copies **no image-meta**, and every KMS provider keys off the new volume's
-  identity, so a naive clone resolves the wrong key and `cryptsetup open` fails.
-  `CreateVolume` now calls `inheritEncryption` on an encrypted clone: it copies the
+  the clone is encrypted under the *source's* passphrase, while every KMS provider
+  keys off the new volume's identity, so a naive clone resolves the wrong key and
+  `cryptsetup open` fails. NOTE (live-verified on Ceph 20.2, 2026-10-28; this file
+  used to claim the opposite): `rbd clone` AND `rbd cp` **DO copy the parent's
+  image-meta** -- so a fresh clone already carries the source's descriptor,
+  including a KMIP UID that, left in place, would make the clone's delete Destroy
+  the SOURCE's HSM object (and a `bard.static` mark, so a restore of a static
+  image inherits the delete no-op). The fake runner models the copy.
+  `CreateVolume` calls `inheritEncryption` on EVERY create of an encrypted clone,
+  fresh or resumed (a provisioner retry once skipped it and advertised no key
+  identity); each field prefers the clone's own value, else the source's. It copies the
   source's encryption descriptor (`bard.encryptionKMSID`, `bard.encryptionKeyID`,
   and any `bard.encryptionDEK`) onto the clone and, for Vault, duplicates the KV
   entry into the clone's own slot. So the clone is **self-contained** -- opens with
@@ -433,9 +440,16 @@ leaves the StatefulSet running as the standing workload.
   re-derives from it, secrets-metadata/Vault use the clone's own copied slot. Two
   caveats: (1) **restore to a compatible (same-KMS) StorageClass** -- the ciphertext
   is bound to the source's provider, so restoring under a different `encryptionKMSID`
-  fails to open; (2) the descriptor is read from the **source image at restore
-  time**, so deleting the source image before restoring its snapshot (clone-v2
-  allows this) loses the descriptor -- the data is intact but unopenable. Unit-proven
+  fails to open; (2) **a snapshot owns its own key copy, taken at CreateSnapshot**
+  (2026-10-28): its descriptor lives on the source image under snapshot-qualified
+  meta keys (`<key>@<snap>`, rbd snapshots carry no meta), external providers get a
+  snapshot-owned entry, and a restore inherits from THAT, not the source's current
+  key. Before this, a key rotation made every pre-rotation snapshot permanently
+  unrestorable (live-proven: the restored LUKS header opened only with the destroyed
+  old key) -- and a snapshot taken BEFORE this fix still has no copy, so it falls
+  back to the source's current key and breaks if the source is rotated. KMIP marks
+  object ownership (`bard.encryptionKMIPOwner`) because librbd copies a parent's
+  UID onto its clones. DeleteSnapshot reaps the copy. Unit-proven
   for all three providers (`encryption_clone_test.go`: clone opens with the source
   key, clone-delete preserves the source, derived chains to the root identity).
   **Live-proven on the k3s krbd tier (2026-06-20)** for both deployed providers

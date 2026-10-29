@@ -102,8 +102,14 @@ func (k *kmipKeyService) passphrase(ctx context.Context, conn []string, instance
 	}
 	defer cleanup()
 
-	if uid := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID); uid != "" {
-		return k.get(ctx, uid)
+	// A failed read fails closed -- registering here would repoint the recorded UID
+	// at a new passphrase and orphan the one the volume was formatted with.
+	recorded, err := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID)
+	if err != nil {
+		return "", err
+	}
+	if recorded != "" {
+		return k.get(ctx, recorded)
 	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -117,7 +123,7 @@ func (k *kmipKeyService) passphrase(ctx context.Context, conn []string, instance
 	if err := k.host.MetaSet(ctx, conn, spec, MetaKMIPUID, uid); err != nil {
 		// Recording the UID failed -- the object would be orphaned. Prefer a UID a
 		// concurrent stage may have stored, else destroy ours and surface the error.
-		if u := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID); u != "" && u != uid {
+		if u, _ := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID); u != "" && u != uid {
 			_ = k.destroy(ctx, uid)
 			return k.get(ctx, u)
 		}
@@ -137,8 +143,22 @@ func (k *kmipKeyService) cloneKey(ctx context.Context, conn []string, instance, 
 		return err
 	}
 	defer cleanup()
-	srcUID := k.host.MetaGet(ctx, conn, sourceSpec, MetaKMIPUID)
+	srcUID, err := k.host.MetaGet(ctx, conn, sourceSpec, MetaKMIPUID)
+	if err != nil {
+		return err
+	}
 	if srcUID == "" {
+		return nil
+	}
+	// Idempotent: an earlier attempt that registered the clone's own object recorded
+	// the clone as its owner. Anything else -- no UID, or a UID librbd copied from the
+	// source (whose owner marker, if any, names the source) -- is not the clone's:
+	// keeping a copied UID would let the clone's delete Destroy the source's key.
+	owner, err := k.host.MetaGet(ctx, conn, cloneSpec, MetaKMIPOwner)
+	if err != nil {
+		return err
+	}
+	if owner == cloneSpec {
 		return nil
 	}
 	pass, err := k.get(ctx, srcUID)
@@ -149,7 +169,12 @@ func (k *kmipKeyService) cloneKey(ctx context.Context, conn []string, instance, 
 	if err != nil {
 		return err
 	}
-	return k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPUID, newUID)
+	// UID before owner: a crash between them re-registers on retry (one leaked
+	// object), never marks a copied UID as owned.
+	if err := k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPUID, newUID); err != nil {
+		return err
+	}
+	return k.host.MetaSet(ctx, conn, cloneSpec, MetaKMIPOwner, cloneSpec)
 }
 
 // rotateKey Registers a NEW SecretData on the HSM, lets the node add it to the LUKS
@@ -163,7 +188,10 @@ func (k *kmipKeyService) rotateKey(ctx context.Context, conn []string, instance,
 		return err
 	}
 	defer cleanup()
-	oldUID := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID)
+	oldUID, err := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID)
+	if err != nil {
+		return err
+	}
 	pass, err := randomPassphrase()
 	if err != nil {
 		return err
@@ -194,7 +222,10 @@ func (k *kmipKeyService) deleteKey(ctx context.Context, conn []string, instance,
 		return err
 	}
 	defer cleanup()
-	uid := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID)
+	uid, err := k.host.MetaGet(ctx, conn, spec, MetaKMIPUID)
+	if err != nil {
+		return err // never report success: rbd rm would then drop the UID and orphan the object
+	}
 	if uid == "" {
 		return nil
 	}

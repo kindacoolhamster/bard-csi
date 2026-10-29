@@ -328,16 +328,20 @@ func TestDeleteVolumeWithSnapshotKeepsKMSKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	before := len(fv.store) // the volume's key + the snapshot's own copy
 	if err := b.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: vol}); err == nil {
 		t.Fatal("DeleteVolume must fail while a live snapshot exists")
 	}
-	if len(fv.store) != 1 {
-		t.Fatalf("the Vault key must survive a refused delete (a restore needs it), %d entries left", len(fv.store))
+	if len(fv.store) != before {
+		t.Fatalf("a refused delete must not touch the Vault: %d entries -> %d", before, len(fv.store))
 	}
 
 	snapRef := bardplugin.VolumeRef{Instance: "east", Location: snap.Location, Name: snap.Name}
 	if err := b.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef}); err != nil {
 		t.Fatal(err)
+	}
+	if len(fv.store) != 1 {
+		t.Fatalf("DeleteSnapshot must reap only the snapshot's copy, %d entries left", len(fv.store))
 	}
 	if err := b.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: vol}); err != nil {
 		t.Fatalf("DeleteVolume after the snapshot is gone: %v", err)

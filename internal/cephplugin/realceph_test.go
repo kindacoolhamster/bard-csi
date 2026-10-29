@@ -4,9 +4,11 @@ import (
 	"context"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/kindacoolhamster/bard-csi/internal/cephenc"
 	"github.com/kindacoolhamster/bard-csi/pkg/bardplugin"
 )
 
@@ -141,6 +143,226 @@ func TestRealCeph(t *testing.T) {
 	t.Log("source deleted while the clone lives; clone intact")
 }
 
+// TestRealCephKMSFailClosed proves, against real `rbd image-meta`, that the metadata
+// store the KMS providers sit on classifies real Ceph errors correctly: an absent key
+// or image reads as absent (so a fresh volume's first stage still mints), while a
+// failed read (here: a wrong cephx key) is an error, never "absent" -- the misread
+// that let a provider mint over, and destroy, a stored key. Same env gate as
+// TestRealCeph.
+func TestRealCephKMSFailClosed(t *testing.T) {
+	if os.Getenv("BARD_CEPH_TEST") != "1" {
+		t.Skip("set BARD_CEPH_TEST=1 (and CEPH_MON/POOL/USER/KEY) to run against real Ceph")
+	}
+	mon, pool, user, key := os.Getenv("CEPH_MON"), os.Getenv("CEPH_POOL"), os.Getenv("CEPH_USER"), os.Getenv("CEPH_KEY")
+	if mon == "" || pool == "" || user == "" || key == "" {
+		t.Fatal("CEPH_MON, CEPH_POOL, CEPH_USER and CEPH_KEY must all be set")
+	}
+	const instance = "real"
+	keyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(keyDir, instance), []byte("real-ceph-test-master-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	be := New(map[string]ClusterConfig{instance: {Monitors: []string{mon}, Pool: pool, UserID: user}}, "", "", nil).
+		WithEncryption(keyDir).
+		WithKMS(map[string]KMSConfig{"k8s": {Type: "secrets-metadata"}})
+	secrets := map[string]string{"userID": user, "userKey": key}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	name := "kms-failclosed-" + time.Now().Format("150405")
+	vol, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{
+		Name: name, CapacityBytes: 16 << 20, Instance: instance,
+		Parameters: map[string]string{"pool": pool}, Secrets: secrets,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	volRef := bardplugin.VolumeRef{Instance: instance, Location: vol.Location, Name: vol.Name}
+	defer func() {
+		if err := be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets}); err != nil {
+			t.Errorf("DeleteVolume: %v", err)
+		}
+	}()
+	spec := vol.Location + "/" + vol.Name
+	conn, connCleanup, err := be.connArgs(be.clusters[instance], instance, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connCleanup()
+
+	if v, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK); v != "" || err != nil {
+		t.Fatalf("absent key on a real image must read (\"\", nil), got %q, %v", v, err)
+	}
+	if v, err := be.MetaGet(ctx, conn, vol.Location+"/no-such-image-"+name, imgMetaWrappedDEK); v != "" || err != nil {
+		t.Fatalf("absent image must read (\"\", nil), got %q, %v", v, err)
+	}
+	p1, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, secrets)
+	if err != nil {
+		t.Fatalf("first stage must mint on a real absent key: %v", err)
+	}
+	stored, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK)
+	if err != nil || stored == "" {
+		t.Fatalf("expected the wrapped DEK in real image-meta, got %q, %v", stored, err)
+	}
+
+	// A real failed read: same mon, wrong cephx key.
+	bad := []byte(key)
+	if bad[20] == 'A' {
+		bad[20] = 'B'
+	} else {
+		bad[20] = 'A'
+	}
+	badSecrets := map[string]string{"userID": user, "userKey": string(bad)}
+	if _, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, badSecrets); err == nil {
+		t.Fatal("a stage whose metadata read fails must error, not mint")
+	} else {
+		t.Logf("failed read surfaced as: %v", err)
+	}
+
+	if got, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK); err != nil || got != stored {
+		t.Fatalf("stored wrapped DEK changed: %q -> %q (%v)", stored, got, err)
+	}
+	p2, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, secrets)
+	if err != nil || p2 != p1 {
+		t.Fatalf("restage must resolve the original key (err %v, same=%v)", err, p2 == p1)
+	}
+}
+
+// TestRealCephEncryptedRestoreRetry drives a retried encrypted restore through real
+// `rbd` (whose clone copies the parent's image-meta onto the child): the retry must
+// advertise the same inherited key identity and resolve the SOURCE's passphrase, and
+// for KMIP the clone must end up with its own HSM object, not the copied source UID.
+// KMS servers are in-process fakes; the rbd side is real. Same env gate as TestRealCeph.
+func TestRealCephEncryptedRestoreRetry(t *testing.T) {
+	if os.Getenv("BARD_CEPH_TEST") != "1" {
+		t.Skip("set BARD_CEPH_TEST=1 (and CEPH_MON/POOL/USER/KEY) to run against real Ceph")
+	}
+	mon, pool, user, key := os.Getenv("CEPH_MON"), os.Getenv("CEPH_POOL"), os.Getenv("CEPH_USER"), os.Getenv("CEPH_KEY")
+	if mon == "" || pool == "" || user == "" || key == "" {
+		t.Fatal("CEPH_MON, CEPH_POOL, CEPH_USER and CEPH_KEY must all be set")
+	}
+	const instance = "real"
+	for _, kmsID := range []string{"" /*derived*/, "vault", "kmip"} {
+		t.Run("kms="+orDefault(kmsID, "derived"), func(t *testing.T) {
+			keyDir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(keyDir, instance), []byte("real-ceph-test-master-key"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fv := newFakeVault()
+			srv := httptest.NewServer(fv.handler())
+			defer srv.Close()
+			f := startFakeKMIP(t)
+			be := New(map[string]ClusterConfig{instance: {Monitors: []string{mon}, Pool: pool, UserID: user}}, "", "", nil).
+				WithEncryption(keyDir).
+				WithKMS(map[string]KMSConfig{
+					"vault": {Type: "vault", Address: srv.URL, Token: "dev-token"},
+					"kmip":  {Type: "kmip", KMIPEndpoint: f.addr, InsecureSkipVerify: true},
+				})
+			secrets := map[string]string{"userID": user, "userKey": key}
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			params := map[string]string{"pool": pool, paramEncrypted: "true"}
+			if kmsID != "" {
+				params[paramEncryptionKMSID] = kmsID
+			}
+			name := "cloneretry-" + orDefault(kmsID, "derived") + "-" + time.Now().Format("150405")
+
+			src, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{Name: name, CapacityBytes: 16 << 20, Instance: instance, Parameters: params, Secrets: secrets})
+			if err != nil {
+				t.Fatalf("CreateVolume: %v", err)
+			}
+			srcRef := bardplugin.VolumeRef{Instance: instance, Location: src.Location, Name: src.Name}
+			srcSpec := src.Location + "/" + src.Name
+			srcPass, err := be.encryptionPassphrase(ctx, instance, kmsID, srcSpec, secrets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snap, err := be.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: name + "-snap", SourceVolume: srcRef, Secrets: secrets})
+			if err != nil {
+				t.Fatalf("CreateSnapshot: %v", err)
+			}
+			snapRef := bardplugin.VolumeRef{Instance: instance, Location: snap.Location, Name: snap.Name}
+			restore := &bardplugin.CreateVolumeRequest{
+				Name: name + "-restore", CapacityBytes: 16 << 20, Instance: instance, Parameters: params,
+				Secrets: secrets, SourceSnapshot: &snapRef,
+			}
+			r1, err := be.CreateVolume(ctx, restore)
+			if err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			cloneRef := bardplugin.VolumeRef{Instance: instance, Location: r1.Location, Name: r1.Name}
+			cloneSpec := r1.Location + "/" + r1.Name
+			// Teardown in dependency order: restore, snapshot, source.
+			defer func() {
+				for _, step := range []func() error{
+					func() error {
+						return be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: cloneRef, Secrets: secrets})
+					},
+					func() error {
+						return be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets})
+					},
+					func() error {
+						return be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: srcRef, Secrets: secrets})
+					},
+				} {
+					if err := step(); err != nil {
+						t.Errorf("teardown: %v", err)
+					}
+				}
+			}()
+			conn, connCleanup, err := be.connArgs(be.clusters[instance], instance, secrets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connCleanup()
+
+			// Rewind the clone to "provisioned, key never cloned": it keeps only what
+			// real rbd clone copied from the parent.
+			switch kmsID {
+			case "vault":
+				if err := be.kms.DeleteKey(ctx, conn, instance, "vault", cloneSpec); err != nil {
+					t.Fatal(err)
+				}
+			case "kmip":
+				srcUID, err := be.MetaGet(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := be.kms.DeleteKey(ctx, conn, instance, "kmip", cloneSpec); err != nil {
+					t.Fatal(err)
+				}
+				if err := be.imageMetaSet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID, srcUID); err != nil {
+					t.Fatal(err)
+				}
+				if err := be.imageMetaRemove(ctx, conn, cloneSpec, cephenc.MetaKMIPOwner); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			r2, err := be.CreateVolume(ctx, restore)
+			if err != nil {
+				t.Fatalf("retried restore: %v", err)
+			}
+			k1, k2 := r1.Context[ctxEncryptionKeyID], r2.Context[ctxEncryptionKeyID]
+			if k1 == "" || k1 != k2 {
+				t.Fatalf("retry must advertise the same key identity: %q vs %q", k1, k2)
+			}
+			clonePass, err := be.encryptionPassphraseFor(ctx, nil, instance, kmsID, cloneSpec, k2, secrets)
+			if err != nil || clonePass != srcPass {
+				t.Fatalf("retried restore must resolve the source's passphrase (err %v)", err)
+			}
+			if kmsID == "kmip" {
+				srcUID, _ := be.MetaGet(ctx, conn, srcSpec, cephenc.MetaKMIPUID)
+				cloneUID, _ := be.MetaGet(ctx, conn, cloneSpec, cephenc.MetaKMIPUID)
+				if cloneUID == srcUID || f.count() != 3 { // source + snapshot + clone
+					t.Fatalf("clone must own its KMIP object (clone %q src %q, %d objects)", cloneUID, srcUID, f.count())
+				}
+			}
+			t.Logf("retry advertised %s and opened with the source key", k2)
+		})
+	}
+}
+
 // TestRealCephDeleteWithSnapshotKeepsKey proves the DeleteVolume snapshot guard
 // against real `rbd`: an encrypted volume with a live snapshot is refused with its
 // KMS key intact, while a snapshot that was deleted but still has a linked restore
@@ -185,13 +407,14 @@ func TestRealCephDeleteWithSnapshotKeepsKey(t *testing.T) {
 	snapRef := bardplugin.VolumeRef{Instance: instance, Location: snap.Location, Name: snap.Name}
 	defer be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets})
 
-	// 1. Live snapshot: refused, volume untouched (key still in the KMS).
+	// 1. Live snapshot: refused, volume untouched (its key and the snapshot's own
+	// copy both still in the KMS).
 	if err := be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets}); err == nil {
 		t.Fatal("DeleteVolume must be refused while a live snapshot exists")
 	} else {
 		t.Logf("refused as expected: %v", err)
 	}
-	if len(fv.store) != 1 {
+	if len(fv.store) != 2 {
 		t.Fatalf("the source key must survive a refused delete, %d entries", len(fv.store))
 	}
 
@@ -206,11 +429,14 @@ func TestRealCephDeleteWithSnapshotKeepsKey(t *testing.T) {
 	}
 	restoreRef := bardplugin.VolumeRef{Instance: instance, Location: restore.Location, Name: restore.Name}
 	defer be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: restoreRef, Secrets: secrets})
-	if len(fv.store) != 2 {
+	if len(fv.store) != 3 {
 		t.Fatalf("the restore must hold its own key copy, %d entries", len(fv.store))
 	}
 	if err := be.DeleteSnapshot(ctx, &bardplugin.DeleteSnapshotRequest{Snapshot: snapRef, Secrets: secrets}); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	if len(fv.store) != 2 {
+		t.Fatalf("DeleteSnapshot must reap only the snapshot's copy, %d entries", len(fv.store))
 	}
 
 	// 3. Only a trashed snapshot remains: the guard must not block. The delete may

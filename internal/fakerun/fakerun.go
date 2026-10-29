@@ -129,11 +129,18 @@ func (r *Runner) rbd(args []string) (string, error) {
 		r.images[pos[1]] = flagValueMiB(args, "--size")
 		return "", nil
 	case "clone", "cp":
-		// clone/cp <parent[@snap]> <dest>: inherit the parent's size. A `clone` is a
-		// COW child (records the parent for clone-depth tracking, inheriting the
-		// parent's own parent depth); a `cp` is an independent full copy (no parent).
+		// clone/cp <parent[@snap]> <dest>: inherit the parent's size and its
+		// image-meta (librbd copies the parent's metadata to the child for both --
+		// live-verified on Ceph 20.2). A `clone` is a COW child (records the parent
+		// for clone-depth tracking, inheriting the parent's own parent depth); a
+		// `cp` is an independent full copy (no parent).
 		base := strings.SplitN(pos[1], "@", 2)[0]
 		r.images[pos[2]] = r.images[base]
+		for k, v := range r.imageMeta {
+			if spec, key, ok := strings.Cut(k, "\x00"); ok && spec == base {
+				r.imageMeta[pos[2]+"\x00"+key] = v
+			}
+		}
 		if pos[0] == "clone" {
 			r.parents[pos[2]] = base
 		}
@@ -226,6 +233,13 @@ func (r *Runner) rbd(args []string) (string, error) {
 				return "", fmt.Errorf("rbd: failed to get metadata %s of image : (2) No such file or directory", pos[3])
 			}
 			return v, nil
+		case "remove":
+			k := pos[2] + "\x00" + pos[3]
+			if _, ok := r.imageMeta[k]; !ok {
+				return "", fmt.Errorf("rbd: removing metadata failed: (2) No such file or directory")
+			}
+			delete(r.imageMeta, k)
+			return "", nil
 		}
 		return "", nil
 	case "ls":

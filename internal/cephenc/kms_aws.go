@@ -115,8 +115,13 @@ func (a *awsKMSKeyService) passphrase(ctx context.Context, conn []string, instan
 	}
 	defer cleanup()
 
-	// Reopen path: the encrypted DEK already exists, so Decrypt and return it.
-	if blob := a.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); blob != "" {
+	// Reopen path: the encrypted DEK already exists, so Decrypt and return it. A
+	// failed read fails closed -- minting here would overwrite the stored DEK.
+	blob, err := a.host.MetaGet(ctx, conn, spec, MetaWrappedDEK)
+	if err != nil {
+		return "", err
+	}
+	if blob != "" {
 		pt, err := a.decrypt(ctx, blob)
 		if err != nil {
 			return "", err
@@ -130,7 +135,7 @@ func (a *awsKMSKeyService) passphrase(ctx context.Context, conn []string, instan
 	}
 	if err := a.host.MetaSet(ctx, conn, spec, MetaWrappedDEK, blob); err != nil {
 		// A concurrent first-stage may have stored its own DEK; prefer the stored one.
-		if b := a.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); b != "" {
+		if b, _ := a.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); b != "" {
 			if p, derr := a.decrypt(ctx, b); derr == nil {
 				return hex.EncodeToString(p), nil
 			}

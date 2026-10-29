@@ -180,6 +180,22 @@ func (b *Backend) encryptionPassphraseFor(ctx context.Context, conn []string, in
 	return b.kms.Passphrase(ctx, conn, instance, kmsID, spec, keyID, secrets)
 }
 
+// encryptionDescriptor reads an encrypted image's recorded KMS id and key identity
+// (the key id defaults to the image's own spec). Both reads are checked: on a
+// misread the caller would resolve a different provider's passphrase.
+func (b *Backend) encryptionDescriptor(ctx context.Context, conn []string, spec string) (kmsID, keyID string, err error) {
+	if kmsID, err = b.imageMetaGetChecked(ctx, conn, spec, imgMetaKMSID); err != nil {
+		return "", "", err
+	}
+	if keyID, err = b.imageMetaGetChecked(ctx, conn, spec, imgMetaKeyID); err != nil {
+		return "", "", err
+	}
+	if keyID == "" {
+		keyID = spec
+	}
+	return kmsID, keyID, nil
+}
+
 // resizeLuks grows an active dm-crypt mapping to its underlying device's new size
 // (NodeExpand, after the rbd image grew). cryptsetup resize needs the volume key;
 // we re-resolve the passphrase through the KMS exactly as DeleteVolume does -- the
@@ -196,10 +212,9 @@ func (b *Backend) resizeLuks(ctx context.Context, vol bardplugin.VolumeRef, mapp
 	}
 	defer cleanup()
 	spec := vol.Location + "/" + vol.Name
-	kmsID := b.imageMetaGet(ctx, conn, spec, imgMetaKMSID)
-	keyID := b.imageMetaGet(ctx, conn, spec, imgMetaKeyID)
-	if keyID == "" {
-		keyID = spec
+	kmsID, keyID, err := b.encryptionDescriptor(ctx, conn, spec)
+	if err != nil {
+		return err
 	}
 	pass, err := b.encryptionPassphraseFor(ctx, conn, vol.Instance, kmsID, spec, keyID, nil)
 	if err != nil {
@@ -374,10 +389,9 @@ func (b *Backend) RotateEncryptionKey(ctx context.Context, req *bardplugin.Rotat
 	}
 	defer cleanup()
 	spec := req.Volume.Location + "/" + req.Volume.Name
-	kmsID := b.imageMetaGet(ctx, conn, spec, imgMetaKMSID)
-	keyID := b.imageMetaGet(ctx, conn, spec, imgMetaKeyID)
-	if keyID == "" {
-		keyID = spec
+	kmsID, keyID, err := b.encryptionDescriptor(ctx, conn, spec)
+	if err != nil {
+		return err
 	}
 	oldPass, err := b.encryptionPassphraseFor(ctx, conn, req.Volume.Instance, kmsID, spec, keyID, req.Secrets)
 	if err != nil {
