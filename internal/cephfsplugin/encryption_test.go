@@ -17,8 +17,9 @@ import (
 // real subvolume metadata. (The fscrypt ioctls in NodeStage are live-proven only, like
 // the RBD plugin's, so the node fscrypt path is not exercised here.)
 type encMetaRunner struct {
-	calls [][]string
-	meta  map[string]string // "fs/sub|key" -> value
+	calls  [][]string
+	meta   map[string]string // "fs/sub|key" -> value
+	getErr error             // when set, every metadata get fails (a transient Ceph read error)
 }
 
 func newEncMetaRunner() *encMetaRunner {
@@ -35,6 +36,9 @@ func (r *encMetaRunner) Run(_ context.Context, name string, args ...string) (str
 		r.meta[fs+"/"+sub+"|"+key] = val
 		return "", nil
 	case strings.Contains(a, "subvolume metadata get"):
+		if r.getErr != nil {
+			return "", r.getErr
+		}
 		i := indexOfArg(args, "metadata")
 		fs, sub, key := args[i+2], args[i+3], args[i+4]
 		if v, ok := r.meta[fs+"/"+sub+"|"+key]; ok {
@@ -201,16 +205,43 @@ func TestEncryptedCloneRejected(t *testing.T) {
 func TestHostSubvolumeMetadataRoundTrip(t *testing.T) {
 	b, _ := encBackend(t, "")
 	ctx := context.Background()
-	if got := b.MetaGet(ctx, nil, "cephfs/sub", "bard.k"); got != "" {
-		t.Fatalf("absent key must read empty, got %q", got)
+	if got, err := b.MetaGet(ctx, nil, "cephfs/sub", "bard.k"); got != "" || err != nil {
+		t.Fatalf("absent key must read empty with no error, got %q, %v", got, err)
 	}
 	if err := b.MetaSet(ctx, nil, "cephfs/sub", "bard.k", "v1"); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.MetaGet(ctx, nil, "cephfs/sub", "bard.k"); got != "v1" {
-		t.Fatalf("round-trip failed, got %q", got)
+	if got, err := b.MetaGet(ctx, nil, "cephfs/sub", "bard.k"); got != "v1" || err != nil {
+		t.Fatalf("round-trip failed, got %q, %v", got, err)
 	}
 	if err := b.MetaSet(ctx, nil, "no-slash-spec", "k", "v"); err == nil {
 		t.Fatal("a malformed spec must error on set")
+	}
+}
+
+// A failed metadata read is an error, not "absent": the KMS providers mint on absent
+// (overwriting a stored key), and DeleteVolume would skip key cleanup and orphan it.
+func TestHostMetaGetFailsClosed(t *testing.T) {
+	b, run := encBackend(t, "")
+	ctx := context.Background()
+	spec := "cephfs/sub"
+	if err := b.MetaSet(ctx, nil, spec, cephenc.MetaKMSID, "k8s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.MetaGet(ctx, nil, "no-slash-spec", "k"); err == nil {
+		t.Fatal("a malformed spec must error on get")
+	}
+	run.getErr = errors.New("Error ETIMEDOUT: (110) Connection timed out")
+	if _, err := b.MetaGet(ctx, nil, spec, cephenc.MetaKMSID); err == nil {
+		t.Fatal("a failed read must surface an error")
+	}
+	if err := b.deleteEncryptionKey(ctx, nil, "east", spec); err == nil {
+		t.Fatal("deleteEncryptionKey must not report success on a failed read")
+	}
+	if _, err := b.kms.Passphrase(ctx, nil, "east", "k8s", spec, spec, nil); err == nil {
+		t.Fatal("a stage must fail on a failed read, not mint a new key")
+	}
+	if _, ok := run.meta[spec+"|"+cephenc.MetaWrappedDEK]; ok {
+		t.Fatal("no DEK may be minted on a failed read")
 	}
 }

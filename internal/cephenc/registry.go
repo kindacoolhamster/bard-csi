@@ -71,12 +71,15 @@ func IsFsCrypt(ctx map[string]string) bool {
 // per operation; a nil conn opens a fresh one whose returned cleanup closes it, while
 // a borrowed conn gets a no-op cleanup (the caller still owns it). MetaGet/MetaSet
 // read/write a per-volume key/value identified by spec (the volume's pool/image or
-// fs/subvolume); MetaGet returns "" for an absent key. Providers that keep key
-// material outside the volume (Vault, Azure) ignore conn and never touch the store.
+// fs/subvolume); MetaGet returns ("", nil) for an absent key and an error when the
+// read itself failed (mon down, auth), which callers MUST NOT treat as absent: a
+// provider that mints on "absent" would overwrite the stored key and make the
+// volume's data unrecoverable. Providers that keep key material outside the volume
+// (Vault, Azure) ignore conn and never touch the store.
 type Host interface {
 	MasterKeyDir() string
 	ConnFor(conn []string, instance string, secrets map[string]string) ([]string, func(), error)
-	MetaGet(ctx context.Context, conn []string, spec, key string) string
+	MetaGet(ctx context.Context, conn []string, spec, key string) (string, error)
 	MetaSet(ctx context.Context, conn []string, spec, key, value string) error
 }
 

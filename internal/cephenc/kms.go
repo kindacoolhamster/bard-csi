@@ -248,8 +248,13 @@ func (s *secretsMetadataKeyService) passphrase(ctx context.Context, conn []strin
 	}
 	defer cleanup() // spec == pool/image or fs/subvolume
 
-	// Reopen path: the wrapped DEK already exists, so unwrap and return it.
-	if wrapped := s.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); wrapped != "" {
+	// Reopen path: the wrapped DEK already exists, so unwrap and return it. A failed
+	// read fails closed -- minting here would overwrite the stored DEK.
+	wrapped, err := s.host.MetaGet(ctx, conn, spec, MetaWrappedDEK)
+	if err != nil {
+		return "", err
+	}
+	if wrapped != "" {
 		return unwrapDEK(kek, wrapped)
 	}
 	// First stage: mint a random DEK, store it wrapped, then use it.
@@ -258,13 +263,13 @@ func (s *secretsMetadataKeyService) passphrase(ctx context.Context, conn []strin
 		return "", fmt.Errorf("cephenc: generate DEK: %w", err)
 	}
 	dek := hex.EncodeToString(raw)
-	wrapped, err := wrapDEK(kek, dek)
+	wrapped, err = wrapDEK(kek, dek)
 	if err != nil {
 		return "", err
 	}
 	if err := s.host.MetaSet(ctx, conn, spec, MetaWrappedDEK, wrapped); err != nil {
 		// A concurrent first-stage may have stored its own DEK; prefer the stored one.
-		if w := s.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); w != "" {
+		if w, _ := s.host.MetaGet(ctx, conn, spec, MetaWrappedDEK); w != "" {
 			return unwrapDEK(kek, w)
 		}
 		return "", err

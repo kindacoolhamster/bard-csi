@@ -3,6 +3,7 @@ package cephplugin
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -138,4 +139,89 @@ func TestRealCeph(t *testing.T) {
 		t.Fatalf("clone must survive the source delete: size %dMiB, err %v", got, err)
 	}
 	t.Log("source deleted while the clone lives; clone intact")
+}
+
+// TestRealCephKMSFailClosed proves, against real `rbd image-meta`, that the metadata
+// store the KMS providers sit on classifies real Ceph errors correctly: an absent key
+// or image reads as absent (so a fresh volume's first stage still mints), while a
+// failed read (here: a wrong cephx key) is an error, never "absent" -- the misread
+// that let a provider mint over, and destroy, a stored key. Same env gate as
+// TestRealCeph.
+func TestRealCephKMSFailClosed(t *testing.T) {
+	if os.Getenv("BARD_CEPH_TEST") != "1" {
+		t.Skip("set BARD_CEPH_TEST=1 (and CEPH_MON/POOL/USER/KEY) to run against real Ceph")
+	}
+	mon, pool, user, key := os.Getenv("CEPH_MON"), os.Getenv("CEPH_POOL"), os.Getenv("CEPH_USER"), os.Getenv("CEPH_KEY")
+	if mon == "" || pool == "" || user == "" || key == "" {
+		t.Fatal("CEPH_MON, CEPH_POOL, CEPH_USER and CEPH_KEY must all be set")
+	}
+	const instance = "real"
+	keyDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(keyDir, instance), []byte("real-ceph-test-master-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	be := New(map[string]ClusterConfig{instance: {Monitors: []string{mon}, Pool: pool, UserID: user}}, "", "", nil).
+		WithEncryption(keyDir).
+		WithKMS(map[string]KMSConfig{"k8s": {Type: "secrets-metadata"}})
+	secrets := map[string]string{"userID": user, "userKey": key}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	name := "kms-failclosed-" + time.Now().Format("150405")
+	vol, err := be.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{
+		Name: name, CapacityBytes: 16 << 20, Instance: instance,
+		Parameters: map[string]string{"pool": pool}, Secrets: secrets,
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	volRef := bardplugin.VolumeRef{Instance: instance, Location: vol.Location, Name: vol.Name}
+	defer func() {
+		if err := be.DeleteVolume(ctx, &bardplugin.DeleteVolumeRequest{Volume: volRef, Secrets: secrets}); err != nil {
+			t.Errorf("DeleteVolume: %v", err)
+		}
+	}()
+	spec := vol.Location + "/" + vol.Name
+	conn, connCleanup, err := be.connArgs(be.clusters[instance], instance, secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connCleanup()
+
+	if v, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK); v != "" || err != nil {
+		t.Fatalf("absent key on a real image must read (\"\", nil), got %q, %v", v, err)
+	}
+	if v, err := be.MetaGet(ctx, conn, vol.Location+"/no-such-image-"+name, imgMetaWrappedDEK); v != "" || err != nil {
+		t.Fatalf("absent image must read (\"\", nil), got %q, %v", v, err)
+	}
+	p1, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, secrets)
+	if err != nil {
+		t.Fatalf("first stage must mint on a real absent key: %v", err)
+	}
+	stored, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK)
+	if err != nil || stored == "" {
+		t.Fatalf("expected the wrapped DEK in real image-meta, got %q, %v", stored, err)
+	}
+
+	// A real failed read: same mon, wrong cephx key.
+	bad := []byte(key)
+	if bad[20] == 'A' {
+		bad[20] = 'B'
+	} else {
+		bad[20] = 'A'
+	}
+	badSecrets := map[string]string{"userID": user, "userKey": string(bad)}
+	if _, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, badSecrets); err == nil {
+		t.Fatal("a stage whose metadata read fails must error, not mint")
+	} else {
+		t.Logf("failed read surfaced as: %v", err)
+	}
+
+	if got, err := be.MetaGet(ctx, conn, spec, imgMetaWrappedDEK); err != nil || got != stored {
+		t.Fatalf("stored wrapped DEK changed: %q -> %q (%v)", stored, got, err)
+	}
+	p2, err := be.encryptionPassphrase(ctx, instance, "k8s", spec, secrets)
+	if err != nil || p2 != p1 {
+		t.Fatalf("restage must resolve the original key (err %v, same=%v)", err, p2 == p1)
+	}
 }
