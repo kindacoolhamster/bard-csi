@@ -420,10 +420,17 @@ leaves the StatefulSet running as the standing workload.
   doesn't model protect) until a live restore surfaced it.
 - **Encrypted clone/restore must inherit the source's key.** A clone (`rbd clone`
   from a snapshot, or `rbd cp`) copies the source's LUKS header byte-for-byte, so
-  the clone is encrypted under the *source's* passphrase -- but `rbd clone/cp`
-  copies **no image-meta**, and every KMS provider keys off the new volume's
-  identity, so a naive clone resolves the wrong key and `cryptsetup open` fails.
-  `CreateVolume` now calls `inheritEncryption` on an encrypted clone: it copies the
+  the clone is encrypted under the *source's* passphrase, while every KMS provider
+  keys off the new volume's identity, so a naive clone resolves the wrong key and
+  `cryptsetup open` fails. NOTE (live-verified on Ceph 20.2, 2026-10-28; this file
+  used to claim the opposite): `rbd clone` AND `rbd cp` **DO copy the parent's
+  image-meta** -- so a fresh clone already carries the source's descriptor,
+  including a KMIP UID that, left in place, would make the clone's delete Destroy
+  the SOURCE's HSM object (and a `bard.static` mark, so a restore of a static
+  image inherits the delete no-op). The fake runner models the copy.
+  `CreateVolume` calls `inheritEncryption` on EVERY create of an encrypted clone,
+  fresh or resumed (a provisioner retry once skipped it and advertised no key
+  identity); each field prefers the clone's own value, else the source's. It copies the
   source's encryption descriptor (`bard.encryptionKMSID`, `bard.encryptionKeyID`,
   and any `bard.encryptionDEK`) onto the clone and, for Vault, duplicates the KV
   entry into the clone's own slot. So the clone is **self-contained** -- opens with

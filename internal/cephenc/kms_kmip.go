@@ -150,6 +150,17 @@ func (k *kmipKeyService) cloneKey(ctx context.Context, conn []string, instance, 
 	if srcUID == "" {
 		return nil
 	}
+	// Idempotent: librbd copies the source's UID onto a fresh clone, so a clone UID
+	// that DIFFERS from the source's is the clone's own object from an earlier
+	// attempt. Registering again would leak that object; keeping the copied
+	// source UID would let the clone's delete Destroy the source's key.
+	cloneUID, err := k.host.MetaGet(ctx, conn, cloneSpec, MetaKMIPUID)
+	if err != nil {
+		return err
+	}
+	if cloneUID != "" && cloneUID != srcUID {
+		return nil
+	}
 	pass, err := k.get(ctx, srcUID)
 	if err != nil {
 		return err

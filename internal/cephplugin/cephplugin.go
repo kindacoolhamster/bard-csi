@@ -762,7 +762,6 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 
 	spec := location + "/" + image
 	isClone := req.SourceSnapshot != nil || req.SourceVolume != nil
-	created := false
 	finalMiB := sizeMiB
 	existingMiB, infoErr := b.imageInfo(ctx, conn, spec)
 	switch {
@@ -798,7 +797,6 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 		if err := b.provision(ctx, conn, spec, sizeMiB, req); err != nil {
 			return nil, err
 		}
-		created = true
 		if isClone {
 			// The clone inherited the source's size; reconcile with the request.
 			cloneMiB, err := b.imageInfo(ctx, conn, spec)
@@ -851,7 +849,10 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 	encKeyID := ""
 	if req.Parameters[paramEncrypted] == "true" {
 		switch {
-		case created && (req.SourceSnapshot != nil || req.SourceVolume != nil):
+		case isClone:
+			// Fresh AND resumed: a retried create whose first attempt died (or whose
+			// response was lost) must still advertise the inherited key identity, or
+			// the node resolves a key that cannot open the copied LUKS header.
 			encKeyID, err = b.inheritEncryption(ctx, conn, cloneSourceImageSpec(req), spec, req.Instance, req.Secrets)
 			if err != nil {
 				return nil, err
@@ -964,15 +965,22 @@ func cloneSourceImageSpec(req *bardplugin.CreateVolumeRequest) string {
 }
 
 // inheritEncryption makes an encrypted clone open with its source's key. rbd
-// clone/cp copies the source's LUKS header byte-for-byte but copies no image
-// metadata, so without this the clone would try to open the copied header with a
-// key derived from (or stored under) its own new identity and fail. It copies the
+// clone/cp copies the source's LUKS header byte-for-byte; librbd also copies its
+// image-meta, but external key material (Vault, Azure, KMIP) is not copied, and a
+// copied KMIP UID would point the clone at the SOURCE's object. Without this the
+// clone would open with a key derived from (or stored under) its own new identity,
+// or share the source's. It copies the
 // source's encryption descriptor -- KMS id, key identity, and any wrapped DEK
 // (secrets-metadata) -- onto the clone, and for a provider that keeps key
 // material outside the image (Vault) duplicates it into the clone's own slot, so
 // the clone is self-contained: it opens with the source's passphrase yet
 // DeleteVolume removes only its own key (no shared-key ref-count hazard). Returns
 // the key identity to advertise to the node (used by the derived provider).
+//
+// Idempotent, and run on every create of a clone, fresh or resumed. Each field
+// prefers the clone's own value -- librbd's clone/cp already copied the parent's
+// image-meta, and a resumed create may have written it -- and falls back to the
+// source's, so a retry stays correct even if the source has since been deleted.
 func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSpec, cloneSpec, instance string, secrets map[string]string) (string, error) {
 	// The source's key identity: its recorded id, else its own pool/image (covers a
 	// source provisioned before this descriptor existed, whose derived passphrase
@@ -981,7 +989,13 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 	// Every source read is checked: a misread would give the clone the wrong (or no)
 	// descriptor, and its first stage would then mint a key that can never open the
 	// copied LUKS header.
-	keyID, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaKeyID)
+	inherited := func(key string) (string, error) {
+		if v, err := b.imageMetaGetChecked(ctx, conn, cloneSpec, key); err != nil || v != "" {
+			return v, err
+		}
+		return b.imageMetaGetChecked(ctx, conn, sourceSpec, key)
+	}
+	keyID, err := inherited(imgMetaKeyID)
 	if err != nil {
 		return "", err
 	}
@@ -994,7 +1008,7 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 	// Carry the provider selection (so DeleteVolume cleans up the right KMS) and any
 	// wrapped DEK (so a secrets-metadata clone unwraps the same key from its own
 	// metadata) down to the clone.
-	kmsID, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaKMSID)
+	kmsID, err := inherited(imgMetaKMSID)
 	if err != nil {
 		return "", err
 	}
@@ -1003,7 +1017,7 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 			return "", err
 		}
 	}
-	dek, err := b.imageMetaGetChecked(ctx, conn, sourceSpec, imgMetaWrappedDEK)
+	dek, err := inherited(imgMetaWrappedDEK)
 	if err != nil {
 		return "", err
 	}
