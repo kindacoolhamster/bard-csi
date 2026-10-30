@@ -426,8 +426,13 @@ leaves the StatefulSet running as the standing workload.
   used to claim the opposite): `rbd clone` AND `rbd cp` **DO copy the parent's
   image-meta** -- so a fresh clone already carries the source's descriptor,
   including a KMIP UID that, left in place, would make the clone's delete Destroy
-  the SOURCE's HSM object (and a `bard.static` mark, so a restore of a static
-  image inherits the delete no-op). The fake runner models the copy.
+  the SOURCE's HSM object. CreateVolume therefore strips what describes the
+  SOURCE from every clone/restore (`stripInheritedMeta`): `bard.static` (it made
+  a restore of a static image a silent delete no-op -- leaked image + key,
+  live-reproduced 2026-10-29), the owner labels, and snapshot-qualified
+  `<key>@<snap>` keys; a resumed create also recognises an INHERITED
+  `bard.source` (clone's rbd parent == requested source AND stamp == parent's)
+  instead of failing AlreadyExists forever. The fake runner models the copy.
   `CreateVolume` calls `inheritEncryption` on EVERY create of an encrypted clone,
   fresh or resumed (a provisioner retry once skipped it and advertised no key
   identity); each field prefers the clone's own value, else the source's. It copies the

@@ -33,6 +33,7 @@ type Runner struct {
 	luksOpen   map[string]string // mapper name -> backing device
 	imageMeta  map[string]string // "spec\x00key" -> value
 	parents    map[string]string // clone "pool[/ns]/image" -> parent "pool[/ns]/image"
+	parentSnap map[string]string // clone "pool[/ns]/image" -> the parent snapshot it was cloned from
 	// trashedSnaps models clone-v2 snapshot trash: `snap rm` on a snapshot with
 	// linked clones succeeds but moves the snap to the trash namespace, where it
 	// still blocks `rbd rm` of its image until every clone is flattened or removed
@@ -55,6 +56,7 @@ func New() *Runner {
 		luksOpen:   map[string]string{},
 		imageMeta:  map[string]string{},
 		parents:    map[string]string{},
+		parentSnap: map[string]string{},
 
 		trashedSnaps: map[string]bool{},
 	}
@@ -112,8 +114,8 @@ func (r *Runner) rbd(args []string) (string, error) {
 		if parent, ok := r.parents[pos[1]]; ok {
 			pool, ns, img := splitSpec(parent)
 			return fmt.Sprintf(
-				`{"size":%d,"parent":{"pool":%q,"pool_namespace":%q,"image":%q,"snapshot":"snap"}}`,
-				size*(1<<20), pool, ns, img), nil
+				`{"size":%d,"parent":{"pool":%q,"pool_namespace":%q,"image":%q,"snapshot":%q}}`,
+				size*(1<<20), pool, ns, img, r.parentSnap[pos[1]]), nil
 		}
 		return fmt.Sprintf(`{"size":%d}`, size*(1<<20)), nil
 	case "status":
@@ -143,6 +145,7 @@ func (r *Runner) rbd(args []string) (string, error) {
 		}
 		if pos[0] == "clone" {
 			r.parents[pos[2]] = base
+			_, r.parentSnap[pos[2]], _ = strings.Cut(pos[1], "@")
 		}
 		return "", nil
 	case "flatten":
@@ -222,7 +225,7 @@ func (r *Runner) rbd(args []string) (string, error) {
 		b, _ := json.Marshal(out)
 		return string(b), nil
 	case "image-meta":
-		// image-meta set|get <pool/image> <key> [value].
+		// image-meta set|get|list|remove <pool/image> [<key> [value]].
 		switch pos[1] {
 		case "set":
 			r.imageMeta[pos[2]+"\x00"+pos[3]] = pos[4]
@@ -233,6 +236,20 @@ func (r *Runner) rbd(args []string) (string, error) {
 				return "", fmt.Errorf("rbd: failed to get metadata %s of image : (2) No such file or directory", pos[3])
 			}
 			return v, nil
+		case "list":
+			// list <pool/image> --format json: a JSON object of key -> value; like
+			// the real CLI, an image with no metadata prints nothing at all.
+			kv := map[string]string{}
+			for k, v := range r.imageMeta {
+				if img, key, ok := strings.Cut(k, "\x00"); ok && img == pos[2] {
+					kv[key] = v
+				}
+			}
+			if len(kv) == 0 {
+				return "", nil
+			}
+			b, _ := json.Marshal(kv)
+			return string(b), nil
 		case "remove":
 			k := pos[2] + "\x00" + pos[3]
 			if _, ok := r.imageMeta[k]; !ok {
