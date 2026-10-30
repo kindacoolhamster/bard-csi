@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -231,6 +233,17 @@ type Backend struct {
 	// still-flattening clone must not stack another `rbd flatten`.
 	flattenMu       sync.Mutex
 	flattenInFlight map[string]bool
+
+	// localClients lists the addresses of this node's krbd clients, so the
+	// single-writer fence never blocklists the node's own shared kernel client.
+	localClients func() (map[string]bool, error)
+
+	// stageLocks serializes NodeStage/NodeUnstage per staging path inside the
+	// plugin. Core's per-volume claim is released when core gives up on a
+	// cancelled call, while the plugin handler (and its non-cancellable cleanup)
+	// keeps running, so a retry could otherwise overlap the attempt it retries.
+	stageMu    sync.Mutex
+	stageLocks map[string]*sync.Mutex
 }
 
 // defaultCloneDepthLimit matches ceph-csi's soft clone-depth limit (rbd flattens
@@ -244,7 +257,7 @@ func New(clusters map[string]ClusterConfig, keyDir, stateDir string, run Runner)
 	if run == nil {
 		run = ExecRunner{}
 	}
-	b := &Backend{clusters: clusters, keyDir: keyDir, stateDir: stateDir, run: run, snapIndex: map[string]string{}, snapNames: map[string]string{}, cloneDepthLimit: defaultCloneDepthLimit, flattenAsync: true}
+	b := &Backend{clusters: clusters, keyDir: keyDir, stateDir: stateDir, run: run, snapIndex: map[string]string{}, snapNames: map[string]string{}, cloneDepthLimit: defaultCloneDepthLimit, flattenAsync: true, localClients: krbdClientAddrs, stageLocks: map[string]*sync.Mutex{}}
 	// The KMS registry resolves a volume's passphrase through pluggable providers; it
 	// reads the master key dir, a Ceph connection, and image metadata back from this
 	// backend (which implements cephenc.Host). Lazily uses b.encKeyDir, so WithEncryption
@@ -2044,6 +2057,7 @@ func (b *Backend) waitForDevice(ctx context.Context, dev string) error {
 }
 
 func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageRequest) error {
+	defer b.lockStaging(req.StagingPath)()
 	cc, err := b.cluster(req.Volume.Instance)
 	if err != nil {
 		return err
@@ -2068,6 +2082,19 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 		// level (blocklist) before we take the image over, so it cannot corrupt the
 		// volume after the failover. This is what makes attachRequired=false safe
 		// for ReadWriteOnce.
+		//
+		// An earlier attempt at this staging path that started mapping but never
+		// recorded the device (crash, or a failed cleanup) left a pending marker:
+		// release the unrecorded map it may have left, so its watcher neither leaks
+		// past DeleteVolume nor sits beside the fresh map below. Without a marker
+		// nothing is touched -- an unrecorded map we did not just abandon (e.g. a
+		// volume staged before device records existed) may be in use.
+		if b.mapPending(req.StagingPath) {
+			b.unmapOrphanedMaps(ctx, req.Volume)
+		}
+		if err := b.markMapPending(req.StagingPath); err != nil {
+			return err
+		}
 		if req.Exclusive {
 			if err := b.fenceStaleWatchers(ctx, cc, conn, req.Volume.Instance, spec, req.Secrets); err != nil {
 				return err
@@ -2083,13 +2110,14 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 			return mErr
 		}
 		dev = mapped
+		unmapOpts := resolveMounterOptions(req.Context[paramUnmapOptions], mounter)
 		if err := b.waitForDevice(ctx, dev); err != nil {
+			b.releaseMap(ctx, req.StagingPath, dev, mounter, unmapOpts)
 			return err
 		}
 		// Record it (with any unmap options) so NodeUnstage can unmap reliably even
 		// if the staging mount -- and the volume context -- are gone by the time it
 		// runs. The recorded mounter drives the unmap tool.
-		unmapOpts := resolveMounterOptions(req.Context[paramUnmapOptions], mounter)
 		rec := deviceRecord{
 			Device:       dev,
 			UnmapOptions: unmapOpts,
@@ -2108,8 +2136,10 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 			}
 		}
 		if err := b.recordDevice(req.StagingPath, rec); err != nil {
+			b.releaseMap(ctx, req.StagingPath, dev, mounter, unmapOpts)
 			return err
 		}
+		b.clearMapPending(req.StagingPath)
 	}
 
 	// Layer LUKS over the mapped device for an encrypted volume (no-op
@@ -2191,6 +2221,7 @@ func (b *Backend) NodeStage(ctx context.Context, req *bardplugin.NodeStageReques
 }
 
 func (b *Backend) NodeUnstage(ctx context.Context, req *bardplugin.NodeUnstageRequest) error {
+	defer b.lockStaging(req.StagingPath)()
 	// Validate the instance, but unmap is driven by the recorded device + mounter
 	// (independent of the live cluster config), so cc itself is not needed here.
 	if _, err := b.cluster(req.Volume.Instance); err != nil {
@@ -2245,6 +2276,208 @@ func (b *Backend) deviceMapped(ctx context.Context, dev string) bool {
 	return n > 0
 }
 
+// releaseMap unmaps a device this NodeStage mapped but could not finish staging
+// (never sized, or unrecorded), so no unrecorded map -- and its rbd watcher --
+// outlives the failed call. Runs on a non-cancelled context: the request's own
+// deadline expiring is a common way to get here. Best effort: the pending marker
+// is cleared only once the device is gone, so a map that survives is released by
+// the next attempt's orphan cleanup.
+func (b *Backend) releaseMap(ctx context.Context, stagingPath, dev, mounter, unmapOpts string) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	args := []string{"unmap", dev}
+	if unmapOpts != "" {
+		args = append(args, "--options", unmapOpts)
+	}
+	_, _ = b.run.Run(ctx, unmapBinary(mounter), args...)
+	if !b.deviceMapped(ctx, dev) {
+		b.clearMapPending(stagingPath)
+	}
+}
+
+// lockStaging takes the per-staging-path lock and returns its release.
+func (b *Backend) lockStaging(stagingPath string) func() {
+	b.stageMu.Lock()
+	l, ok := b.stageLocks[stagingPath]
+	if !ok {
+		l = &sync.Mutex{}
+		b.stageLocks[stagingPath] = l
+	}
+	b.stageMu.Unlock()
+	l.Lock()
+	return l.Unlock
+}
+
+// The pending marker sits beside a staging path's device record from just before
+// a fresh map until the device is recorded (or released): its presence at the
+// start of a NodeStage means an earlier attempt may have left an unrecorded map.
+const pendingSuffix = ".pending"
+
+func (b *Backend) mapPending(stagingPath string) bool {
+	if b.stateDir == "" {
+		return false
+	}
+	_, err := os.Stat(b.deviceRecordPath(stagingPath) + pendingSuffix)
+	return err == nil
+}
+
+func (b *Backend) markMapPending(stagingPath string) error {
+	if b.stateDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(b.stateDir, 0o750); err != nil {
+		return fmt.Errorf("ceph-rbd: state dir: %w", err)
+	}
+	if err := os.WriteFile(b.deviceRecordPath(stagingPath)+pendingSuffix, nil, 0o600); err != nil {
+		return fmt.Errorf("ceph-rbd: mark map pending: %w", err)
+	}
+	return nil
+}
+
+func (b *Backend) clearMapPending(stagingPath string) {
+	if b.stateDir != "" {
+		_ = os.Remove(b.deviceRecordPath(stagingPath) + pendingSuffix)
+	}
+}
+
+// localMap is one entry of `rbd showmapped` / `rbd-nbd list-mapped` JSON (krbd
+// names the image "name", rbd-nbd "image").
+type localMap struct {
+	Pool      string `json:"pool"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	Image     string `json:"image"`
+	Snap      string `json:"snap"`
+	Device    string `json:"device"`
+}
+
+// unmapOrphanedMaps unmaps every local krbd/rbd-nbd map of vol's image that no
+// device record owns. Called only when a pending marker shows an earlier attempt
+// at this staging path mapped without recording: kubelet stages a volume at one
+// path per node, and that attempt never completed, so nothing can have published
+// its map. Left alone, the map's rbd watcher blocks DeleteVolume's `rbd rm`.
+// Snapshot maps, recorded devices (this path's included) and devices visibly in
+// use are skipped. Best effort: a listing or unmap failure is logged, not fatal.
+func (b *Backend) unmapOrphanedMaps(ctx context.Context, vol bardplugin.VolumeRef) {
+	owned := b.recordedDevices()
+	for _, mounter := range []string{mounterKRBD, mounterNBD} {
+		args := []string{"showmapped", "--format", "json"}
+		if mounter == mounterNBD {
+			args = []string{"list-mapped", "--format", "json"}
+		}
+		out, err := b.run.Run(ctx, unmapBinary(mounter), args...)
+		if err != nil {
+			log.Printf("ceph-rbd: list %s maps for %s/%s: %v (skipping orphan cleanup)", mounter, vol.Location, vol.Name, err)
+			continue
+		}
+		var maps []localMap
+		if strings.TrimSpace(out) != "" {
+			if err := json.Unmarshal([]byte(out), &maps); err != nil {
+				log.Printf("ceph-rbd: parse %s maps: %v (skipping orphan cleanup)", mounter, err)
+				continue
+			}
+		}
+		for _, m := range maps {
+			name := m.Name
+			if name == "" {
+				name = m.Image
+			}
+			if m.Device == "" || owned[m.Device] || (m.Snap != "" && m.Snap != "-") ||
+				name != vol.Name || locator(m.Pool, m.Namespace) != vol.Location {
+				continue
+			}
+			// Never yank a device something still uses (a mount, or a dm-crypt
+			// holder): rbd-nbd unmap disconnects even an open device. An unrecorded
+			// map in use is e.g. a volume staged before device records existed.
+			if b.deviceInUse(ctx, m.Device) {
+				log.Printf("ceph-rbd: unrecorded %s map %s of %s/%s is in use; leaving it", mounter, m.Device, vol.Location, vol.Name)
+				continue
+			}
+			if _, err := b.run.Run(ctx, unmapBinary(mounter), "unmap", m.Device); err != nil {
+				log.Printf("ceph-rbd: unmap orphaned %s map %s of %s/%s: %v", mounter, m.Device, vol.Location, vol.Name, err)
+				continue
+			}
+			log.Printf("ceph-rbd: unmapped orphaned %s map %s of %s/%s", mounter, m.Device, vol.Location, vol.Name)
+		}
+	}
+}
+
+// deviceInUse reports whether dev is mounted or held open by a stacked device
+// (e.g. a dm-crypt mapper). Any doubt counts as in use.
+func (b *Backend) deviceInUse(ctx context.Context, dev string) bool {
+	out, err := b.run.Run(ctx, "findmnt", "-n", "-o", "TARGET", "--source", dev)
+	if strings.TrimSpace(out) != "" || (err != nil && !isFindmntNoMatch(err)) {
+		return true
+	}
+	holders, err := os.ReadDir(filepath.Join(sysBlockDir, filepath.Base(dev), "holders"))
+	return len(holders) > 0 || (err != nil && !os.IsNotExist(err))
+}
+
+// isFindmntNoMatch: findmnt exits 1 with no output when nothing matches.
+func isFindmntNoMatch(err error) bool {
+	var ee *exec.ExitError
+	return errors.As(err, &ee) && ee.ExitCode() == 1
+}
+
+// sysBlockDir is where a block device's holders are listed (var for tests).
+var sysBlockDir = "/sys/class/block"
+
+// recordedDevices returns every device a staging record names.
+func (b *Backend) recordedDevices() map[string]bool {
+	owned := map[string]bool{}
+	if b.stateDir == "" {
+		return owned
+	}
+	entries, err := os.ReadDir(b.stateDir)
+	if err != nil {
+		return owned
+	}
+	for _, e := range entries {
+		if e.IsDir() || strings.HasSuffix(e.Name(), pendingSuffix) {
+			continue
+		}
+		if data, err := os.ReadFile(filepath.Join(b.stateDir, e.Name())); err == nil {
+			var rec deviceRecord
+			if json.Unmarshal(data, &rec) != nil || rec.Device == "" {
+				rec.Device = strings.TrimSpace(string(data)) // legacy bare-path record
+			}
+			owned[rec.Device] = true
+		}
+	}
+	return owned
+}
+
+// sysBusRbdDir lists the node's krbd devices (var for tests).
+var sysBusRbdDir = "/sys/bus/rbd/devices"
+
+// krbdClientAddrs returns the address of every krbd client on this node, read
+// from each mapped device's client_addr ("ip:0/nonce", the form `rbd status`
+// reports a watcher in). krbd shares one client per (cluster, user, options)
+// across all of a node's maps, so these are exactly the watchers whose blocklist
+// would cut off the node's own I/O. A kernel without the attribute reports
+// nothing for that device (the fence then treats its watcher as foreign, as it
+// always did).
+func krbdClientAddrs() (map[string]bool, error) {
+	addrs := map[string]bool{}
+	entries, err := os.ReadDir(sysBusRbdDir)
+	if os.IsNotExist(err) {
+		return addrs, nil // rbd module not loaded: no krbd clients
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		data, err := os.ReadFile(filepath.Join(sysBusRbdDir, e.Name(), "client_addr"))
+		if err != nil {
+			continue // device unmapped meanwhile, or attribute unsupported
+		}
+		if a := strings.TrimSpace(string(data)); a != "" {
+			addrs[a] = true
+		}
+	}
+	return addrs, nil
+}
+
 // fenceStaleWatchers blocklists every client currently watching spec, so a stale
 // writer on a previous node cannot reach the OSDs after this node takes the
 // exclusive volume over. `osd blocklist add` fences at the OSD level, which (un-
@@ -2253,9 +2486,13 @@ func (b *Backend) deviceMapped(ctx context.Context, dev string) bool {
 // (Ceph default 1h), so no un-blocklist is required when the old node is gone;
 // the scoped cephx user's `profile rbd` grants blocklist-add but not -rm anyway.
 //
-// Only called on a fresh map of an exclusive volume, so any watcher seen is
-// foreign by construction (the same node's idempotent re-stage reuses its
-// recorded device and never reaches this path).
+// Only called on a fresh map of an exclusive volume. A watcher that IS one of
+// this node's krbd clients (exact ip:0/nonce) is skipped: it can only be a
+// leftover map of ours, and krbd shares that client across every volume the node
+// has mapped for the user, so blocklisting it would cut off the node's own I/O.
+// Matching the full address, not just the IP, keeps a foreign writer that merely
+// shares an address with this node (NAT, a floating VIP) fenced; a leftover
+// rbd-nbd map of ours is its own per-process client, so fencing it is harmless.
 func (b *Backend) fenceStaleWatchers(ctx context.Context, cc ClusterConfig, conn []string, instance, spec string, secrets map[string]string) error {
 	out, err := b.run.Run(ctx, "rbd", appendArgs(conn, "status", spec, "--format", "json")...)
 	if err != nil {
@@ -2272,6 +2509,12 @@ func (b *Backend) fenceStaleWatchers(ctx context.Context, cc ClusterConfig, conn
 	if len(st.Watchers) == 0 {
 		return nil
 	}
+	local, err := b.localClients()
+	if err != nil {
+		// Without our own clients we cannot tell our watcher from a foreign one;
+		// retry rather than risk fencing this node or skipping a stale writer.
+		return fmt.Errorf("ceph-rbd: list local krbd clients to fence %s: %w", spec, err)
+	}
 	// Blocklisting goes through the Python `ceph` CLI (needs a conf), unlike rbd.
 	// The request secrets ride along so a CSI-secret-only deployment can fence.
 	cephConn, cleanup, err := b.cephCLIConn(cc, instance, secrets)
@@ -2281,6 +2524,10 @@ func (b *Backend) fenceStaleWatchers(ctx context.Context, cc ClusterConfig, conn
 	defer cleanup()
 	for _, w := range st.Watchers {
 		if w.Address == "" {
+			continue
+		}
+		if local[w.Address] {
+			log.Printf("ceph-rbd: not fencing %s on %s: it is this node's own krbd client", w.Address, spec)
 			continue
 		}
 		// Fail the stage if a watcher cannot be fenced: better to retry than to
