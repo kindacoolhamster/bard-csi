@@ -569,25 +569,33 @@ func (b *Backend) imageInfo(ctx context.Context, conn []string, spec string) (in
 // it cannot be opened by name, so the chain above it is unwalkable; the child's
 // own info reports it via the parent `trash` flag (verified live on Ceph 20.2).
 func (b *Backend) imageParent(ctx context.Context, conn []string, spec string) (parent string, trashed bool, err error) {
+	parent, _, trashed, err = b.imageParentSnap(ctx, conn, spec)
+	return parent, trashed, err
+}
+
+// imageParentSnap is imageParent plus the name of the parent SNAPSHOT spec was
+// cloned from.
+func (b *Backend) imageParentSnap(ctx context.Context, conn []string, spec string) (parent, snap string, trashed bool, err error) {
 	out, err := b.run.Run(ctx, "rbd", appendArgs(conn, "info", spec, "--format", "json")...)
 	if err != nil {
-		return "", false, fmt.Errorf("ceph-rbd: info %s: %w", spec, err)
+		return "", "", false, fmt.Errorf("ceph-rbd: info %s: %w", spec, err)
 	}
 	var raw struct {
 		Parent *struct {
 			Pool          string `json:"pool"`
 			PoolNamespace string `json:"pool_namespace"`
 			Image         string `json:"image"`
+			Snapshot      string `json:"snapshot"`
 			Trash         bool   `json:"trash"`
 		} `json:"parent"`
 	}
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
-		return "", false, fmt.Errorf("ceph-rbd: parse info %s: %w", spec, err)
+		return "", "", false, fmt.Errorf("ceph-rbd: parse info %s: %w", spec, err)
 	}
 	if raw.Parent == nil || raw.Parent.Image == "" {
-		return "", false, nil
+		return "", "", false, nil
 	}
-	return locator(raw.Parent.Pool, raw.Parent.PoolNamespace) + "/" + raw.Parent.Image, raw.Parent.Trash, nil
+	return locator(raw.Parent.Pool, raw.Parent.PoolNamespace) + "/" + raw.Parent.Image, raw.Parent.Snapshot, raw.Parent.Trash, nil
 }
 
 // cloneDepth counts the parent images above an rbd image (0 = it is not a clone).
@@ -797,9 +805,15 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 		// snapshot/volume -- or none -- is an incompatible AlreadyExists per CSI.
 		// An unstamped image (pre-upgrade, or a create that died before the
 		// stamp) is accepted as before.
-		if recorded := b.imageMetaGet(ctx, conn, spec, imgMetaSource); recorded != "" && recorded != sourceDesc(req) {
-			return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
-				"volume %q exists with a different content source (%s)", req.Name, recorded)
+		if recorded := b.imageMetaGet(ctx, conn, spec, imgMetaSource); recorded != sourceDesc(req) {
+			ok, err := b.resumableClone(ctx, conn, spec, req, recorded)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, bardplugin.Errorf(bardplugin.CodeAlreadyExists,
+					"volume %q exists with a different content source (%s)", req.Name, orDash(recorded))
+			}
 		}
 		if existingMiB != sizeMiB {
 			// A clone/restore starts at the SOURCE's size (rbd clone cannot size the
@@ -839,6 +853,14 @@ func (b *Backend) CreateVolume(ctx context.Context, req *bardplugin.CreateVolume
 		}
 	default:
 		return nil, infoErr
+	}
+
+	if isClone {
+		// librbd copied the source's image-meta onto the clone; drop what
+		// describes the source, not this volume. Fresh and resumed paths alike.
+		if err := b.stripInheritedMeta(ctx, conn, spec, sourceDesc(req)); err != nil {
+			return nil, err
+		}
 	}
 
 	if req.SourceVolume != nil {
@@ -1093,6 +1115,115 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 		}
 	}
 	return keyID, nil
+}
+
+// stripInheritedMeta removes the image-meta a clone inherits from its source but
+// that describes the SOURCE, then (re)stamps the clone's own content source.
+// `rbd clone` copies every key of the parent image (live-verified, Ceph 20.2):
+//   - bard.static: the clone is CSI-created, yet would read as admin-owned, so its
+//     DeleteVolume would silently no-op and leak the image and its key;
+//   - the owner labels (bard.pvname etc.): would name the source's PVC whenever the
+//     provisioner passes no --extra-create-metadata to overwrite them;
+//   - snapshot-qualified keys ("<key>@<snap>", see metaAddr): describe snapshots of
+//     the source, which the clone does not have. A key naming a snapshot that DOES
+//     exist on this image is its own (CreateSnapshot wrote it -- a CO may replay
+//     CreateVolume at any time) and is kept.
+//
+// Encryption keys are left to inheritEncryption, which owns them. Idempotent; a
+// failure fails the create so the CO's retry finishes the job.
+func (b *Backend) stripInheritedMeta(ctx context.Context, conn []string, spec, source string) error {
+	out, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "list", spec, "--format", "json")...)
+	if err != nil {
+		return fmt.Errorf("ceph-rbd: image-meta list %s: %w", spec, err)
+	}
+	meta := map[string]string{}
+	if strings.TrimSpace(out) != "" { // an image with no metadata prints nothing
+		if err := json.Unmarshal([]byte(out), &meta); err != nil {
+			return fmt.Errorf("ceph-rbd: parse image-meta of %s: %w", spec, err)
+		}
+	}
+	owner := map[string]bool{}
+	for _, k := range ownerMeta {
+		owner[k] = true
+	}
+	var ownSnaps map[string]bool // lazily: only an image with @-keys pays the snap ls
+	for k := range meta {
+		_, snap, qualified := strings.Cut(k, "@")
+		if qualified {
+			if ownSnaps == nil {
+				snaps, err := b.listSnaps(ctx, conn, spec)
+				if err != nil {
+					return err
+				}
+				ownSnaps = map[string]bool{}
+				for _, sn := range snaps {
+					ownSnaps[sn.Name] = true
+				}
+			}
+			if ownSnaps[snap] {
+				continue
+			}
+		}
+		if k == imgMetaStatic || owner[k] || qualified {
+			if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "remove", spec, k)...); err != nil && !isNotFound(err) {
+				return fmt.Errorf("ceph-rbd: image-meta remove %s %s: %w", spec, k, err)
+			}
+		}
+	}
+	if meta[imgMetaSource] != source {
+		return b.imageMetaSet(ctx, conn, spec, imgMetaSource, source)
+	}
+	return nil
+}
+
+// resumableClone decides whether an existing image whose bard.source stamp does
+// not match this create may still be resumed as it. A plain create stamps nothing:
+// only an unstamped image matches it. For a clone the stamp may be missing (a
+// pre-upgrade image, or a create that died between `rbd clone` and the stamp) or
+// INHERITED -- librbd copies the parent's own stamp onto the child -- so neither
+// alone proves a conflict. The clone's COW link does: while it exists (flattening
+// is only ever scheduled after the stamp) it names exactly the parent image AND
+// snapshot the clone was made from, which must be the requested source's. A
+// recorded stamp must additionally equal that parent's own (i.e. be inherited, not
+// a stamp of this volume naming another source). An unstamped clone with no parent
+// link (flattened, pre-upgrade) is accepted as before. Failed reads fail the create
+// (retry) rather than guess.
+func (b *Backend) resumableClone(ctx context.Context, conn []string, spec string, req *bardplugin.CreateVolumeRequest, recorded string) (bool, error) {
+	var wantImg, wantSnap string
+	switch {
+	case req.SourceSnapshot != nil:
+		img, snap, _ := strings.Cut(req.SourceSnapshot.Name, "@")
+		wantImg, wantSnap = req.SourceSnapshot.Location+"/"+img, snap
+	case req.SourceVolume != nil:
+		wantImg, wantSnap = req.SourceVolume.Location+"/"+req.SourceVolume.Name, shortName(tmpClonePrefix, req.Name)
+	default:
+		return recorded == "", nil
+	}
+	parent, snap, _, err := b.imageParentSnap(ctx, conn, spec)
+	if err != nil {
+		return false, err
+	}
+	if parent == "" {
+		return recorded == "", nil
+	}
+	if parent != wantImg || snap != wantSnap {
+		return false, nil
+	}
+	if recorded == "" {
+		return true, nil
+	}
+	v, err := b.imageMetaGetChecked(ctx, conn, parent, imgMetaSource)
+	if err != nil {
+		return false, err
+	}
+	return v == recorded, nil
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func (b *Backend) provision(ctx context.Context, conn []string, spec string, sizeMiB int64, req *bardplugin.CreateVolumeRequest) error {
