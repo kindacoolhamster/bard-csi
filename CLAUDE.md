@@ -662,6 +662,22 @@ leaves the StatefulSet running as the standing workload.
   a node with a staged RWO volume + force-failing the volume over makes the new
   node's NodeStage `ceph osd blocklist add` the stale watcher (it shows up in
   `osd blocklist ls`) before taking over. See the k3s tier section.
+  **The fence skips the node's OWN krbd client -- by exact `ip:0/nonce`**
+  (live-proven on archimedes 2026-10-29), read from
+  `/sys/bus/rbd/devices/*/client_addr` (same format `rbd status` prints). A
+  leftover map of ours (map succeeded, device never sized / record failed /
+  crash) used to be blocklisted on the retry, and since krbd shares one client
+  per (cluster,user) per node, that self-fenced EVERY volume the node had mapped
+  for the user (`map failed: (108) Cannot send after transport endpoint
+  shutdown`). NOT an IP match: a foreign writer sharing this node's IP (NAT, a
+  VIP) must still be fenced (review finding). A failed post-map step unmaps on a
+  non-cancelled ctx; a `.pending` marker beside the device record spans map ->
+  record, and ONLY when an earlier attempt left one does a fresh stage unmap
+  unrecorded local maps of the image (never a recorded device, never one that is
+  mounted / dm-held) -- without the marker, an unrecorded map may be a live
+  raw-block publish (a device-node bind that findmnt --source can't see).
+  NodeStage/NodeUnstage are serialized per staging path inside the plugin
+  (core's claim is released when it gives up on a cancelled call).
 - **NFS + kind co-located:** kind exhausts the default `fs.inotify.max_user_instances=128`,
   which starves the host NFS server's `nfsdcld`/`mountd` and makes **NFSv4 mounts
   hang** (host loopback *and* from pods). Fix: `sysctl -w fs.inotify.max_user_instances=8192`
