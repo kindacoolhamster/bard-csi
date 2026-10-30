@@ -3,6 +3,7 @@ package cephplugin
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/kindacoolhamster/bard-csi/internal/fakerun"
@@ -243,4 +244,49 @@ func (b *Backend) imageMeta(ctx context.Context, run *fakerun.Runner, spec, key 
 
 func snapRef(r *bardplugin.CreateSnapshotResponse) *bardplugin.VolumeRef {
 	return &bardplugin.VolumeRef{Instance: "east", Location: r.Location, Name: r.Name}
+}
+
+// CSI lets a CO replay CreateVolume for an existing volume at any time. A replay of
+// a clone that has since been snapshotted must keep that snapshot's own
+// <key>@<snap> descriptor (CreateSnapshot writes it on this image; a restore after
+// a key rotation needs it), while still dropping keys inherited for snapshots this
+// image does not have.
+func TestCloneReplayKeepsItsOwnSnapshotKeys(t *testing.T) {
+	ctx := context.Background()
+	b, run := newCloneMetaBackend()
+	params := map[string]string{"pool": "replicapool"}
+	src, err := b.CreateVolume(ctx, &bardplugin.CreateVolumeRequest{Name: "src", CapacityBytes: 1 << 30, Instance: "east", Parameters: params})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srcRef := bardplugin.VolumeRef{Instance: "east", Location: src.Location, Name: src.Name}
+	s1, err := b.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: "s1", SourceVolume: srcRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &bardplugin.CreateVolumeRequest{Name: "copy", CapacityBytes: 1 << 30, Instance: "east", Parameters: params, SourceSnapshot: snapRef(s1)}
+	cp, err := b.CreateVolume(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpRef := bardplugin.VolumeRef{Instance: "east", Location: cp.Location, Name: cp.Name}
+	cpSpec := cp.Location + "/" + cp.Name
+	own, err := b.CreateSnapshot(ctx, &bardplugin.CreateSnapshotRequest{Name: "own", SourceVolume: cpRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ownSnap, _ := strings.Cut(own.Name, "@")
+	ownKey := "bard.encryptionKMSID@" + ownSnap
+	setMeta(t, run, cpSpec, ownKey, "k8s")
+	setMeta(t, run, cpSpec, "bard.encryptionKMSID@csi-snap-not-mine", "k8s")
+
+	if _, err := b.CreateVolume(ctx, req); err != nil { // replay
+		t.Fatal(err)
+	}
+	if v := b.imageMeta(ctx, run, cpSpec, ownKey); v != "k8s" {
+		t.Fatalf("replay stripped the clone's own snapshot descriptor %s (now %q); meta: %s", ownKey, v, metaList(t, run, cpSpec))
+	}
+	if v := b.imageMeta(ctx, run, cpSpec, "bard.encryptionKMSID@csi-snap-not-mine"); v != "" {
+		t.Fatalf("a key for a snapshot this image lacks must still be stripped, got %q", v)
+	}
 }

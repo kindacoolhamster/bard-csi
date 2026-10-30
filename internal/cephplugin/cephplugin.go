@@ -1125,7 +1125,9 @@ func (b *Backend) inheritEncryption(ctx context.Context, conn []string, sourceSp
 //   - the owner labels (bard.pvname etc.): would name the source's PVC whenever the
 //     provisioner passes no --extra-create-metadata to overwrite them;
 //   - snapshot-qualified keys ("<key>@<snap>", see metaAddr): describe snapshots of
-//     the source, which the clone does not have.
+//     the source, which the clone does not have. A key naming a snapshot that DOES
+//     exist on this image is its own (CreateSnapshot wrote it -- a CO may replay
+//     CreateVolume at any time) and is kept.
 //
 // Encryption keys are left to inheritEncryption, which owns them. Idempotent; a
 // failure fails the create so the CO's retry finishes the job.
@@ -1144,8 +1146,25 @@ func (b *Backend) stripInheritedMeta(ctx context.Context, conn []string, spec, s
 	for _, k := range ownerMeta {
 		owner[k] = true
 	}
+	var ownSnaps map[string]bool // lazily: only an image with @-keys pays the snap ls
 	for k := range meta {
-		if k == imgMetaStatic || owner[k] || strings.Contains(k, "@") {
+		_, snap, qualified := strings.Cut(k, "@")
+		if qualified {
+			if ownSnaps == nil {
+				snaps, err := b.listSnaps(ctx, conn, spec)
+				if err != nil {
+					return err
+				}
+				ownSnaps = map[string]bool{}
+				for _, sn := range snaps {
+					ownSnaps[sn.Name] = true
+				}
+			}
+			if ownSnaps[snap] {
+				continue
+			}
+		}
+		if k == imgMetaStatic || owner[k] || qualified {
 			if _, err := b.run.Run(ctx, "rbd", appendArgs(conn, "image-meta", "remove", spec, k)...); err != nil && !isNotFound(err) {
 				return fmt.Errorf("ceph-rbd: image-meta remove %s %s: %w", spec, k, err)
 			}
